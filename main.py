@@ -6,7 +6,7 @@ import os
 app = FastAPI()
 
 # Tu API key
-openai.api_key = "sk-proj-..."  # ← Reemplaza por tu key real
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 class Entrada(BaseModel):
     mensaje: str
