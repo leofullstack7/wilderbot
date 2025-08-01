@@ -5,12 +5,15 @@ import os
 
 app = FastAPI()
 
-# Tu API key
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 class Entrada(BaseModel):
     mensaje: str
     usuario: str
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 @app.post("/responder")
 async def responder(data: Entrada):
@@ -20,13 +23,17 @@ async def responder(data: Entrada):
         "respondes como ser humano real, y motivas a seguir participando."
     )
 
-    respuesta = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": prompt_sistema},
-            {"role": "user", "content": data.mensaje}
-        ]
-    )
+    try:
+        respuesta = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": prompt_sistema},
+                {"role": "user", "content": data.mensaje}
+            ]
+        )
 
-    contenido = respuesta['choices'][0]['message']['content']
-    return {"respuesta": contenido}
+        contenido = respuesta['choices'][0]['message']['content']
+        return {"respuesta": contenido}
+    
+    except Exception as e:
+        return {"error": str(e)}
