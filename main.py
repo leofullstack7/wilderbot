@@ -1,11 +1,12 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from pydantic import BaseModel
-import openai
+from openai import OpenAI
 import os
 
 app = FastAPI()
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Inicializar cliente OpenAI con clave desde variable de entorno
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class Entrada(BaseModel):
     mensaje: str
@@ -24,17 +25,15 @@ async def responder(data: Entrada):
     )
 
     try:
-        respuesta = openai.ChatCompletion.create(
+        chat_completion = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": prompt_sistema},
                 {"role": "user", "content": data.mensaje}
             ]
         )
+        return {"respuesta": chat_completion.choices[0].message.content}
 
-        contenido = respuesta['choices'][0]['message']['content']
-        return {"respuesta": contenido}
-    
     except Exception as e:
         return {"error": str(e)}
 
