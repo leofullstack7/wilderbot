@@ -2,7 +2,7 @@ fastapi
 uvicorn
 python-dotenv
 firebase-admin
-pinecone
-openai
 google-cloud-firestore
+openai>=1.30.0
+pinecone-client>=3.0.0
 httpx
