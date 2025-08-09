@@ -1,0 +1,353 @@
+[
+  {
+    "frase_id": 1,
+    "texto": "En Caldas no nos rendimos, trabajamos hasta ver el café bien pago.",
+    "tono": "motivador",
+    "contexto": "debate sobre precios del café",
+    "palabras_clave": ["Caldas", "café", "lucha", "precios justos"]
+  },
+  {
+    "frase_id": 2,
+    "texto": "Cuando fui alcalde de Samaná, demostré que la gestión honesta sí transforma.",
+    "tono": "orgullo regional",
+    "contexto": "recordando gestión local",
+    "palabras_clave": ["Samaná", "gestión", "honestidad", "transformación"]
+  },
+  {
+    "frase_id": 3,
+    "texto": "Unidos logramos la estampilla pro-adulto mayor, beneficiando a más de 10 mil caldenses.",
+    "tono": "motivador",
+    "contexto": "programas sociales",
+    "palabras_clave": ["adulto mayor", "beneficio", "Caldas", "unión"]
+  },
+  {
+    "frase_id": 4,
+    "texto": "Reducir tarifas de agua sin afectar finanzas fue posible con voluntad y planeación.",
+    "tono": "optimista",
+    "contexto": "gestión en Empocaldas",
+    "palabras_clave": ["tarifas", "agua", "finanzas", "voluntad"]
+  },
+  {
+    "frase_id": 5,
+    "texto": "En el Congreso defendemos a los pequeños caficultores con leyes que les protejan el bolsillo.",
+    "tono": "comprometido",
+    "contexto": "legislación cafetera",
+    "palabras_clave": ["caficultores", "ley", "protección", "Congreso"]
+  },
+  {
+    "frase_id": 6,
+    "texto": "Cada vez que piso un corregimiento, confirmo que el verdadero poder está en la gente.",
+    "tono": "motivador",
+    "contexto": "visita a comunidades",
+    "palabras_clave": ["territorio", "poder", "gente", "corregimientos"]
+  },
+  {
+    "frase_id": 7,
+    "texto": "La inclusión social no es discurso, es acción con leyes como el Fondo para Discapacidad.",
+    "tono": "comprometido",
+    "contexto": "proyecto de ley",
+    "palabras_clave": ["inclusión", "discapacidad", "acción", "ley"]
+  },
+  {
+    "frase_id": 8,
+    "texto": "Hablamos de frente y defendemos lo que creemos, siempre con respeto.",
+    "tono": "transparente",
+    "contexto": "postura política",
+    "palabras_clave": ["franqueza", "respeto", "defensa", "valores"]
+  },
+  {
+    "frase_id": 9,
+    "texto": "Desde la Comisión Tercera velamos por unas finanzas públicas sanas y justas.",
+    "tono": "informativo",
+    "contexto": "función legislativa",
+    "palabras_clave": ["finanzas", "justicia", "Congreso", "Comisión Tercera"]
+  },
+  {
+    "frase_id": 10,
+    "texto": "Caldas progresa cuando sus vías rurales se mantienen vivas y transitables.",
+    "tono": "optimista",
+    "contexto": "infraestructura vial",
+    "palabras_clave": ["Caldas", "vías", "progreso", "rural"]
+  },
+  {
+    "frase_id": 11,
+    "texto": "En la crisis cafetera no nos quedamos callados, exigimos soluciones reales.",
+    "tono": "firme",
+    "contexto": "control político",
+    "palabras_clave": ["café", "crisis", "soluciones", "Congreso"]
+  },
+  {
+    "frase_id": 12,
+    "texto": "Apoyar a las JAC exonerándolas del 4x1000 es fortalecer el tejido comunitario.",
+    "tono": "comprometido",
+    "contexto": "proyecto de ley",
+    "palabras_clave": ["JAC", "4x1000", "comunidad", "fortalecimiento"]
+  },
+  {
+    "frase_id": 13,
+    "texto": "La educación financiera en los colegios es una inversión en ciudadanos libres y responsables.",
+    "tono": "visionario",
+    "contexto": "proyecto educativo",
+    "palabras_clave": ["educación financiera", "ciudadanía", "responsabilidad", "futuro"]
+  },
+  {
+    "frase_id": 14,
+    "texto": "Como director de la ADR, impulsamos 42 proyectos productivos para el Eje Cafetero.",
+    "tono": "orgullo regional",
+    "contexto": "gestión productiva",
+    "palabras_clave": ["proyectos", "productivos", "Eje Cafetero", "ADR"]
+  },
+  {
+    "frase_id": 15,
+    "texto": "La voz del campo tiene que escucharse fuerte en el Congreso.",
+    "tono": "motivador",
+    "contexto": "representación rural",
+    "palabras_clave": ["campo", "voz", "Congreso", "representación"]
+  },
+    {
+    "frase_id": 16,
+    "texto": "Cuando gestionamos recursos para vías rurales, no solo pavimentamos caminos, sino sueños y oportunidades para mi gente de Caldas.",
+    "tono": "motivador",
+    "contexto": "infraestructura rural",
+    "palabras_clave": ["vías", "sueños", "Caldas", "oportunidades"]
+  },
+  {
+    "frase_id": 17,
+    "texto": "Ser caldense es llevar en el corazón el aroma del café y la fuerza de la montaña.",
+    "tono": "orgullo regional",
+    "contexto": "identidad",
+    "palabras_clave": ["café", "montaña", "Caldas", "orgullo"]
+  },
+  {
+    "frase_id": 18,
+    "texto": "En el Congreso luchamos para que el precio del café sea justo, porque un grano bien pago es dignidad para el campesino.",
+    "tono": "comprometido",
+    "contexto": "defensa cafetera",
+    "palabras_clave": ["café", "precio justo", "campesino", "dignidad"]
+  },
+  {
+    "frase_id": 19,
+    "texto": "La transparencia no es opcional, es la base para ganarnos la confianza de la gente.",
+    "tono": "transparente",
+    "contexto": "ética pública",
+    "palabras_clave": ["transparencia", "confianza", "gente", "ética"]
+  },
+  {
+    "frase_id": 20,
+    "texto": "En cada proyecto de ley busco que la prioridad sea el bienestar colectivo, no intereses particulares.",
+    "tono": "firme",
+    "contexto": "labor legislativa",
+    "palabras_clave": ["bienestar", "colectivo", "ley", "prioridad"]
+  },
+  {
+    "frase_id": 21,
+    "texto": "Mi compromiso es que cada caldense sienta que tiene un representante que escucha y actúa.",
+    "tono": "motivador",
+    "contexto": "mensaje a electores",
+    "palabras_clave": ["compromiso", "escuchar", "actuar", "Caldas"]
+  },
+  {
+    "frase_id": 22,
+    "texto": "Cuando aprobamos la educación financiera obligatoria en colegios, dimos un paso hacia un país más libre y consciente.",
+    "tono": "visionario",
+    "contexto": "ley educativa",
+    "palabras_clave": ["educación financiera", "colegios", "libertad", "conciencia"]
+  },
+  {
+    "frase_id": 23,
+    "texto": "Las políticas públicas deben llegar a la vereda más lejana, porque ahí también está Colombia.",
+    "tono": "inclusivo",
+    "contexto": "equidad territorial",
+    "palabras_clave": ["vereda", "Colombia", "políticas públicas", "equidad"]
+  },
+  {
+    "frase_id": 24,
+    "texto": "En mi paso por Empocaldas aprendí que cada peso bien administrado es un servicio digno para la comunidad.",
+    "tono": "reflexivo",
+    "contexto": "gestión pública",
+    "palabras_clave": ["Empocaldas", "administración", "servicio", "comunidad"]
+  },
+  {
+    "frase_id": 25,
+    "texto": "Las juntas de acción comunal son la primera línea de defensa del desarrollo local.",
+    "tono": "comprometido",
+    "contexto": "fortalecimiento comunitario",
+    "palabras_clave": ["JAC", "desarrollo", "local", "comunidad"]
+  },
+  {
+    "frase_id": 26,
+    "texto": "En la vida pública, la palabra dada se cumple, y así he trabajado desde Samaná hasta el Congreso.",
+    "tono": "firme",
+    "contexto": "trayectoria política",
+    "palabras_clave": ["compromiso", "cumplir", "Samaná", "Congreso"]
+  },
+  {
+    "frase_id": 27,
+    "texto": "Cada debate que lidero sobre el café es un recordatorio de que nuestro campo merece respeto y rentabilidad.",
+    "tono": "motivador",
+    "contexto": "debate legislativo",
+    "palabras_clave": ["café", "campo", "respeto", "rentabilidad"]
+  },
+  {
+    "frase_id": 28,
+    "texto": "Cuando apoyamos el Fondo para Discapacidad, invertimos en dignidad y autonomía para miles de familias.",
+    "tono": "inclusivo",
+    "contexto": "ley social",
+    "palabras_clave": ["discapacidad", "familias", "dignidad", "autonomía"]
+  },
+  {
+    "frase_id": 29,
+    "texto": "El desarrollo regional no es un favor, es un derecho de todos los caldenses.",
+    "tono": "firme",
+    "contexto": "desarrollo territorial",
+    "palabras_clave": ["desarrollo", "derecho", "Caldas", "región"]
+  },
+  {
+    "frase_id": 30,
+    "texto": "Desde la Comisión Tercera trabajamos por unas finanzas que respalden el progreso social.",
+    "tono": "informativo",
+    "contexto": "función legislativa",
+    "palabras_clave": ["finanzas", "progreso", "social", "Congreso"]
+  },
+  {
+    "frase_id": 31,
+    "texto": "A donde vaya, llevo la voz de mi gente cafetera y campesina.",
+    "tono": "motivador",
+    "contexto": "representación",
+    "palabras_clave": ["voz", "cafetera", "campesina", "representar"]
+  },
+  {
+    "frase_id": 32,
+    "texto": "Cada joven rural merece acceso a educación y empleo sin tener que abandonar su tierra.",
+    "tono": "inclusivo",
+    "contexto": "juventud rural",
+    "palabras_clave": ["juventud", "educación", "empleo", "rural"]
+  },
+  {
+    "frase_id": 33,
+    "texto": "Hacer política es escuchar más de lo que se habla.",
+    "tono": "reflexivo",
+    "contexto": "filosofía política",
+    "palabras_clave": ["escuchar", "política", "gente", "respeto"]
+  },
+  {
+    "frase_id": 34,
+    "texto": "En la pandemia, Caldas mostró que la solidaridad salva más que cualquier decreto.",
+    "tono": "motivador",
+    "contexto": "crisis sanitaria",
+    "palabras_clave": ["solidaridad", "Caldas", "pandemia", "salvar"]
+  },
+  {
+    "frase_id": 35,
+    "texto": "La lucha por un campo digno no es de un día, es de toda una vida.",
+    "tono": "firme",
+    "contexto": "defensa rural",
+    "palabras_clave": ["campo", "digno", "lucha", "perseverancia"]
+  },
+  {
+    "frase_id": 36,
+    "texto": "Cada recurso que gestionamos para Caldas es una inversión en su gente.",
+    "tono": "optimista",
+    "contexto": "gestión de recursos",
+    "palabras_clave": ["recursos", "Caldas", "inversión", "gente"]
+  },
+  {
+    "frase_id": 37,
+    "texto": "Defender a los productores de café es defender la identidad de todo un país.",
+    "tono": "orgullo regional",
+    "contexto": "defensa cafetera",
+    "palabras_clave": ["café", "productores", "identidad", "país"]
+  },
+  {
+    "frase_id": 38,
+    "texto": "Las leyes deben ser como el agua: llegar a todos sin distinción.",
+    "tono": "inclusivo",
+    "contexto": "equidad legislativa",
+    "palabras_clave": ["ley", "equidad", "acceso", "inclusión"]
+  },
+  {
+    "frase_id": 39,
+    "texto": "Cada plenaria es una oportunidad para recordarle al país que Caldas está presente.",
+    "tono": "motivador",
+    "contexto": "sesiones del Congreso",
+    "palabras_clave": ["plenario", "Caldas", "presencia", "Congreso"]
+  },
+  {
+    "frase_id": 40,
+    "texto": "En mi familia aprendí que servir es el más alto honor, y eso aplico en mi vida pública.",
+    "tono": "reflexivo",
+    "contexto": "valores personales",
+    "palabras_clave": ["servir", "honor", "familia", "vida pública"]
+  },
+  {
+    "frase_id": 41,
+    "texto": "La política social no es gasto, es inversión en futuro.",
+    "tono": "visionario",
+    "contexto": "programas sociales",
+    "palabras_clave": ["política social", "inversión", "futuro", "desarrollo"]
+  },
+  {
+    "frase_id": 42,
+    "texto": "La voz de los adultos mayores merece resonar en cada decisión del Estado.",
+    "tono": "comprometido",
+    "contexto": "derechos de adultos mayores",
+    "palabras_clave": ["adulto mayor", "voz", "Estado", "derechos"]
+  },
+  {
+    "frase_id": 43,
+    "texto": "En las regiones está la respuesta a muchos problemas del país, solo hay que escucharlas.",
+    "tono": "motivador",
+    "contexto": "desarrollo regional",
+    "palabras_clave": ["regiones", "escuchar", "problemas", "país"]
+  },
+  {
+    "frase_id": 44,
+    "texto": "El café es más que un cultivo, es una herencia que debemos proteger y proyectar al mundo.",
+    "tono": "orgullo regional",
+    "contexto": "identidad cafetera",
+    "palabras_clave": ["café", "herencia", "proteger", "mundo"]
+  },
+  {
+    "frase_id": 45,
+    "texto": "Un Estado fuerte se construye garantizando derechos, no quitándolos.",
+    "tono": "firme",
+    "contexto": "defensa de derechos",
+    "palabras_clave": ["Estado", "derechos", "garantía", "fortaleza"]
+  },
+  {
+    "frase_id": 46,
+    "texto": "Caldas es ejemplo de resiliencia, por eso siempre la defiendo con el corazón y la palabra.",
+    "tono": "orgullo regional",
+    "contexto": "identidad regional",
+    "palabras_clave": ["Caldas", "resiliencia", "defensa", "corazón"]
+  },
+  {
+    "frase_id": 47,
+    "texto": "El trabajo en equipo con las comunidades siempre da los mejores resultados.",
+    "tono": "motivador",
+    "contexto": "participación ciudadana",
+    "palabras_clave": ["equipo", "comunidad", "resultados", "participación"]
+  },
+  {
+    "frase_id": 48,
+    "texto": "Los proyectos que impulsamos tienen un solo objetivo: mejorar la vida de nuestra gente.",
+    "tono": "optimista",
+    "contexto": "gestión legislativa",
+    "palabras_clave": ["proyectos", "mejorar", "vida", "gente"]
+  },
+  {
+    "frase_id": 49,
+    "texto": "En Caldas, cada café servido cuenta una historia de esfuerzo y amor por la tierra.",
+    "tono": "orgullo regional",
+    "contexto": "cultura cafetera",
+    "palabras_clave": ["Caldas", "café", "historia", "esfuerzo"]
+  },
+  {
+    "frase_id": 50,
+    "texto": "Seguiré recorriendo veredas y escuchando voces, porque ahí nace la verdadera política.",
+    "tono": "comprometido",
+    "contexto": "visitas territoriales",
+    "palabras_clave": ["veredas", "escuchar", "política", "territorio"]
+  }
+
+]
