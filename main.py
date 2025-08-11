@@ -28,6 +28,11 @@ from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+import math  # <— nuevo
+
+# Umbral de similitud para detectar cambio de tema (0..1)
+TOPIC_SIM_THRESHOLD = float(os.getenv("TOPIC_SIM_THRESHOLD", "0.78"))
+
 # =========================================================
 #  Config e inicialización básica
 # =========================================================
@@ -162,7 +167,12 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             "mensajes": [],  # En tu modelo, los turnos viven como arreglo en el documento
             "fecha_inicio": firestore.SERVER_TIMESTAMP,
             "ultima_fecha": firestore.SERVER_TIMESTAMP,
-            "tono_detectado": None
+            "tono_detectado": None,
+            "last_topic_vec": None,               # embedding del último tema consolidado
+            "last_topic_summary": None,           # resumen breve del último tema
+            "awaiting_topic_confirm": False,      # estamos esperando confirmación de nuevo tema
+            "candidate_new_topic_summary": None,  # resumen del tema candidato
+            "candidate_new_topic_vec": None,      # embedding del tema candidato
         })
     else:
         # Si ya existe, solo refrescamos la última fecha de actividad
@@ -202,6 +212,16 @@ def load_historial_para_prompt(conv_ref) -> List[Dict[str, str]]:
         return out
     return []
 
+
+def cosine_sim(a: List[float] | None, b: List[float] | None) -> float:
+    """Coseno entre dos embeddings."""
+    if not a or not b:
+        return 0.0
+    dot = sum(x*y for x, y in zip(a, b))
+    na = math.sqrt(sum(x*x for x in a))
+    nb = math.sqrt(sum(y*y for y in b))
+    return dot/(na*nb) if na and nb else 0.0
+
 # =========================================================
 #  RAG (embeddings + búsqueda vectorial)
 # =========================================================
@@ -225,12 +245,20 @@ def rag_search(query: str, top_k: int = 5):
     return hits
 
 
-def build_messages(user_text: str, rag_snippets: List[str], historial: List[Dict[str, str]]):
+def build_messages(
+    user_text: str,
+    rag_snippets: List[str],
+    historial: List[Dict[str, str]],
+    topic_change_suspect: bool = False,
+    prev_summary: str = "",
+    new_summary: str = ""
+):
     """
     Construye los mensajes que enviaremos a OpenAI:
     - system: reglas de estilo y límites (máx 4 frases)
     - historial: continuidad de conversación
-    - user: mensaje actual + contexto RAG (frases de Wilder recuperadas)
+    - user: mensaje actual + contexto RAG
+    - si hay sospecha de cambio de tema, instruye a formular la pregunta humana.
     """
     contexto = "\n".join([f"- {s}" for s in rag_snippets if s.strip()])
 
@@ -246,15 +274,25 @@ def build_messages(user_text: str, rag_snippets: List[str], historial: List[Dict
     )
 
 
+    if topic_change_suspect and new_summary:
+        human_q = (
+            f'Valoro mucho tus aportes, ¿quieres que terminemos de hablar acerca de '
+            f'"{(prev_summary or "el tema anterior")}" o prefieres que pasemos a hablar '
+            f'sobre "{new_summary}"?'
+        )
+        system_msg += (
+            "Detecto que el mensaje podría ser un **tema distinto**. Primero, hazlo notar con aprecio y pregunta de forma natural:\n"
+            f'- "{human_q}"\n'
+            "Espera confirmación antes de avanzar con acciones o registrar como propuesta aparte.\n"
+        )
+
+    system_msg += "Usa el contexto recuperado para mantener el estilo y coherencia, y evita inventar hechos."
+
     contexto_msg = "Contexto recuperado (frases reales de Wilder):\n" + (contexto if contexto else "(sin coincidencias relevantes)")
 
     msgs = [{"role": "system", "content": system_msg}]
-
-    # Historial previo (si existe), en el formato que espera OpenAI
     if historial:
-        msgs.extend(historial[-8:])  # Nos quedamos con los últimos 8 turnos
-
-    # Turno actual del ciudadano más el contexto RAG
+        msgs.extend(historial[-8:])
     msgs.append({"role": "user", "content": f"{contexto_msg}\n\nMensaje del ciudadano:\n{user_text}"})
     return msgs
 
@@ -268,9 +306,10 @@ async def responder(data: Entrada):
     Flujo:
     1) Resolver chat_id y registrar usuario vs anónimo.
     2) Asegurar doc en 'conversaciones'.
-    3) RAG (Pinecone) + historial (Firestore) → construir prompt.
-    4) Llamar a OpenAI para la respuesta final (corta y humana).
-    5) Guardar ambos turnos en el arreglo 'mensajes'.
+    3) Detección de cambio de tema (embeddings) y actualización de banderas.
+    4) RAG (Pinecone) + historial (Firestore) → construir prompt.
+    5) Llamar a OpenAI para la respuesta final (corta y humana).
+    6) Guardar ambos turnos en el arreglo 'mensajes'.
     """
     try:
         # 1) chat_id estable: si no viene, generamos uno temporal web_XXXX
@@ -282,12 +321,52 @@ async def responder(data: Entrada):
         # 2) Asegurar la conversación
         conv_ref = ensure_conversacion(chat_id, usuario_id, data.faq_origen)
 
-        # 3) Recuperar contexto estilo Wilder y últimos turnos
+        # 3) --- Detección de cambio de tema usando embeddings ---
+        conv_data = (conv_ref.get().to_dict() or {})
+        prev_vec = conv_data.get("last_topic_vec")
+        prev_sum = (conv_data.get("last_topic_summary") or "").strip()
+
+        # Embedding del mensaje actual
+        curr_vec = client.embeddings.create(model=EMBEDDING_MODEL, input=data.mensaje).data[0].embedding
+        sim = cosine_sim(prev_vec, curr_vec) if prev_vec else 1.0
+
+        # Resumen súper corto (para mostrar en la pregunta humana)
+        curr_sum = (data.mensaje.strip()[:120]).rstrip()
+
+        topic_change_suspect = (prev_vec is not None and sim < TOPIC_SIM_THRESHOLD)
+
+        if topic_change_suspect:
+            # Marcamos candidato y pedimos confirmación en el siguiente turno
+            conv_ref.update({
+                "awaiting_topic_confirm": True,
+                "candidate_new_topic_summary": curr_sum,
+                "candidate_new_topic_vec": curr_vec,
+                "ultima_fecha": firestore.SERVER_TIMESTAMP
+            })
+        else:
+            # Consideramos que sigue el mismo tema → actualizamos el tema "consolidado"
+            conv_ref.update({
+                "last_topic_vec": curr_vec,
+                "last_topic_summary": curr_sum,
+                "awaiting_topic_confirm": False,
+                "candidate_new_topic_summary": None,
+                "candidate_new_topic_vec": None,
+                "ultima_fecha": firestore.SERVER_TIMESTAMP
+            })
+
+        # 4) Recuperar contexto estilo Wilder y últimos turnos
         hits = rag_search(data.mensaje, top_k=5)
         historial = load_historial_para_prompt(conv_ref)
-        messages = build_messages(data.mensaje, [h["texto"] for h in hits], historial)
+        messages = build_messages(
+            data.mensaje,
+            [h["texto"] for h in hits],
+            historial,
+            topic_change_suspect=topic_change_suspect,
+            prev_summary=prev_sum,
+            new_summary=curr_sum
+        )
 
-        # 4) LLM (respuesta final)
+        # 5) LLM (respuesta final)
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
@@ -296,7 +375,7 @@ async def responder(data: Entrada):
         )
         texto = completion.choices[0].message.content.strip()
 
-        # 5) Guardar turnos en la conversación (en el arreglo 'mensajes')
+        # 6) Guardar turnos en la conversación (en el arreglo 'mensajes')
         append_mensajes(conv_ref, [
             {"role": "user", "content": data.mensaje},
             {"role": "assistant", "content": texto}
@@ -308,6 +387,7 @@ async def responder(data: Entrada):
     except Exception as e:
         # No exponemos stacktrace, solo el mensaje de error
         return {"error": str(e)}
+
 
 # =========================================================
 #  Clasificación y Panel (/clasificar)  — NUEVO BLOQUE
@@ -438,7 +518,7 @@ async def clasificar(body: ClasificarIn):
             max_tokens=300
         ).choices[0].message.content.strip()
 
-        # 4) Parseo del JSON devuelto (con llaves tolerantes)
+        # 4) Parseo del JSON devuelto
         data = json.loads(out)
         categoria = data.get("categoria_general") or data.get("categoria") or "General"
         titulo    = data.get("titulo_propuesta") or data.get("titulo") or "Propuesta ciudadana"
@@ -446,10 +526,13 @@ async def clasificar(body: ClasificarIn):
         palabras  = data.get("palabras_clave", [])
 
         # 5) Decidir si se debe contabilizar en panel
-        ya_contado = bool(conv_data.get("panel_contabilizado"))  # flag en la conversación
+        awaiting = bool(conv_data.get("awaiting_topic_confirm"))   # <— NUEVO: hay cambio de tema pendiente?
+        ya_contado = bool(conv_data.get("panel_contabilizado"))    # ya se contó alguna vez
+
         if body.contabilizar is None:
-            # Regla por defecto: solo cuenta la primera vez
-            debe_contar = not ya_contado
+            # Por defecto NO contamos si estamos esperando confirmación por cambio de tema;
+            # si no estamos esperando, contamos solo la primera vez.
+            debe_contar = (not awaiting) and (not ya_contado)
         else:
             # Respeta lo que indique n8n explícitamente
             debe_contar = bool(body.contabilizar)
