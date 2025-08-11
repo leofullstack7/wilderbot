@@ -84,6 +84,11 @@ class ClasificarIn(BaseModel):
     """
     chat_id: str
 
+    # Si es None, el backend decide: solo contabiliza si aún no se ha contado.
+    # Si es True, fuerza un nuevo registro en panel (para casos confirmados de "nueva propuesta").
+    # Si es False, nunca contabiliza (solo actualiza los campos de la conversación).
+    contabilizar: Optional[bool] = None
+
 # =========================================================
 #  Health Check
 # =========================================================
@@ -231,10 +236,15 @@ def build_messages(user_text: str, rag_snippets: List[str], historial: List[Dict
 
     system_msg = (
         "Actúa como Wilder Escobar, Representante a la Cámara en Colombia.\n"
-        "Tono: cercano, claro y humano. Responde en **máximo 4 frases** (sin párrafos largos).\n"
+        "Tono: muy cercano, empático y humano. Responde en **máximo 4 frases** (sin párrafos largos).\n"
         "Si pides datos, haz **1 pregunta puntual**. Si el usuario cambia de tema, respóndelo sin perder cortesía.\n"
-        "Usa el contexto recuperado para estilo y coherencia; no inventes hechos."
+        "Si detectas que el nuevo mensaje ES UN TEMA DISTINTO al que venían tratando, hazlo notar con aprecio y plantea la pregunta de forma natural, por ejemplo:\n"
+        "  - \"Valoro mucho tus aportes, ¿quieres que terminemos de hablar acerca de la necesidad de {{tema_anterior}}? "
+        "o prefieres que pasemos a hablar sobre {{nuevo_tema}}?\"\n"
+        "Reemplaza {{tema_anterior}} y {{nuevo_tema}} por resúmenes cortos y claros de cada asunto.\n"
+        "Usa el contexto recuperado para mantener el estilo y coherencia, y evita inventar hechos."
     )
+
 
     contexto_msg = "Contexto recuperado (frases reales de Wilder):\n" + (contexto if contexto else "(sin coincidencias relevantes)")
 
@@ -402,45 +412,49 @@ def update_panel_resumen(categoria: str, tono: str, titulo: str, usuario_id: str
 @app.post("/clasificar")
 async def clasificar(body: ClasificarIn):
     """
-    Endpoint opcional (asíncrono). Ejecútalo desde n8n después de /responder.
-    Efectos:
-      - Escribe en conversaciones/{chat_id} los campos:
-        categoria_general, titulo_propuesta, tono_detectado
-      - Asegura la categoría en 'categorias_tematicas'
-      - Actualiza 'panel_resumen/global'
-      - Si faq_origen existe, crea un registro en 'faq_logs'
+    Clasifica la conversación indicada por chat_id.
+    - Actualiza: categoria_general, titulo_propuesta, tono_detectado.
+    - 'panel_resumen/global': solo incrementa la 1ª vez (o cuando contabilizar=True).
+    - Si faq_origen existe, registra faq_logs.
     """
     try:
         chat_id = body.chat_id
 
-        # Leer últimos aportes para dar contexto a la clasificación
+        # 1) Leer últimos aportes para dar contexto a la clasificación
         ultimo_u, ultima_a, conv_data = read_last_user_and_bot(chat_id)
         if not ultimo_u:
             return {"ok": False, "mensaje": "No hay mensajes para clasificar."}
 
-        # Prompt base desde configuración
+        # 2) Prompt base desde configuración + mensajes de clasificación
         prompt_base = get_prompt_base()
         msgs = build_messages_for_classify(prompt_base, ultimo_u, ultima_a)
 
-        # Puedes usar un modelo distinto para clasificar (opcional)
+        # 3) Llamada al modelo (esperamos un JSON plano)
         model_cls = os.getenv("OPENAI_MODEL_CLASSIFY", OPENAI_MODEL)
-
-        # Llamada al modelo (se espera un JSON plano como string)
         out = client.chat.completions.create(
             model=model_cls,
             messages=msgs,
-            temperature=0.2,   # clasificación: baja creatividad
+            temperature=0.2,
             max_tokens=300
         ).choices[0].message.content.strip()
 
-        # Parseo seguro del JSON devuelto
+        # 4) Parseo del JSON devuelto (con llaves tolerantes)
         data = json.loads(out)
         categoria = data.get("categoria_general") or data.get("categoria") or "General"
         titulo    = data.get("titulo_propuesta") or data.get("titulo") or "Propuesta ciudadana"
         tono      = data.get("tono_detectado") or "neutral"
         palabras  = data.get("palabras_clave", [])
 
-        # Actualizar conversación con los campos de clasificación
+        # 5) Decidir si se debe contabilizar en panel
+        ya_contado = bool(conv_data.get("panel_contabilizado"))  # flag en la conversación
+        if body.contabilizar is None:
+            # Regla por defecto: solo cuenta la primera vez
+            debe_contar = not ya_contado
+        else:
+            # Respeta lo que indique n8n explícitamente
+            debe_contar = bool(body.contabilizar)
+
+        # 6) Actualizar la conversación con los campos de clasificación
         conv_ref = db.collection("conversaciones").document(chat_id)
         conv_ref.set({
             "categoria_general": categoria,
@@ -449,16 +463,19 @@ async def clasificar(body: ClasificarIn):
             "ultima_fecha": firestore.SERVER_TIMESTAMP
         }, merge=True)
 
-        # Asegurar la categoría en 'categorias_tematicas'
+        # 7) Registrar/asegurar la categoría
         db.collection("categorias_tematicas").document(categoria).set({
             "nombre": categoria
         }, merge=True)
 
-        # Panel resumen (conteos + últimas propuestas)
+        # 8) Panel resumen: sólo si corresponde
         usuario_id = conv_data.get("usuario_id", chat_id)
-        update_panel_resumen(categoria, tono, titulo, usuario_id)
+        if debe_contar:
+            update_panel_resumen(categoria, tono, titulo, usuario_id)
+            # Marcar que esta conversación ya fue contabilizada al menos una vez
+            conv_ref.set({"panel_contabilizado": True}, merge=True)
 
-        # Si la conversación nació de una FAQ, registramos log
+        # 9) Log de FAQ si aplica (no afecta el conteo)
         faq = conv_data.get("faq_origen")
         if faq:
             db.collection("faq_logs").add({
@@ -472,11 +489,13 @@ async def clasificar(body: ClasificarIn):
             "categoria_general": categoria,
             "titulo_propuesta": titulo,
             "tono_detectado": tono,
-            "palabras_clave": palabras
+            "palabras_clave": palabras,
+            "contabilizado_en_panel": bool(debe_contar)
         }}
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
 
 # =========================================================
 #  Arranque local (uvicorn)
