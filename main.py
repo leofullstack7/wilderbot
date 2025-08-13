@@ -353,8 +353,8 @@ def build_messages(
     if intro_hint:
         system_msg += (
             "\n\nCUANDO SEA UN SALUDO Y NO HAYA TEMA ACTUAL:\n"
-            "- Preséntate brevemente como la mano derecha de Wilder Escobar.\n"
-            "- Explica en una sola frase que estás aquí para escuchar problemas, propuestas o comentarios positivos y canalizarlos.\n"
+            "- Preséntate como la mano derecha de Wilder Escobar y que canalizas problemas, propuestas o reconocimientos.\n"
+            "- **No** devuelvas un simple '¿cómo estás?' ni solo cortesías.\n"
             "- Cierra con **una** pregunta concreta para invitar a contar la situación o idea (máx. 1 línea)."
         )
 
