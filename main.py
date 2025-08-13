@@ -281,12 +281,10 @@ def build_messages(
             f'sobre "{new_summary}"?'
         )
         system_msg += (
-            "Detecto que el mensaje podría ser un **tema distinto**. Primero, hazlo notar con aprecio y pregunta de forma natural:\n"
+            "\nDetecto que el mensaje podría ser un **tema distinto**. Primero, hazlo notar con aprecio y pregunta de forma natural:\n"
             f'- "{human_q}"\n'
-            "Espera confirmación antes de avanzar con acciones o registrar como propuesta aparte.\n"
+            "Espera confirmación antes de avanzar con acciones o registrar como propuesta aparte."
         )
-
-    system_msg += "Usa el contexto recuperado para mantener el estilo y coherencia, y evita inventar hechos."
 
     contexto_msg = "Contexto recuperado (frases reales de Wilder):\n" + (contexto if contexto else "(sin coincidencias relevantes)")
 
