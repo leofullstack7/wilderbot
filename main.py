@@ -173,6 +173,7 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             "awaiting_topic_confirm": False,      # estamos esperando confirmación de nuevo tema
             "candidate_new_topic_summary": None,  # resumen del tema candidato
             "candidate_new_topic_vec": None,      # embedding del tema candidato
+            "topics_history": [],  # <— NUEVO: historial de temas clasificados
         })
     else:
         # Si ya existe, solo refrescamos la última fecha de actividad
@@ -323,7 +324,8 @@ def build_messages(
     historial: List[Dict[str, str]],
     topic_change_suspect: bool = False,
     prev_summary: str = "",
-    new_summary: str = ""
+    new_summary: str = "",
+    intro_hint: bool = False,
 ):
     """
     Construye los mensajes que enviaremos a OpenAI:
@@ -331,6 +333,7 @@ def build_messages(
     - historial: continuidad de conversación
     - user: mensaje actual + contexto RAG
     - si hay sospecha de cambio de tema, instruye a formular la pregunta humana.
+    - si intro_hint=True: presentación breve enfocada a captar problemas/propuestas/elogios.
     """
     contexto = "\n".join([f"- {s}" for s in rag_snippets if s.strip()])
 
@@ -346,6 +349,15 @@ def build_messages(
     )
 
 
+    # Presentación proactiva cuando sea saludo/smalltalk sin tema vigente
+    if intro_hint:
+        system_msg += (
+            "\n\nCUANDO SEA UN SALUDO Y NO HAYA TEMA ACTUAL:\n"
+            "- Preséntate brevemente como la mano derecha de Wilder Escobar.\n"
+            "- Explica en una sola frase que estás aquí para escuchar problemas, propuestas o comentarios positivos y canalizarlos.\n"
+            "- Cierra con **una** pregunta concreta para invitar a contar la situación o idea (máx. 1 línea)."
+        )
+
     if topic_change_suspect and new_summary:
         human_q = (
             f'Valoro mucho tus aportes, ¿quieres que terminemos de hablar acerca de '
@@ -353,7 +365,7 @@ def build_messages(
             f'sobre "{new_summary}"?'
         )
         system_msg += (
-            "\nDetecto que el mensaje podría ser un **tema distinto**. Primero, hazlo notar con aprecio y pregunta de forma natural:\n"
+            "\n\nDetecto que el mensaje podría ser un **tema distinto**. Primero, hazlo notar con aprecio y pregunta de forma natural:\n"
             f'- "{human_q}"\n'
             "Espera confirmación antes de avanzar con acciones o registrar como propuesta aparte."
         )
@@ -408,6 +420,8 @@ async def responder(data: Entrada):
         )
         action = decision.get("action")
         curr_sum = (decision.get("current_summary") or data.mensaje[:120]).strip()
+        intro_hint = (action in ("greeting_smalltalk", "meta")) and (not prev_sum) and (not awaiting_confirm)
+
 
         topic_change_suspect = False  # se usa luego para construir el prompt
         curr_vec = None               # solo calculamos si hace falta
@@ -469,7 +483,8 @@ async def responder(data: Entrada):
             historial,
             topic_change_suspect=topic_change_suspect,
             prev_summary=prev_sum,
-            new_summary=curr_sum
+            new_summary=curr_sum,
+            intro_hint=intro_hint,
         )
 
         # 5) LLM (respuesta final)
@@ -667,6 +682,28 @@ async def clasificar(body: ClasificarIn):
             "tono_detectado": tono,
             "ultima_fecha": firestore.SERVER_TIMESTAMP
         }, merge=True)
+
+        # --- Historial de temas clasificados ---
+        hist_last = (conv_data.get("topics_history") or [])
+        last_item = hist_last[-1] if hist_last else {}
+
+        should_append = (
+            not last_item or
+            last_item.get("categoria") != categoria or
+            last_item.get("titulo") != titulo or
+            last_item.get("tono") != tono
+        )
+
+        if should_append:
+            conv_ref.set({
+                "topics_history": firestore.ArrayUnion([{
+                    "categoria": categoria,
+                    "titulo": titulo,
+                    "tono": tono,
+                    "fecha": firestore.SERVER_TIMESTAMP
+                }])
+            }, merge=True)
+
 
         # 7) Registrar/asegurar la categoría
         db.collection("categorias_tematicas").document(categoria).set({
