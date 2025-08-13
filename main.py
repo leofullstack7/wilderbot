@@ -422,6 +422,19 @@ async def responder(data: Entrada):
         curr_sum = (decision.get("current_summary") or data.mensaje[:120]).strip()
         intro_hint = (action in ("greeting_smalltalk", "meta")) and (not prev_sum) and (not awaiting_confirm)
 
+        # 🚩 NUEVO: saludo fijo y salida temprana (sin llamar al LLM)
+        if intro_hint:
+            saludo = os.getenv(
+                "BOT_INTRO_TEXT",
+                "¡Hola! Soy la mano derecha de Wilder Escobar. Estoy aquí para escuchar y atender tus "
+                "problemas, propuestas o reconocimientos. ¿Qué te gustaría contarme hoy?"
+            )
+            # no tocamos vectores/temas; solo registramos los turnos
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": saludo}
+            ])
+            return {"respuesta": saludo, "fuentes": [], "chat_id": chat_id}
 
         topic_change_suspect = False  # se usa luego para construir el prompt
         curr_vec = None               # solo calculamos si hace falta
