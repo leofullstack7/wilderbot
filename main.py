@@ -43,7 +43,7 @@ app = FastAPI()               # Instancia de FastAPI
 
 # === Variables de entorno (con valores por defecto coherentes) ===
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")               # modelo para responder
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o")               # modelo para responder
 EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small") # modelo de embeddings
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX   = os.getenv("PINECONE_INDEX", "wilder-frases")
@@ -222,6 +222,78 @@ def cosine_sim(a: List[float] | None, b: List[float] | None) -> float:
     nb = math.sqrt(sum(y*y for y in b))
     return dot/(na*nb) if na and nb else 0.0
 
+
+def llm_decide_turn(
+    last_topic_summary: str,
+    awaiting_confirm: bool,
+    last_two_turns: List[Dict[str, str]],
+    current_text: str,
+    model: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Usa el LLM para decidir qué tipo de turno es este mensaje.
+    Posibles 'action':
+      - greeting_smalltalk: saludo/cordialidad sin contenido programático.
+      - continue_topic: profundiza el tema vigente (mismo hilo).
+      - new_topic: propone tema distinto (solicitar confirmación).
+      - confirm_new_topic: usuario confirma que sí es nuevo tema.
+      - reject_new_topic: usuario dice que NO, que siga el tema anterior.
+      - meta: mensajes de control, 'gracias', 'ok', etc. (no contaminar).
+
+    Return:
+      {
+        "action": "...",
+        "reason": "breve explicación",
+        "current_summary": "resumen corto del mensaje actual",
+        "topic_label": "rótulo corto del tema si aplica"
+      }
+    """
+    model = model or OPENAI_MODEL
+
+    sys = (
+        "Eres un asistente que clasifica el rol conversacional de un mensaje "
+        "dado el tema vigente.\n"
+        "Responde SOLO un JSON válido con claves: action, reason, current_summary, topic_label.\n"
+        "Reglas:\n"
+        "- greeting_smalltalk: saludos, cortesías, '¿cómo estás?', 'gracias', etc.\n"
+        "- continue_topic: aporta detalles o responde dentro del mismo tema vigente.\n"
+        "- new_topic: aparece un asunto distinto al vigente (si no hay vigente, proponlo como posible nuevo).\n"
+        "- confirm_new_topic: el usuario explícitamente acepta cambiar de tema o dice 'pasemos a X'.\n"
+        "- reject_new_topic: el usuario dice que NO y que sigan con el tema anterior.\n"
+        "- meta: mensajes sin contenido programático (p. ej., 'listo', 'ok', 'repite').\n"
+        "Incluye 'topic_label' breve si detectas un tema (p.ej. 'parque La Esperanza', 'muro del colegio', 'mejorar vía al centro')."
+    )
+
+    last_turns_text = "\n".join([f"{t.get('role')}: {t.get('content','')}" for t in last_two_turns[-2:]])
+    usr = (
+        f"Tema vigente (si existe): {last_topic_summary or '(ninguno)'}\n"
+        f"¿Estamos esperando confirmación de cambio de tema?: {'Sí' if awaiting_confirm else 'No'}\n"
+        f"Últimos turnos recientes:\n{last_turns_text}\n\n"
+        f"Mensaje actual del ciudadano:\n{current_text}\n\n"
+        "Devuelve el JSON ahora."
+    )
+
+    out = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": sys},
+                  {"role": "user", "content": usr}],
+        temperature=0.1,
+        max_tokens=220
+    ).choices[0].message.content
+
+    try:
+        data = json.loads(out)
+    except Exception:
+        # fallback conservador
+        data = {"action": "continue_topic", "reason": "fallback", "current_summary": current_text[:120], "topic_label": ""}
+
+    # sanea claves mínimas
+    data.setdefault("action", "continue_topic")
+    data.setdefault("current_summary", current_text[:120])
+    data.setdefault("topic_label", "")
+    data.setdefault("reason", "")
+    return data
+
 # =========================================================
 #  RAG (embeddings + búsqueda vectorial)
 # =========================================================
@@ -319,38 +391,74 @@ async def responder(data: Entrada):
         # 2) Asegurar la conversación
         conv_ref = ensure_conversacion(chat_id, usuario_id, data.faq_origen)
 
-        # 3) --- Detección de cambio de tema usando embeddings ---
+        # 3) --- Decisión de turno con LLM + (opcional) embeddings ---
         conv_data = (conv_ref.get().to_dict() or {})
         prev_vec = conv_data.get("last_topic_vec")
         prev_sum = (conv_data.get("last_topic_summary") or "").strip()
+        awaiting_confirm = bool(conv_data.get("awaiting_topic_confirm"))
 
-        # Embedding del mensaje actual
-        curr_vec = client.embeddings.create(model=EMBEDDING_MODEL, input=data.mensaje).data[0].embedding
-        sim = cosine_sim(prev_vec, curr_vec) if prev_vec else 1.0
+        # Tomamos hasta 2 turnos previos para contexto
+        historial_for_decider = load_historial_para_prompt(conv_ref)
 
-        # Resumen súper corto (para mostrar en la pregunta humana)
-        curr_sum = (data.mensaje.strip()[:120]).rstrip()
+        decision = llm_decide_turn(
+            last_topic_summary=prev_sum,
+            awaiting_confirm=awaiting_confirm,
+            last_two_turns=historial_for_decider[-2:] if historial_for_decider else [],
+            current_text=data.mensaje
+        )
+        action = decision.get("action")
+        curr_sum = (decision.get("current_summary") or data.mensaje[:120]).strip()
 
-        topic_change_suspect = (prev_vec is not None and sim < TOPIC_SIM_THRESHOLD)
+        topic_change_suspect = False  # se usa luego para construir el prompt
+        curr_vec = None               # solo calculamos si hace falta
 
-        if topic_change_suspect:
-            # Marcamos candidato y pedimos confirmación en el siguiente turno
-            conv_ref.update({
-                "awaiting_topic_confirm": True,
-                "candidate_new_topic_summary": curr_sum,
-                "candidate_new_topic_vec": curr_vec,
-                "ultima_fecha": firestore.SERVER_TIMESTAMP
-            })
-        else:
-            # Consideramos que sigue el mismo tema → actualizamos el tema "consolidado"
-            conv_ref.update({
-                "last_topic_vec": curr_vec,
+        if action in ("confirm_new_topic", "new_topic", "continue_topic"):
+            # Calculamos embedding SOLO cuando el mensaje es relevante para tema
+            curr_vec = client.embeddings.create(model=EMBEDDING_MODEL, input=data.mensaje).data[0].embedding
+            if action == "new_topic":
+                topic_change_suspect = True
+                conv_ref.update({
+                    "awaiting_topic_confirm": True,
+                    "candidate_new_topic_summary": curr_sum,
+                    "candidate_new_topic_vec": curr_vec,
+                    "ultima_fecha": firestore.SERVER_TIMESTAMP
+                })
+            elif action == "confirm_new_topic":
+                # Consolidar el candidato como tema vigente
+                cand_vec = conv_data.get("candidate_new_topic_vec") or curr_vec
+                cand_sum = conv_data.get("candidate_new_topic_summary") or curr_sum
+                conv_ref.update({
+                    "last_topic_vec": cand_vec,
+                    "last_topic_summary": cand_sum,
+                    "awaiting_topic_confirm": False,
+                    "candidate_new_topic_summary": None,
+                    "candidate_new_topic_vec": None,
+                    "ultima_fecha": firestore.SERVER_TIMESTAMP
+                })
+        elif action == "continue_topic":
+            # No reescribimos el vector en cada turno; sólo el resumen.
+            # Si aún no hay vector consolidado (primera vez), lo guardamos.
+            update_payload = {
                 "last_topic_summary": curr_sum,
+                "awaiting_topic_confirm": False,
+                "ultima_fecha": firestore.SERVER_TIMESTAMP
+            }
+            if prev_vec is None and curr_vec is not None:
+                update_payload["last_topic_vec"] = curr_vec  # primera consolidación
+            conv_ref.update(update_payload)
+
+        elif action == "reject_new_topic":
+            # Mantener el tema anterior, limpiar candidato
+            conv_ref.update({
                 "awaiting_topic_confirm": False,
                 "candidate_new_topic_summary": None,
                 "candidate_new_topic_vec": None,
                 "ultima_fecha": firestore.SERVER_TIMESTAMP
             })
+
+        else:
+            # greeting_smalltalk o meta: no tocar vectores ni candidatos
+            conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
         # 4) Recuperar contexto estilo Wilder y últimos turnos
         hits = rag_search(data.mensaje, top_k=5)
@@ -502,6 +610,22 @@ async def clasificar(body: ClasificarIn):
         ultimo_u, ultima_a, conv_data = read_last_user_and_bot(chat_id)
         if not ultimo_u:
             return {"ok": False, "mensaje": "No hay mensajes para clasificar."}
+        
+        # --- Saltar clasificación si el último turno es saludo/pequeña charla/meta ---
+        decision_cls = llm_decide_turn(
+            last_topic_summary=(conv_data.get("last_topic_summary") or ""),
+            awaiting_confirm=bool(conv_data.get("awaiting_topic_confirm")),
+            last_two_turns=[{"role":"user","content": ultimo_u},
+                            {"role":"assistant","content": ultima_a}],
+            current_text=ultimo_u
+        )
+        if decision_cls.get("action") in ("greeting_smalltalk", "meta"):
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "saludo_o_meta_detectado_por_llm"
+            }
+
 
         # 2) Prompt base desde configuración + mensajes de clasificación
         prompt_base = get_prompt_base()
