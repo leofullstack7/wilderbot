@@ -23,6 +23,7 @@ from google.cloud.firestore_v1 import Increment
 import json
 import os
 from dotenv import load_dotenv
+import re
 
 # --- Firestore Admin SDK
 import firebase_admin
@@ -48,6 +49,12 @@ EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small") # mode
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX   = os.getenv("PINECONE_INDEX", "wilder-frases")
 GOOGLE_CREDS     = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "/etc/secrets/firebase.json"
+# Texto fijo de presentación para saludos sin tema (se puede sobreescribir con env var)
+BOT_INTRO_TEXT = os.getenv(
+    "BOT_INTRO_TEXT",
+    "¡Hola! Soy la mano derecha de Wilder Escobar. Estoy aquí para escuchar y canalizar tus "
+    "problemas, propuestas o reconocimientos. ¿Qué te gustaría contarme hoy?"
+)
 
 # === Clientes de terceros ===
 client = OpenAI(api_key=OPENAI_API_KEY)       # Cliente OpenAI (chat + embeddings)
@@ -223,6 +230,46 @@ def cosine_sim(a: List[float] | None, b: List[float] | None) -> float:
     nb = math.sqrt(sum(y*y for y in b))
     return dot/(na*nb) if na and nb else 0.0
 
+def _normalize_text(t: str) -> str:
+    """
+    Normaliza texto para detectar saludos simples:
+    - minúsculas
+    - reemplaza vocales acentuadas
+    - elimina signos/puntuación
+    - colapsa espacios
+    """
+    t = t.lower()
+    # quitar tildes básicas (sin librerías externas)
+    t = (t.replace("á","a").replace("é","e").replace("í","i")
+           .replace("ó","o").replace("ú","u").replace("ü","u"))
+    # quitar signos/puntuación
+    t = re.sub(r"[^a-zñ0-9\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def is_plain_greeting(text: str) -> bool:
+    """Detecta saludos/cortesías sin tema. Evita gastar LLM en el primer turno."""
+    if not text:
+        return False
+    t = _normalize_text(text)
+
+    # palabras/expresiones típicas de saludo
+    kws = (
+        "hola", "holaa", "holaaa",
+        "buenas", "buenos dias", "buenas tardes", "buenas noches",
+        "como estas", "que mas", "q mas", "saludos"
+    )
+    short = len(t) <= 30
+    has_kw = any(k in t for k in kws)
+
+    # si detectamos indicios de tema, no lo tratamos como saludo vacío
+    topicish = any(w in t for w in (
+        "arregl", "propuesta", "proponer", "daño", "danada", "hueco",
+        "parque", "colegio", "via", "salud", "seguridad",
+        "ayuda", "necesito", "quiero", "repar", "denuncia", "idea"
+    ))
+
+    return short and has_kw and not topicish
 
 def llm_decide_turn(
     last_topic_summary: str,
@@ -409,6 +456,14 @@ async def responder(data: Entrada):
         prev_sum = (conv_data.get("last_topic_summary") or "").strip()
         awaiting_confirm = bool(conv_data.get("awaiting_topic_confirm"))
 
+        # --- Saludo determinístico sin gastar LLM ---
+        if not prev_sum and not awaiting_confirm and is_plain_greeting(data.mensaje):
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": BOT_INTRO_TEXT}
+            ])
+            return {"respuesta": BOT_INTRO_TEXT, "fuentes": [], "chat_id": chat_id}
+
         # Tomamos hasta 2 turnos previos para contexto
         historial_for_decider = load_historial_para_prompt(conv_ref)
 
@@ -424,17 +479,11 @@ async def responder(data: Entrada):
 
         # 🚩 NUEVO: saludo fijo y salida temprana (sin llamar al LLM)
         if intro_hint:
-            saludo = os.getenv(
-                "BOT_INTRO_TEXT",
-                "¡Hola! Soy la mano derecha de Wilder Escobar. Estoy aquí para escuchar y atender tus "
-                "problemas, propuestas o reconocimientos. ¿Qué te gustaría contarme hoy?"
-            )
-            # no tocamos vectores/temas; solo registramos los turnos
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
-                {"role": "assistant", "content": saludo}
+                {"role": "assistant", "content": BOT_INTRO_TEXT}
             ])
-            return {"respuesta": saludo, "fuentes": [], "chat_id": chat_id}
+            return {"respuesta": BOT_INTRO_TEXT, "fuentes": [], "chat_id": chat_id}
 
         topic_change_suspect = False  # se usa luego para construir el prompt
         curr_vec = None               # solo calculamos si hace falta
