@@ -169,8 +169,8 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
         conv_ref.set({
             "usuario_id": usuario_id,
             "faq_origen": faq_origen or None,
-            "categoria_general": None,
-            "titulo_propuesta": None,
+            "categoria_general": [],
+            "titulo_propuesta": [],
             "mensajes": [],  # En tu modelo, los turnos viven como arreglo en el documento
             "fecha_inicio": firestore.SERVER_TIMESTAMP,
             "ultima_fecha": firestore.SERVER_TIMESTAMP,
@@ -738,12 +738,47 @@ async def clasificar(body: ClasificarIn):
 
         # 6) Actualizar la conversación con los campos de clasificación
         conv_ref = db.collection("conversaciones").document(chat_id)
-        conv_ref.set({
-            "categoria_general": categoria,
-            "titulo_propuesta": titulo,
-            "tono_detectado": tono,
-            "ultima_fecha": firestore.SERVER_TIMESTAMP
-        }, merge=True)
+
+        # Estado actual en BD
+        arr_cat = (conv_data.get("categoria_general") or [])
+        arr_tit = (conv_data.get("titulo_propuesta") or [])
+        tono_bd = conv_data.get("tono_detectado")
+
+        # --- Normaliza tipo de campos si vienen de versiones viejas (string -> array) ---
+        if isinstance(conv_data.get("categoria_general"), str):
+            conv_ref.set({"categoria_general": [conv_data["categoria_general"]]}, merge=True)
+            arr_cat = [conv_data["categoria_general"]]
+
+        if isinstance(conv_data.get("titulo_propuesta"), str):
+            conv_ref.set({"titulo_propuesta": [conv_data["titulo_propuesta"]]}, merge=True)
+            arr_tit = [conv_data["titulo_propuesta"]]
+
+        # Normalizadores simples para evitar duplicados por mayúsculas/espacios
+        def _norm(s: str) -> str:
+            return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+        cat_in_arr = _norm(categoria) in {_norm(c) for c in arr_cat}
+        tit_in_arr = _norm(titulo)    in {_norm(t) for t in arr_tit}
+
+        updates = {"ultima_fecha": firestore.SERVER_TIMESTAMP}
+
+        # 1) Tono: solo se fija la 1ª vez
+        if not tono_bd and tono:
+            updates["tono_detectado"] = tono
+
+        # 2) Categoría/Título: agregamos al arreglo cuando:
+        #    - no estamos esperando confirmación de nuevo tema, o
+        #    - explícitamente body.contabilizar == True (fuerza el alta)
+        permitir_append = (not awaiting) or (body.contabilizar is True)
+
+        if permitir_append:
+            if not cat_in_arr and categoria:
+                updates["categoria_general"] = firestore.ArrayUnion([categoria])
+            if not tit_in_arr and titulo:
+                updates["titulo_propuesta"] = firestore.ArrayUnion([titulo])
+
+        # Aplica cambios (solo lo que haya en 'updates')
+        conv_ref.set(updates, merge=True)
 
         # --- Historial de temas clasificados ---
         hist_last = (conv_data.get("topics_history") or [])
@@ -756,7 +791,7 @@ async def clasificar(body: ClasificarIn):
             last_item.get("tono") != tono
         )
 
-        if should_append:
+        if should_append and permitir_append:
             conv_ref.set({
                 "topics_history": firestore.ArrayUnion([{
                     "categoria": categoria,
