@@ -31,6 +31,8 @@ from firebase_admin import credentials, firestore
 
 import math  # <— nuevo
 
+from fastapi.middleware.cors import CORSMiddleware
+
 # Umbral de similitud para detectar cambio de tema (0..1)
 TOPIC_SIM_THRESHOLD = float(os.getenv("TOPIC_SIM_THRESHOLD", "0.78"))
 
@@ -75,6 +77,15 @@ db = firestore.client()   # Cliente Firestore listo para leer/escribir
 # =========================================================
 #  Esquemas de entrada/salida
 # =========================================================
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # restringe a tu dominio si quieres
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class Entrada(BaseModel):
     """
