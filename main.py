@@ -250,6 +250,21 @@ def has_argument_text(t: str) -> bool:
     ]
     return any(k in t for k in keys)
 
+def make_argument_question(resumen: str) -> str:
+    """
+    Devuelve UNA repregunta breve para que la persona argumente.
+    Prioriza motivo/impacto o detalle concreto.
+    """
+    base = "Gracias por la idea. "
+    r = _normalize_text(resumen or "")
+    if "parque" in r:
+        return base + "¿Qué problema resolvería el parque y en qué punto exacto lo imaginas?"
+    if "seguridad" in r or "robo" in r or "atraco" in r:
+        return base + "¿En qué puntos y horarios ocurre más el problema?"
+    if "via" in r or "hueco" in r or "calle" in r:
+        return base + "¿Cuál es el tramo exacto y qué riesgos genera hoy?"
+    return base + "¿Cuál es el motivo principal y a quién beneficiaría más?"
+
 # =========================================================
 #  Pequeñas “LLM tools” (clasificadores ligeros)
 # =========================================================
@@ -418,7 +433,8 @@ def build_messages(
         "Tono cercano y claro. **Máximo 3–4 frases, sin párrafos largos.**\n"
         "Sé el intermediario: no preguntes si ya habló con otras autoridades.\n"
         "No saludes de nuevo. Llama por el nombre solo si ya lo sabes.\n"
-        "Si pides datos, haz UNA sola solicitud (nombre, barrio y celular)."
+        "Si pides datos, haz UNA sola solicitud (nombre, barrio y celular).\n"
+        "**PROHIBIDO** pedir datos de contacto hasta que hayas hecho UNA repregunta y el ciudadano te responda con motivo/impacto."
     )
 
     if intro_hint:
@@ -511,15 +527,15 @@ async def responder(data: Entrada):
                     "candidate_new_topic_vec": None,
                     "ultima_fecha": firestore.SERVER_TIMESTAMP
                 })
-        elif action == "continue_topic":
-            update_payload = {
-                "last_topic_summary": curr_sum,
-                "awaiting_topic_confirm": False,
-                "ultima_fecha": firestore.SERVER_TIMESTAMP
-            }
-            if prev_vec is None and curr_vec is not None:
-                update_payload["last_topic_vec"] = curr_vec
-            conv_ref.update(update_payload)
+            elif action == "continue_topic":
+                update_payload = {
+                    "last_topic_summary": curr_sum,
+                    "awaiting_topic_confirm": False,
+                    "ultima_fecha": firestore.SERVER_TIMESTAMP
+                }
+                if prev_vec is None and curr_vec is not None:
+                    update_payload["last_topic_vec"] = curr_vec
+                conv_ref.update(update_payload)
         elif action == "reject_new_topic":
             conv_ref.update({
                 "awaiting_topic_confirm": False,
@@ -558,6 +574,13 @@ async def responder(data: Entrada):
                              and not (conv_data.get("argument_requested") or conv_data.get("argument_collected")))
         if need_argument_now:
             conv_ref.update({"argument_requested": True})
+            # Responder con UNA repregunta breve sin invocar al LLM
+            pregunta = make_argument_question(curr_sum or data.mensaje)
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": pregunta}
+            ])
+            return {"respuesta": pregunta, "fuentes": [], "chat_id": chat_id}
 
         # ¿Debemos pedir contacto ahora? (solo después de tener argumento)
         already_req = bool(conv_data.get("contact_requested"))
@@ -591,7 +614,7 @@ async def responder(data: Entrada):
             new_summary=curr_sum,
             intro_hint=intro_hint,
             emphasize_contact=should_ask_now,
-            emphasize_argument=need_argument_now,
+            emphasize_argument=False,  # ya no, porque si tocaba repreguntar, hicimos early-return arriba
             intent=intent,
             contact_already_requested=already_req,
             contact_already_collected=already_col,
@@ -605,6 +628,12 @@ async def responder(data: Entrada):
             max_tokens=280
         )
         texto = completion.choices[0].message.content.strip()
+
+        # Guardia: si aún no hay argumento, censura cualquier intento de pedir contacto
+        if not (conv_data.get("argument_collected") or argument_ready):
+            contact_kws = ("tel", "celu", "número", "numero", "contacto", "whatsapp")
+            if any(k in texto.lower() for k in contact_kws):
+                texto = make_argument_question(curr_sum or data.mensaje)
 
         # --- POST: cierre conciso si llegó teléfono en este turno ---
         if tel:
