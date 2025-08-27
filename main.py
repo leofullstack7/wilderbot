@@ -102,12 +102,7 @@ async def health():
 # =========================================================
 
 def upsert_usuario_o_anon(chat_id: str, nombre: Optional[str], telefono: Optional[str], canal: Optional[str]) -> str:
-    """
-    Si entrega teléfono lo guardamos en 'usuarios', si no, en 'anonimos'.
-    Usamos chat_id como identificador estable de ese hilo.
-    """
     usuario_id = chat_id
-
     if telefono:
         ref = db.collection("usuarios").document(usuario_id)
         doc = ref.get()
@@ -143,16 +138,15 @@ def upsert_usuario_o_anon(chat_id: str, nombre: Optional[str], telefono: Optiona
                 "chats": firestore.ArrayUnion([chat_id]),
                 "canal": canal or doc.to_dict().get("canal", "web"),
             })
-
     return usuario_id
 
 
 def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]):
     """
-    Crea conversaciones/{chat_id} si no existe y añade campos de contacto y flags de argumento.
+    Crea conversaciones/{chat_id} si no existe y añade campos de contacto + flags de argumento.
     """
     conv_ref = db.collection("conversaciones").document(chat_id)
-    if not conv_ref.get().exists:   # propiedad .exists
+    if not conv_ref.get().exists:
         conv_ref.set({
             "usuario_id": usuario_id,
             "faq_origen": faq_origen or None,
@@ -172,8 +166,8 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             "topics_history": [],
 
             # === Flujo argumento + contacto ===
-            "argument_requested": False,
-            "argument_collected": False,
+            "argument_requested": False,   # ya hicimos la ÚNICA pregunta de argumento
+            "argument_collected": False,   # el ciudadano ya respondió a esa pregunta
             "contact_intent": None,        # 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
             "contact_requested": False,
             "contact_collected": False,    # True solo si hay teléfono
@@ -194,7 +188,7 @@ def append_mensajes(conv_ref, nuevos: List[Dict[str, Any]]):
 
 def load_historial_para_prompt(conv_ref) -> List[Dict[str, str]]:
     snap = conv_ref.get()
-    if snap.exists:   # propiedad .exists
+    if snap.exists:
         data = snap.to_dict() or {}
         msgs = data.get("mensajes", [])
         out = []
@@ -250,21 +244,6 @@ def has_argument_text(t: str) -> bool:
     ]
     return any(k in t for k in keys)
 
-def make_argument_question(resumen: str) -> str:
-    """
-    Devuelve UNA repregunta breve para que la persona argumente.
-    Prioriza motivo/impacto o detalle concreto.
-    """
-    base = "Gracias por la idea. "
-    r = _normalize_text(resumen or "")
-    if "parque" in r:
-        return base + "¿Qué problema resolvería el parque y en qué punto exacto lo imaginas?"
-    if "seguridad" in r or "robo" in r or "atraco" in r:
-        return base + "¿En qué puntos y horarios ocurre más el problema?"
-    if "via" in r or "hueco" in r or "calle" in r:
-        return base + "¿Cuál es el tramo exacto y qué riesgos genera hoy?"
-    return base + "¿Cuál es el motivo principal y a quién beneficiaría más?"
-
 # =========================================================
 #  Pequeñas “LLM tools” (clasificadores ligeros)
 # =========================================================
@@ -315,10 +294,6 @@ def llm_decide_turn(
 
 
 def llm_contact_policy(summary_so_far: str, last_user: str) -> Dict[str, Any]:
-    """
-    Decide si corresponde PEDIR contacto ahora y el tipo de intención.
-    Devuelve JSON: { "should_request": bool, "intent": "propuesta|problema|reconocimiento|otro", "reason": "..." }
-    """
     sys = (
         "Eres un clasificador de intención y oportunidad de contacto para un bot cívico.\n"
         "Analiza el tema/resumen y el último mensaje del ciudadano.\n"
@@ -351,12 +326,10 @@ def llm_contact_policy(summary_so_far: str, last_user: str) -> Dict[str, Any]:
 
 def parse_contact_from_text(text: str) -> Dict[str, Optional[str]]:
     """
-    Extrae datos básicos si el usuario los comparte libremente.
-    - teléfono: dígitos con 8-12 números (Col: 10 usual).
-    - nombre: varias heurísticas (al inicio antes de una coma, 'soy/me llamo/mi nombre es').
-    - barrio: variantes de 'en el barrio X' / 'del barrio X', corta en coma/punto o conectores.
+    - Teléfono: dígitos con 8-12 números (Col: 10).
+    - Nombre: 'soy|me llamo|mi nombre es' O nombre al inicio antes de coma/‘vivo…’.
+    - Barrio: patrones de 'barrio X' y variantes ('en el barrio', 'del barrio').
     """
-    # Teléfono
     tel = None
     m = re.search(r'(\+?\d[\d\s\-]{7,14}\d)', text)
     if m:
@@ -364,13 +337,10 @@ def parse_contact_from_text(text: str) -> Dict[str, Optional[str]]:
         if len(tel) < 8 or len(tel) > 12:
             tel = None
 
-    # Nombre (patrones explícitos)
     nombre = None
     m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40})', text, flags=re.IGNORECASE)
     if m:
         nombre = m.group(1).strip()
-
-    # Nombre (al inicio antes de coma o conector: "Leandro, vivo en...")
     if not nombre:
         m = re.search(r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)', text)
         if m:
@@ -378,7 +348,6 @@ def parse_contact_from_text(text: str) -> Dict[str, Optional[str]]:
             if posible.lower() not in {"hola","buenas","buenos dias","buenas tardes","buenas noches"}:
                 nombre = posible
 
-    # Barrio
     barrio = None
     m = re.search(r'\b(?:en el|en la|del|de la|de el)?\s*barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=,|\.|\s+es\b|\s+mi\b|\s+y\b|$)', text, flags=re.IGNORECASE)
     if m:
@@ -433,8 +402,7 @@ def build_messages(
         "Tono cercano y claro. **Máximo 3–4 frases, sin párrafos largos.**\n"
         "Sé el intermediario: no preguntes si ya habló con otras autoridades.\n"
         "No saludes de nuevo. Llama por el nombre solo si ya lo sabes.\n"
-        "Si pides datos, haz UNA sola solicitud (nombre, barrio y celular).\n"
-        "**PROHIBIDO** pedir datos de contacto hasta que hayas hecho UNA repregunta y el ciudadano te responda con motivo/impacto."
+        "Si pides datos, haz UNA sola solicitud (nombre, barrio y celular)."
     )
 
     if intro_hint:
@@ -476,7 +444,7 @@ async def responder(data: Entrada):
         prev_sum = (conv_data.get("last_topic_summary") or "").strip()
         awaiting_confirm = bool(conv_data.get("awaiting_topic_confirm"))
 
-        # Saludo directo sin gastar modelo
+        # Saludo directo
         if not prev_sum and not awaiting_confirm and is_plain_greeting(data.mensaje):
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
@@ -527,15 +495,15 @@ async def responder(data: Entrada):
                     "candidate_new_topic_vec": None,
                     "ultima_fecha": firestore.SERVER_TIMESTAMP
                 })
-            elif action == "continue_topic":
-                update_payload = {
-                    "last_topic_summary": curr_sum,
-                    "awaiting_topic_confirm": False,
-                    "ultima_fecha": firestore.SERVER_TIMESTAMP
-                }
-                if prev_vec is None and curr_vec is not None:
-                    update_payload["last_topic_vec"] = curr_vec
-                conv_ref.update(update_payload)
+        elif action == "continue_topic":
+            update_payload = {
+                "last_topic_summary": curr_sum,
+                "awaiting_topic_confirm": False,
+                "ultima_fecha": firestore.SERVER_TIMESTAMP
+            }
+            if prev_vec is None and curr_vec is not None:
+                update_payload["last_topic_vec"] = curr_vec
+            conv_ref.update(update_payload)
         elif action == "reject_new_topic":
             conv_ref.update({
                 "awaiting_topic_confirm": False,
@@ -546,8 +514,8 @@ async def responder(data: Entrada):
         else:
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
-        # === PARSING DE CONTACTO (no cerramos sin teléfono) ===
-        parsed = parse_contact_from_text(data.mensaje)           # {"nombre":..., "barrio":..., "telefono":...}
+        # === PARSING CONTACTO ===
+        parsed = parse_contact_from_text(data.mensaje)
         partials = {k: v for k, v in parsed.items() if v}
         tel = parsed.get("telefono")
 
@@ -555,32 +523,32 @@ async def responder(data: Entrada):
             current_info = (conv_data.get("contact_info") or {})
             new_info = {**current_info, **{k: v or current_info.get(k) for k, v in parsed.items()}}
             conv_ref.update({"contact_info": new_info})
-            if tel:  # contacto "suficiente"
+            if tel:
                 conv_ref.update({"contact_collected": True})
                 upsert_usuario_o_anon(chat_id, new_info.get("nombre") or data.nombre or data.usuario, tel, data.canal)
 
-        # === Política de argumento y contacto ===
+        # === Política argumento + contacto ===
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
         intent = policy.get("intent", "otro")
 
-        # ¿Este turno contiene argumento?
-        prev_role = historial_for_decider[-1]["role"] if historial_for_decider else None
-        argument_ready = (prev_role == "assistant") and has_argument_text(data.mensaje)
+        # ¿El usuario acaba de responder nuestra pregunta de argumento?
+        last_role = historial_for_decider[-1]["role"] if historial_for_decider else None
+        just_asked_argument = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
+        user_replied_after_arg_q = just_asked_argument and (len(_normalize_text(data.mensaje)) >= 5)
+
+        # Consideramos argumento listo si:
+        #  a) respondió tras nuestra pregunta (aunque no diga "porque"), o
+        #  b) el texto contiene señales de argumento.
+        argument_ready = user_replied_after_arg_q or has_argument_text(data.mensaje)
         if argument_ready and not conv_data.get("argument_collected"):
             conv_ref.update({"argument_collected": True})
 
-        # ¿Debemos pedir argumento ahora?
+        # ¿Debemos pedir argumento (UNA sola vez)?
         need_argument_now = (intent in ("propuesta", "problema")
-                             and not (conv_data.get("argument_requested") or conv_data.get("argument_collected")))
+                             and not conv_data.get("argument_requested")
+                             and not conv_data.get("argument_collected"))
         if need_argument_now:
             conv_ref.update({"argument_requested": True})
-            # Responder con UNA repregunta breve sin invocar al LLM
-            pregunta = make_argument_question(curr_sum or data.mensaje)
-            append_mensajes(conv_ref, [
-                {"role": "user", "content": data.mensaje},
-                {"role": "assistant", "content": pregunta}
-            ])
-            return {"respuesta": pregunta, "fuentes": [], "chat_id": chat_id}
 
         # ¿Debemos pedir contacto ahora? (solo después de tener argumento)
         already_req = bool(conv_data.get("contact_requested"))
@@ -593,9 +561,9 @@ async def responder(data: Entrada):
         if should_ask_now and not already_req:
             conv_ref.update({"contact_intent": intent, "contact_requested": True})
 
-        # Si debemos pedir contacto y el usuario no dio nada aún -> atajo (sin LLM)
+        # Si toca pedir contacto y el usuario no dio nada aún -> atajo directo
         if should_ask_now and not partials:
-            texto_directo = build_contact_request(["nombre", "celular"])  # barrio opcional
+            texto_directo = build_contact_request(["nombre", "celular"])
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto_directo}
@@ -614,7 +582,7 @@ async def responder(data: Entrada):
             new_summary=curr_sum,
             intro_hint=intro_hint,
             emphasize_contact=should_ask_now,
-            emphasize_argument=False,  # ya no, porque si tocaba repreguntar, hicimos early-return arriba
+            emphasize_argument=need_argument_now,   # <-- SOLO una pregunta de argumento
             intent=intent,
             contact_already_requested=already_req,
             contact_already_collected=already_col,
@@ -629,12 +597,6 @@ async def responder(data: Entrada):
         )
         texto = completion.choices[0].message.content.strip()
 
-        # Guardia: si aún no hay argumento, censura cualquier intento de pedir contacto
-        if not (conv_data.get("argument_collected") or argument_ready):
-            contact_kws = ("tel", "celu", "número", "numero", "contacto", "whatsapp")
-            if any(k in texto.lower() for k in contact_kws):
-                texto = make_argument_question(curr_sum or data.mensaje)
-
         # --- POST: cierre conciso si llegó teléfono en este turno ---
         if tel:
             nombre_txt = (parsed.get("nombre") or "").strip()
@@ -645,7 +607,7 @@ async def responder(data: Entrada):
             else:
                 texto += "\n\n" + cierre
 
-        # --- POST: si no hay teléfono pero sí dio algo y tocaba pedir -> pide lo que falta ---
+        # --- POST: si falta algo y ya toca pedir contacto -> pide lo faltante ---
         elif partials and should_ask_now:
             info_actual = (conv_data.get("contact_info") or {})
             missing = []
@@ -681,7 +643,7 @@ def get_prompt_base() -> str:
 def read_last_user_and_bot(chat_id: str) -> Tuple[str, str, dict]:
     conv_ref = db.collection("conversaciones").document(chat_id)
     snap = conv_ref.get()
-    if not snap.exists:   # propiedad .exists
+    if not snap.exists:
         return "", "", {}
     data = snap.to_dict() or {}
     mensajes = data.get("mensajes", [])
