@@ -171,12 +171,12 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             "candidate_new_topic_vec": None,
             "topics_history": [],
 
-            # === NUEVO: flujo de contacto ===
+            # === Flujo de contacto ===
             # intención detectada: 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
             "contact_intent": None,
             "contact_requested": False,     # ya pedimos datos
-            "contact_collected": False,     # ya recibimos algún dato (ojo: se considera suficiente solo si hay teléfono)
-            "contact_info": {               # lo que logremos extraer
+            "contact_collected": False,     # solo en True si hay teléfono
+            "contact_info": {
                 "nombre": None,
                 "barrio": None,
                 "telefono": None,
@@ -242,6 +242,15 @@ def is_plain_greeting(text: str) -> bool:
         "ayuda","necesito","quiero","repar","denuncia","idea"
     ))
     return short and has_kw and not topicish
+
+def has_argument_text(t: str) -> bool:
+    """Heurística simple para detectar 'argumento/razón' en el turno del ciudadano."""
+    t = _normalize_text(t)
+    keys = [
+        "porque","ya que","debido","para que","para ","peligro","riesgo","falta","no hay",
+        "estan oxida","esta roto","es necesario","urge","hace falta","afecta","impacta"
+    ]
+    return any(k in t for k in keys)
 
 # =========================================================
 #  Pequeñas “LLM tools” (clasificadores ligeros)
@@ -333,9 +342,10 @@ def parse_contact_from_text(text: str) -> Dict[str, Optional[str]]:
     """
     Extrae datos básicos si el usuario los comparte libremente.
     - teléfono: dígitos con 8-12 números (Col: 10 usual).
-    - nombre: heurística simple si dice 'soy <nombre>' o 'me llamo <nombre>'.
-    - barrio: si menciona 'barrio <X>'.
+    - nombre: varias heurísticas (al inicio antes de una coma, 'soy/me llamo/mi nombre es').
+    - barrio: variantes de 'en el barrio X' / 'del barrio X', corta en coma/punto o conectores.
     """
+    # Teléfono
     tel = None
     m = re.search(r'(\+?\d[\d\s\-]{7,14}\d)', text)
     if m:
@@ -343,15 +353,26 @@ def parse_contact_from_text(text: str) -> Dict[str, Optional[str]]:
         if len(tel) < 8 or len(tel) > 12:
             tel = None
 
+    # Nombre (patrones explícitos)
     nombre = None
     m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40})', text, flags=re.IGNORECASE)
     if m:
         nombre = m.group(1).strip()
 
+    # Nombre (al inicio antes de coma o conector: "Leandro, vivo en...")
+    if not nombre:
+        m = re.search(r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)', text)
+        if m:
+            posible = m.group(1).strip()
+            # Evitar falsos positivos como "Hola"
+            if posible.lower() not in {"hola","buenas","buenos dias","buenas tardes","buenas noches"}:
+                nombre = posible
+
+    # Barrio
     barrio = None
-    m = re.search(r'\bbarrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+    m = re.search(r'\b(?:en el|en la|del|de la|de el)?\s*barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=,|\.|\s+es\b|\s+mi\b|\s+y\b|$)', text, flags=re.IGNORECASE)
     if m:
-        barrio = m.group(1).strip()
+        barrio = m.group(1).strip(" .,")
 
     return {"nombre": nombre, "barrio": barrio, "telefono": tel}
 
@@ -551,12 +572,17 @@ async def responder(data: Entrada):
                 upsert_usuario_o_anon(chat_id, new_info.get("nombre") or data.nombre or data.usuario, tel, data.canal)
 
         # === Política: ¿ya es momento de pedir contacto? ===
+        # Requisito: que este turno sea respuesta a una repregunta del bot Y contenga argumento.
+        prev_role = historial_for_decider[-1]["role"] if historial_for_decider else None
+        argument_ready = (prev_role == "assistant") and has_argument_text(data.mensaje)
+
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
         intent = policy.get("intent", "otro")
         already_req = bool(conv_data.get("contact_requested"))
         already_col = bool(conv_data.get("contact_collected")) or bool(tel)
 
-        should_ask_now = (policy.get("should_request") and intent in ("propuesta", "problema") and not already_col)
+        should_ask_now = (argument_ready and policy.get("should_request")
+                          and intent in ("propuesta", "problema") and not already_col)
 
         # Marcar que pedimos contacto
         if should_ask_now and not already_req:
