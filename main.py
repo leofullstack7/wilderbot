@@ -43,6 +43,13 @@ TOPIC_SIM_THRESHOLD = float(os.getenv("TOPIC_SIM_THRESHOLD", "0.78"))
 load_dotenv()                 # Permite usar .env en local; en Render usas env vars
 
 app = FastAPI()               # Instancia de FastAPI
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],           # p.ej. ["https://midominio.com", "http://localhost:5173"]
+    allow_credentials=False,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # === Variables de entorno (con valores por defecto coherentes) ===
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
@@ -77,15 +84,6 @@ db = firestore.client()   # Cliente Firestore listo para leer/escribir
 # =========================================================
 #  Esquemas de entrada/salida
 # =========================================================
-
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],          # restringe a tu dominio si quieres
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 class Entrada(BaseModel):
     """
@@ -191,7 +189,13 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             "awaiting_topic_confirm": False,      # estamos esperando confirmación de nuevo tema
             "candidate_new_topic_summary": None,  # resumen del tema candidato
             "candidate_new_topic_vec": None,      # embedding del tema candidato
-            "topics_history": [],  # <— NUEVO: historial de temas clasificados
+            "topics_history": [],                 # historial de temas clasificados
+
+            # --- NUEVO: control de contacto ---
+            "contact_requested": False,           # ya pedimos datos?
+            "contact_captured": False,            # ya tenemos ambos (nombre y celular)?
+            "contact_name": None,
+            "contact_phone": None,
         })
     else:
         # Si ya existe, solo refrescamos la última fecha de actividad
@@ -354,6 +358,70 @@ def llm_decide_turn(
     return data
 
 # =========================================================
+#  Contact & detección de plan/acción (NUEVO)
+# =========================================================
+
+PHONE_RE = re.compile(r"(?:\+?57\s*)?(?:3\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|\d{7,10})")
+NAME_PATTERNS = (
+    r"(?:me llamo|mi nombre es|soy)\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})",
+)
+PLAN_KWS = (
+    "podemos ", "podríamos ", "propongo ", "armemos ", "hagamos ",
+    "crear un grupo", "organizar", "convocar", "reunirnos", "cronograma",
+    "pasos", "plan", "campaña", "jornada"
+)
+
+def extract_phone(text: str) -> Optional[str]:
+    if not text: return None
+    m = PHONE_RE.search(text)
+    if not m: return None
+    digits = re.sub(r"\D", "", m.group(0))
+    if len(digits) == 10 and digits.startswith("3"):
+        return f"+57{digits}"
+    if len(digits) in (7, 8, 9, 10):
+        return digits
+    return None
+
+def extract_name(text: str) -> Optional[str]:
+    if not text: return None
+    for pat in NAME_PATTERNS:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            name = m.group(1).strip()
+            return " ".join(s.capitalize() for s in name.split())
+    return None
+
+def looks_like_plan(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in PLAN_KWS)
+
+def llm_should_request_contact(prev_summary: str, current_text: str) -> bool:
+    """
+    Mini-clasificador: ¿el mensaje trae propuesta/plan concreto?
+    Si falla el LLM, usamos heurística.
+    """
+    try:
+        sys = (
+            "Eres un clasificador binario. Responde SOLO JSON con {\"ask\": true|false}.\n"
+            "Marca ask=true cuando el usuario plantea una solución/plan concreto o disposición a actuar."
+        )
+        usr = (
+            f"Tema: {prev_summary or '(sin tema)'}\n"
+            f"Mensaje: {current_text}\n"
+            "Devuelve el JSON ahora."
+        )
+        out = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":sys},{"role":"user","content":usr}],
+            temperature=0,
+            max_tokens=30
+        ).choices[0].message.content
+        data = json.loads(out)
+        return bool(data.get("ask", False))
+    except Exception:
+        return looks_like_plan(current_text)
+
+# =========================================================
 #  RAG (embeddings + búsqueda vectorial)
 # =========================================================
 
@@ -384,6 +452,9 @@ def build_messages(
     prev_summary: str = "",
     new_summary: str = "",
     intro_hint: bool = False,
+    must_request_contact: bool = False,   # NUEVO
+    contact_pending: bool = False,        # NUEVO
+    contact_captured: bool = False,       # NUEVO
 ):
     """
     Construye los mensajes que enviaremos a OpenAI:
@@ -392,6 +463,7 @@ def build_messages(
     - user: mensaje actual + contexto RAG
     - si hay sospecha de cambio de tema, instruye a formular la pregunta humana.
     - si intro_hint=True: presentación breve enfocada a captar problemas/propuestas/elogios.
+    - cuando must_request_contact=True, pedir nombre+celular y no abrir subhilos.
     """
     contexto = "\n".join([f"- {s}" for s in rag_snippets if s.strip()])
 
@@ -405,7 +477,6 @@ def build_messages(
         "Reemplaza {{tema_anterior}} y {{nuevo_tema}} por resúmenes cortos y claros de cada asunto.\n"
         "Usa el contexto recuperado para mantener el estilo y coherencia, y evita inventar hechos."
     )
-
 
     # Presentación proactiva cuando sea saludo/smalltalk sin tema vigente
     if intro_hint:
@@ -426,6 +497,27 @@ def build_messages(
             "\n\nDetecto que el mensaje podría ser un **tema distinto**. Primero, hazlo notar con aprecio y pregunta de forma natural:\n"
             f'- "{human_q}"\n'
             "Espera confirmación antes de avanzar con acciones o registrar como propuesta aparte."
+        )
+
+    # --- NUEVO: reglas para pedir/gestionar contacto ---
+    if must_request_contact:
+        system_msg += (
+            "\n\nSI YA HAY UNA PROPUESTA O PLAN DE ACCIÓN:\n"
+            "- No abras nuevos subtemas. Pide **solamente** nombre y número de celular para escalar el caso.\n"
+            "- Un bloque breve, con ejemplo de formato (Nombre y Celular).\n"
+            'Ejemplo: "¿Me compartes tu nombre y un número de contacto (ej. Juan Pérez, +57 3XX XXX XXXX) '
+            'para que el equipo te contacte y avancemos?"'
+        )
+    elif contact_pending:
+        system_msg += (
+            "\n\nYA PEDISTE CONTACTO Y FALTA COMPLETARLO:\n"
+            "- Si falta el celular, pídelo explícitamente (con ejemplo). Si falta el nombre, pídelo explícitamente.\n"
+            "- No abras temas nuevos hasta cerrar el contacto."
+        )
+    elif contact_captured:
+        system_msg += (
+            "\n\nSI YA TIENES NOMBRE Y CELULAR:\n"
+            "- Agradece y confirma que el equipo dará seguimiento. Evita nuevas preguntas salvo que la persona lo pida."
         )
 
     contexto_msg = "Contexto recuperado (frases reales de Wilder):\n" + (contexto if contexto else "(sin coincidencias relevantes)")
@@ -547,6 +639,56 @@ async def responder(data: Entrada):
             # greeting_smalltalk o meta: no tocar vectores ni candidatos
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
+        # ------------------ NUEVO: Captura y decisión de contacto ------------------
+
+        # 3.5) Captura nombre/teléfono si vienen en este mismo turno
+        name_from_msg = extract_name(data.mensaje)
+        phone_from_msg = extract_phone(data.mensaje)
+
+        updates_contact: Dict[str, Any] = {}
+        if name_from_msg and not conv_data.get("contact_name"):
+            updates_contact["contact_name"] = name_from_msg
+        if phone_from_msg and not conv_data.get("contact_phone"):
+            updates_contact["contact_phone"] = phone_from_msg
+
+        if updates_contact:
+            # si ya tenemos ambos, marcamos capturado
+            contact_name = updates_contact.get("contact_name") or conv_data.get("contact_name")
+            contact_phone = updates_contact.get("contact_phone") or conv_data.get("contact_phone")
+            updates_contact["contact_captured"] = bool(contact_name and contact_phone)
+            conv_ref.set(updates_contact, merge=True)
+
+            # opcional: refleja en 'usuarios' si ya hay ambos
+            if updates_contact.get("contact_captured"):
+                db.collection("usuarios").document(conv_data.get("usuario_id", chat_id)).set({
+                    "nombre": contact_name,
+                    "telefono": contact_phone,
+                    "chats": firestore.ArrayUnion([chat_id]),
+                    "fecha_registro": firestore.SERVER_TIMESTAMP
+                }, merge=True)
+
+            # refresca conv_data para lo que sigue
+            conv_data.update(updates_contact)
+
+        # 3.6) Decidir si hay que pedir contacto en esta respuesta
+        contact_requested = bool(conv_data.get("contact_requested"))
+        contact_captured  = bool(conv_data.get("contact_captured"))
+        have_name         = bool(conv_data.get("contact_name"))
+        have_phone        = bool(conv_data.get("contact_phone"))
+
+        must_request_contact = False
+        contact_pending = False
+
+        if not contact_captured:
+            if not contact_requested and llm_should_request_contact(prev_sum, data.mensaje):
+                must_request_contact = True
+                conv_ref.update({"contact_requested": True})
+                contact_requested = True
+            elif contact_requested:
+                contact_pending = True  # ya lo pedimos y aún falta algo
+
+        # --------------------------------------------------------------------------
+
         # 4) Recuperar contexto estilo Wilder y últimos turnos
         hits = rag_search(data.mensaje, top_k=5)
         historial = load_historial_para_prompt(conv_ref)
@@ -558,6 +700,9 @@ async def responder(data: Entrada):
             prev_summary=prev_sum,
             new_summary=curr_sum,
             intro_hint=intro_hint,
+            must_request_contact=must_request_contact,
+            contact_pending=contact_pending and not contact_captured and (not have_name or not have_phone),
+            contact_captured=contact_captured,
         )
 
         # 5) LLM (respuesta final)
@@ -581,7 +726,6 @@ async def responder(data: Entrada):
     except Exception as e:
         # No exponemos stacktrace, solo el mensaje de error
         return {"error": str(e)}
-
 
 # =========================================================
 #  Clasificación y Panel (/clasificar)  — NUEVO BLOQUE
@@ -714,14 +858,13 @@ async def clasificar(body: ClasificarIn):
                 "reason": "saludo_o_meta_detectado_por_llm"
             }
 
-
         # 2) Prompt base desde configuración + mensajes de clasificación
         prompt_base = get_prompt_base()
         msgs = build_messages_for_classify(prompt_base, ultimo_u, ultima_a)
 
         # 3) Llamada al modelo (esperamos un JSON plano)
         model_cls = os.getenv("OPENAI_MODEL_CLASSIFY", OPENAI_MODEL)
-        out = client.chat.completions.create(
+        out = client.chat_completions.create(  # Retrocompat si usas openai<1.40 cambia a client.chat.completions
             model=model_cls,
             messages=msgs,
             temperature=0.2,
@@ -736,7 +879,7 @@ async def clasificar(body: ClasificarIn):
         palabras  = data.get("palabras_clave", [])
 
         # 5) Decidir si se debe contabilizar en panel
-        awaiting = bool(conv_data.get("awaiting_topic_confirm"))   # <— NUEVO: hay cambio de tema pendiente?
+        awaiting = bool(conv_data.get("awaiting_topic_confirm"))   # hay cambio de tema pendiente?
         ya_contado = bool(conv_data.get("panel_contabilizado"))    # ya se contó alguna vez
 
         if body.contabilizar is None:
@@ -812,7 +955,6 @@ async def clasificar(body: ClasificarIn):
                 }])
             }, merge=True)
 
-
         # 7) Registrar/asegurar la categoría
         db.collection("categorias_tematicas").document(categoria).set({
             "nombre": categoria
@@ -846,7 +988,6 @@ async def clasificar(body: ClasificarIn):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-
 # =========================================================
 #  Arranque local (uvicorn)
 # =========================================================
@@ -855,3 +996,4 @@ if __name__ == "__main__":
     import uvicorn
     # Puerto 10000 para mantener compatibilidad con Render y tu render.yml
     uvicorn.run("main:app", host="0.0.0.0", port=10000)
+

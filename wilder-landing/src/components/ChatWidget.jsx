@@ -1,7 +1,7 @@
 // src/components/ChatWidget.jsx
 import { useEffect, useRef, useState } from "react";
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:10000";
+const API_URL = import.meta.env.VITE_API_URL;
 
 export default function ChatWidget({ open, onClose, initialMessage, initialFaqOrigin }) {
     const [input, setInput] = useState("");
