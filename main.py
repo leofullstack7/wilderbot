@@ -152,7 +152,7 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
     Crea conversaciones/{chat_id} si no existe y añade campos de contacto y flags de argumento.
     """
     conv_ref = db.collection("conversaciones").document(chat_id)
-    if not conv_ref.get().exists():
+    if not conv_ref.get().exists:   # propiedad .exists
         conv_ref.set({
             "usuario_id": usuario_id,
             "faq_origen": faq_origen or None,
@@ -171,18 +171,13 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             "candidate_new_topic_vec": None,
             "topics_history": [],
 
-            # === Flujo de argumento + contacto ===
-            "argument_requested": False,   # ya pedimos una pregunta de argumento
-            "argument_collected": False,   # detectamos motivo/impacto del ciudadano
-            # intención detectada: 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
-            "contact_intent": None,
-            "contact_requested": False,    # ya pedimos datos
-            "contact_collected": False,    # solo True si hay teléfono
-            "contact_info": {
-                "nombre": None,
-                "barrio": None,
-                "telefono": None,
-            },
+            # === Flujo argumento + contacto ===
+            "argument_requested": False,
+            "argument_collected": False,
+            "contact_intent": None,        # 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
+            "contact_requested": False,
+            "contact_collected": False,    # True solo si hay teléfono
+            "contact_info": {"nombre": None, "barrio": None, "telefono": None},
         })
     else:
         conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
@@ -199,7 +194,7 @@ def append_mensajes(conv_ref, nuevos: List[Dict[str, Any]]):
 
 def load_historial_para_prompt(conv_ref) -> List[Dict[str, str]]:
     snap = conv_ref.get()
-    if snap.exists:
+    if snap.exists:   # propiedad .exists
         data = snap.to_dict() or {}
         msgs = data.get("mensajes", [])
         out = []
@@ -377,7 +372,6 @@ def parse_contact_from_text(text: str) -> Dict[str, Optional[str]]:
     return {"nombre": nombre, "barrio": barrio, "telefono": tel}
 
 def build_contact_request(missing: List[str]) -> str:
-    # missing puede contener: "nombre", "barrio", "celular"
     etiquetas = {"nombre": "tu nombre", "barrio": "tu barrio", "celular": "un número de contacto"}
     pedir = [etiquetas[m] for m in missing]
     frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
@@ -422,32 +416,24 @@ def build_messages(
     system_msg = (
         "Actúa como Wilder Escobar, Representante a la Cámara en Colombia.\n"
         "Tono cercano y claro. **Máximo 3–4 frases, sin párrafos largos.**\n"
-        "Sé el **intermediario**: evita preguntar si ya habló con otras autoridades; enfoca en escuchar y canalizar.\n"
-        "No saludes de nuevo ('Hola', etc.). Llama por el nombre solo si ya lo sabes.\n"
-        "Cuando pidas datos, haz **una sola solicitud** (nombre, barrio y celular; acepta lo que la persona quiera dar)."
+        "Sé el intermediario: no preguntes si ya habló con otras autoridades.\n"
+        "No saludes de nuevo. Llama por el nombre solo si ya lo sabes.\n"
+        "Si pides datos, haz UNA sola solicitud (nombre, barrio y celular)."
     )
 
     if intro_hint:
-        system_msg += "\nSi es solo un saludo y no hay tema, preséntate e invita con **una pregunta** a contar la situación o idea."
+        system_msg += "\nSi es solo un saludo sin tema, invita con UNA pregunta a contar la situación o idea."
 
     if emphasize_argument:
-        system_msg += (
-            "\nAHORA PRIORIZA UNA ÚNICA PREGUNTA BREVE para entender el **motivo/impacto** o un detalle clave de la propuesta/problema. "
-            "No pidas contacto en este turno."
-        )
+        system_msg += "\nPrioriza UNA pregunta breve para entender motivo/impacto. No pidas contacto en este turno."
 
     if emphasize_contact and intent in ("propuesta", "problema") and (not contact_already_collected):
-        system_msg += (
-            "\nAHORA PRIORIZA PEDIR CONTACTO: Agradece el detalle y solicita con suavidad nombre, barrio y celular "
-            "para escalar el caso y dar seguimiento. No hagas más preguntas abiertas."
-        )
+        system_msg += "\nAhora pide contacto con suavidad (nombre, barrio y celular) para escalar y dar seguimiento."
     elif intent == "reconocimiento":
-        system_msg += "\nSi es un reconocimiento/elogio, agradece y no pidas contacto salvo que lo solicite."
+        system_msg += "\nSi es reconocimiento, agradece sin pedir contacto salvo que lo solicite."
 
     if topic_change_suspect and new_summary:
-        human_q = (
-            f'Valoro tus aportes, ¿seguimos con "{(prev_summary or "el tema anterior")}" o pasamos a "{new_summary}"?'
-        )
+        human_q = f'¿Seguimos con "{(prev_summary or "el tema anterior")}" o pasamos a "{new_summary}"?'
         system_msg += "\nSi detectas cambio de tema, pregunta primero: " + human_q
 
     contexto_msg = "Contexto recuperado (frases reales de Wilder):\n" + (contexto if contexto else "(sin coincidencias relevantes)")
@@ -555,7 +541,6 @@ async def responder(data: Entrada):
             conv_ref.update({"contact_info": new_info})
             if tel:  # contacto "suficiente"
                 conv_ref.update({"contact_collected": True})
-                # Refrescar 'usuarios' si corresponde
                 upsert_usuario_o_anon(chat_id, new_info.get("nombre") or data.nombre or data.usuario, tel, data.canal)
 
         # === Política de argumento y contacto ===
@@ -626,7 +611,6 @@ async def responder(data: Entrada):
             nombre_txt = (parsed.get("nombre") or "").strip()
             cierre = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
             cierre += "Con estos datos escalamos el caso y te contamos avances."
-            # Si el modelo pidió de nuevo contacto, sustituimos por el cierre
             if "tel" in texto.lower() or "celu" in texto.lower() or len(texto) < 30:
                 texto = cierre
             else:
@@ -668,7 +652,7 @@ def get_prompt_base() -> str:
 def read_last_user_and_bot(chat_id: str) -> Tuple[str, str, dict]:
     conv_ref = db.collection("conversaciones").document(chat_id)
     snap = conv_ref.get()
-    if not snap.exists():
+    if not snap.exists:   # propiedad .exists
         return "", "", {}
     data = snap.to_dict() or {}
     mensajes = data.get("mensajes", [])
