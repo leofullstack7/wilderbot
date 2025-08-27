@@ -166,12 +166,16 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             "topics_history": [],
 
             # === Flujo argumento + contacto ===
-            "argument_requested": False,   # ya hicimos la ÚNICA pregunta de argumento
-            "argument_collected": False,   # el ciudadano ya respondió a esa pregunta
+            "argument_requested": False,   # hicimos la ÚNICA pregunta de argumento
+            "argument_collected": False,   # el ciudadano ya respondió
             "contact_intent": None,        # 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
             "contact_requested": False,
             "contact_collected": False,    # True solo si hay teléfono
+            "contact_refused": False,      # rechazo explícito
             "contact_info": {"nombre": None, "barrio": None, "telefono": None},
+
+            # Lugar de la propuesta (no confundir con barrio de residencia)
+            "project_location": None,
         })
     else:
         conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
@@ -235,14 +239,86 @@ def is_plain_greeting(text: str) -> bool:
     return short and has_kw and not topicish
 
 def has_argument_text(t: str) -> bool:
-    """Heurística simple para detectar 'argumento/razón' en el turno del ciudadano."""
+    """
+    Heurística para detectar 'argumento/razón'.
+    Más estricta: NO dispara por 'para' suelto (evita falsos positivos como 'para los niños').
+    """
     t = _normalize_text(t)
     keys = [
-        "porque","ya que","debido","para que","para ","peligro","riesgo","falta","no hay",
-        "estan oxida","esta roto","es necesario","urge","hace falta","afecta","impacta","contamina",
-        "seguridad","salud","empleo","tránsito","movilidad","ambiental"
+        "porque", "ya que", "debido", "por que", "porqué",
+        "afecta", "impacta", "riesgo", "peligro",
+        "falta", "no hay", "urge", "es necesario", "contamina",
+        "seguridad", "salud", "empleo", "movilidad", "ambiental"
     ]
     return any(k in t for k in keys)
+
+# =========================================================
+#  Extracciones específicas
+# =========================================================
+
+def extract_user_name(text: str) -> Optional[str]:
+    m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40})', text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Nombre al inicio antes de coma o conectores
+    m = re.search(r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)', text)
+    if m:
+        posible = m.group(1).strip()
+        if posible.lower() not in {"hola","buenas","buenos dias","buenas tardes","buenas noches"}:
+            return posible
+    return None
+
+def extract_phone(text: str) -> Optional[str]:
+    m = re.search(r'(\+?\d[\d\s\-]{7,14}\d)', text)
+    if not m:
+        return None
+    tel = re.sub(r'\D', '', m.group(1))
+    return tel if 8 <= len(tel) <= 12 else None
+
+def extract_user_barrio(text: str) -> Optional[str]:
+    """
+    Solo tomamos barrio de RESIDENCIA con patrones explícitos (para no confundir con el del proyecto).
+    """
+    patterns = [
+        r'\bvivo en el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})',
+        r'\bresido en el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})',
+        r'\bsoy del barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})',
+        r'\bmi barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})',
+    ]
+    for p in patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip(" .,")
+    return None
+
+def extract_project_location(text: str) -> Optional[str]:
+    """
+    Detecta ubicación de la propuesta (p.ej., 'parque en el barrio Colinas').
+    No se guarda como contacto.
+    """
+    m = re.search(r'(?:parque|colegio|cancha|centro|obra|hospital|biblioteca|sendero|paradero|jardin)\s+(?:en|para)\s+el\s+barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip(" .,")
+    # fallback genérico 'en el barrio X' si el mensaje habla de 'construir'/'hacer'
+    if re.search(r'\b(construir|hacer|instalar|crear|mejorar)\b', text, flags=re.IGNORECASE):
+        m = re.search(r'\ben el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip(" .,")
+    return None
+
+def detect_contact_refusal(text: str) -> bool:
+    t = _normalize_text(text)
+    patterns = [
+        "no me gusta dar mis datos",
+        "no quiero compartir mis datos",
+        "prefiero no dar mis datos",
+        "no doy mi celular",
+        "no comparto informacion personal",
+        "no comparto datos personales",
+        "no quiero dar mi telefono",
+        "no quiero dar mi numero",
+    ]
+    return any(p in t for p in patterns)
 
 # =========================================================
 #  Pequeñas “LLM tools” (clasificadores ligeros)
@@ -323,43 +399,22 @@ def llm_contact_policy(summary_so_far: str, last_user: str) -> Dict[str, Any]:
     data.setdefault("reason", "")
     return data
 
-
-def parse_contact_from_text(text: str) -> Dict[str, Optional[str]]:
-    """
-    - Teléfono: dígitos con 8-12 números (Col: 10).
-    - Nombre: 'soy|me llamo|mi nombre es' O nombre al inicio antes de coma/‘vivo…’.
-    - Barrio: patrones de 'barrio X' y variantes ('en el barrio', 'del barrio').
-    """
-    tel = None
-    m = re.search(r'(\+?\d[\d\s\-]{7,14}\d)', text)
-    if m:
-        tel = re.sub(r'\D', '', m.group(1))
-        if len(tel) < 8 or len(tel) > 12:
-            tel = None
-
-    nombre = None
-    m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40})', text, flags=re.IGNORECASE)
-    if m:
-        nombre = m.group(1).strip()
-    if not nombre:
-        m = re.search(r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)', text)
-        if m:
-            posible = m.group(1).strip()
-            if posible.lower() not in {"hola","buenas","buenos dias","buenas tardes","buenas noches"}:
-                nombre = posible
-
-    barrio = None
-    m = re.search(r'\b(?:en el|en la|del|de la|de el)?\s*barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=,|\.|\s+es\b|\s+mi\b|\s+y\b|$)', text, flags=re.IGNORECASE)
-    if m:
-        barrio = m.group(1).strip(" .,")
-
-    return {"nombre": nombre, "barrio": barrio, "telefono": tel}
+# =========================================================
+#  Contact helpers
+# =========================================================
 
 def build_contact_request(missing: List[str]) -> str:
     etiquetas = {"nombre": "tu nombre", "barrio": "tu barrio", "celular": "un número de contacto"}
     pedir = [etiquetas[m] for m in missing]
     frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
     return f"Para escalar y darle seguimiento, ¿me compartes {frase}? Lo usamos solo para informarte avances."
+
+PRIVACY_REPLY = (
+    "Entiendo perfectamente que quieras proteger tu información personal. "
+    "Queremos que sepas que tus datos están completamente seguros con nosotros. "
+    "Cumplimos con todas las normativas de protección de datos y solo usamos tu información "
+    "para escalar tu propuesta y ayudar a que pueda hacerse realidad."
+)
 
 # =========================================================
 #  RAG
@@ -514,18 +569,28 @@ async def responder(data: Entrada):
         else:
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
-        # === PARSING CONTACTO ===
-        parsed = parse_contact_from_text(data.mensaje)
-        partials = {k: v for k, v in parsed.items() if v}
-        tel = parsed.get("telefono")
+        # === EXTRAER datos sueltos del texto ===
+        # Nombre y teléfono (para contacto)
+        name = extract_user_name(data.mensaje)
+        phone = extract_phone(data.mensaje)
+        user_barrio = extract_user_barrio(data.mensaje)  # residencia
+        proj_loc = extract_project_location(data.mensaje)  # ubicación propuesta
+
+        if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
+            conv_ref.update({"project_location": proj_loc})
+
+        partials = {}
+        if name:   partials["nombre"] = name
+        if phone:  partials["telefono"] = phone
+        if user_barrio: partials["barrio"] = user_barrio
 
         if partials:
             current_info = (conv_data.get("contact_info") or {})
-            new_info = {**current_info, **{k: v or current_info.get(k) for k, v in parsed.items()}}
+            new_info = {**current_info, **{k: v or current_info.get(k) for k, v in partials.items()}}
             conv_ref.update({"contact_info": new_info})
-            if tel:
+            if phone:
                 conv_ref.update({"contact_collected": True})
-                upsert_usuario_o_anon(chat_id, new_info.get("nombre") or data.nombre or data.usuario, tel, data.canal)
+                upsert_usuario_o_anon(chat_id, new_info.get("nombre") or data.nombre or data.usuario, phone, data.canal)
 
         # === Política argumento + contacto ===
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
@@ -536,9 +601,8 @@ async def responder(data: Entrada):
         just_asked_argument = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
         user_replied_after_arg_q = just_asked_argument and (len(_normalize_text(data.mensaje)) >= 5)
 
-        # Consideramos argumento listo si:
-        #  a) respondió tras nuestra pregunta (aunque no diga "porque"), o
-        #  b) el texto contiene señales de argumento.
+        # Consideramos argumento listo SOLO si respondió a nuestra pregunta
+        # o si hay señales fuertes (porque/ya que/debido…).
         argument_ready = user_replied_after_arg_q or has_argument_text(data.mensaje)
         if argument_ready and not conv_data.get("argument_collected"):
             conv_ref.update({"argument_collected": True})
@@ -550,25 +614,46 @@ async def responder(data: Entrada):
         if need_argument_now:
             conv_ref.update({"argument_requested": True})
 
-        # ¿Debemos pedir contacto ahora? (solo después de tener argumento)
+        # ¿El usuario rechazó dar datos?
+        if detect_contact_refusal(data.mensaje):
+            conv_ref.update({"contact_refused": True, "contact_requested": True})
+
+        # ¿Debemos pedir contacto ahora? -> SOLO después de tener argumento (no en 1er turno)
         already_req = bool(conv_data.get("contact_requested"))
-        already_col = bool(conv_data.get("contact_collected")) or bool(tel)
+        already_col = bool(conv_data.get("contact_collected")) or bool(phone)
+        contact_refused = bool(conv_data.get("contact_refused"))
         should_ask_now = (policy.get("should_request")
                           and intent in ("propuesta", "problema")
-                          and (conv_data.get("argument_collected") or argument_ready)
-                          and not already_col)
+                          and bool(conv_data.get("argument_collected"))   # <-- clave: ya tenemos argumento
+                          and not already_col
+                          and not contact_refused)
 
         if should_ask_now and not already_req:
             conv_ref.update({"contact_intent": intent, "contact_requested": True})
 
         # Si toca pedir contacto y el usuario no dio nada aún -> atajo directo
-        if should_ask_now and not partials:
-            texto_directo = build_contact_request(["nombre", "celular"])
+        if should_ask_now and not (name or phone or user_barrio):
+            # No pidas nombre si ya lo extrajimos previamente en la conversación
+            info_actual = (conv_data.get("contact_info") or {})
+            faltan = []
+            if not info_actual.get("nombre"): faltan.append("nombre")
+            if not info_actual.get("barrio"): faltan.append("barrio")
+            if not info_actual.get("telefono"): faltan.append("celular")
+            texto_directo = build_contact_request(faltan or ["celular"])
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto_directo}
             ])
             return {"respuesta": texto_directo, "fuentes": [], "chat_id": chat_id}
+
+        # Si el usuario rechazó dar datos y ya se los habíamos pedido -> envia mensaje de tranquilidad
+        if contact_refused and already_req and not already_col:
+            texto = PRIVACY_REPLY
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": texto}
+            ])
+            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
         # 4) RAG + prompt final
         hits = rag_search(data.mensaje, top_k=5)
@@ -598,8 +683,8 @@ async def responder(data: Entrada):
         texto = completion.choices[0].message.content.strip()
 
         # --- POST: cierre conciso si llegó teléfono en este turno ---
-        if tel:
-            nombre_txt = (parsed.get("nombre") or "").strip()
+        if phone:
+            nombre_txt = (name or (conv_data.get("contact_info") or {}).get("nombre") or "").strip()
             cierre = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
             cierre += "Con estos datos escalamos el caso y te contamos avances."
             if "tel" in texto.lower() or "celu" in texto.lower() or len(texto) < 30:
@@ -607,14 +692,13 @@ async def responder(data: Entrada):
             else:
                 texto += "\n\n" + cierre
 
-        # --- POST: si falta algo y ya toca pedir contacto -> pide lo faltante ---
-        elif partials and should_ask_now:
+        # --- POST: si falta algo y ya toca pedir contacto -> pide lo que falte (sin repetir lo ya dado) ---
+        elif should_ask_now:
             info_actual = (conv_data.get("contact_info") or {})
             missing = []
-            if not (info_actual.get("nombre") or parsed.get("nombre")):
-                missing.append("nombre")
-            if not (info_actual.get("telefono") or parsed.get("telefono")):
-                missing.append("celular")
+            if not (info_actual.get("nombre") or name):   missing.append("nombre")
+            if not (info_actual.get("barrio") or user_barrio): missing.append("barrio")
+            if not (info_actual.get("telefono") or phone): missing.append("celular")
             if missing:
                 texto = build_contact_request(missing)
 
