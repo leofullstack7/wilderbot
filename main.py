@@ -400,7 +400,7 @@ def llm_contact_policy(summary_so_far: str, last_user: str) -> Dict[str, Any]:
     return data
 
 # =========================================================
-#  Contact helpers
+#  Contact helpers y control de flujo
 # =========================================================
 
 def build_contact_request(missing: List[str]) -> str:
@@ -415,6 +415,28 @@ PRIVACY_REPLY = (
     "Cumplimos con todas las normativas de protección de datos y solo usamos tu información "
     "para escalar tu propuesta y ayudar a que pueda hacerse realidad."
 )
+
+# --- NUEVO: helpers para forzar pregunta de argumento y limpiar pedidos de contacto
+def craft_argument_question(name: Optional[str], project_location: Optional[str]) -> str:
+    saludo = f"Hola, {name}." if name else "¡Qué buena iniciativa!"
+    lugar = f" en el barrio {project_location}" if project_location else ""
+    # 1 sola pregunta, sin pedir datos
+    return (
+        f"{saludo} La idea de construir un parque{lugar} suena excelente para fomentar espacios de recreación. "
+        "¿Por qué crees que deba hacerse en ese sector?"
+    )
+
+CONTACT_PATTERNS = re.compile(
+    r"(compart(e|ir)|env(í|i)a|dime|indícame|facilítame).{0,40}"
+    r"(tu\s+)?(nombre|barrio|celular|tel[eé]fono|n[uú]mero|contacto)", re.IGNORECASE)
+
+def strip_contact_requests(texto: str) -> str:
+    # Elimina frases que pidan datos de contacto si aún no corresponde
+    # Dividimos por oraciones simples para remover selectivamente
+    sent_split = re.split(r'(?<=[\.\?!])\s+', texto.strip())
+    limpio = [s for s in sent_split if not CONTACT_PATTERNS.search(s)]
+    out = " ".join([s for s in limpio if s])
+    return out if out else texto
 
 # =========================================================
 #  RAG
@@ -570,7 +592,6 @@ async def responder(data: Entrada):
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
         # === EXTRAER datos sueltos del texto ===
-        # Nombre y teléfono (para contacto)
         name = extract_user_name(data.mensaje)
         phone = extract_phone(data.mensaje)
         user_barrio = extract_user_barrio(data.mensaje)  # residencia
@@ -614,6 +635,15 @@ async def responder(data: Entrada):
         if need_argument_now:
             conv_ref.update({"argument_requested": True})
 
+        # --- NUEVO: si toca pedir argumento, no usamos LLM; respondemos con UNA sola pregunta
+        if need_argument_now:
+            texto = craft_argument_question(name, proj_loc)
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": texto}
+            ])
+            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
         # ¿El usuario rechazó dar datos?
         if detect_contact_refusal(data.mensaje):
             conv_ref.update({"contact_refused": True, "contact_requested": True})
@@ -633,11 +663,10 @@ async def responder(data: Entrada):
 
         # Si toca pedir contacto y el usuario no dio nada aún -> atajo directo
         if should_ask_now and not (name or phone or user_barrio):
-            # No pidas nombre si ya lo extrajimos previamente en la conversación
             info_actual = (conv_data.get("contact_info") or {})
             faltan = []
-            if not info_actual.get("nombre"): faltan.append("nombre")
-            if not info_actual.get("barrio"): faltan.append("barrio")
+            if not info_actual.get("nombre"):   faltan.append("nombre")
+            if not info_actual.get("barrio"):   faltan.append("barrio")
             if not info_actual.get("telefono"): faltan.append("celular")
             texto_directo = build_contact_request(faltan or ["celular"])
             append_mensajes(conv_ref, [
@@ -667,7 +696,7 @@ async def responder(data: Entrada):
             new_summary=curr_sum,
             intro_hint=intro_hint,
             emphasize_contact=should_ask_now,
-            emphasize_argument=need_argument_now,   # <-- SOLO una pregunta de argumento
+            emphasize_argument=False,   # ya no toca: si tocaba, devolvimos antes
             intent=intent,
             contact_already_requested=already_req,
             contact_already_collected=already_col,
@@ -681,6 +710,10 @@ async def responder(data: Entrada):
             max_tokens=280
         )
         texto = completion.choices[0].message.content.strip()
+
+        # --- NUEVO: si aún NO debemos pedir contacto, limpiamos cualquier intento del LLM
+        if not should_ask_now:
+            texto = strip_contact_requests(texto)
 
         # --- POST: cierre conciso si llegó teléfono en este turno ---
         if phone:
@@ -696,9 +729,9 @@ async def responder(data: Entrada):
         elif should_ask_now:
             info_actual = (conv_data.get("contact_info") or {})
             missing = []
-            if not (info_actual.get("nombre") or name):   missing.append("nombre")
+            if not (info_actual.get("nombre") or name):        missing.append("nombre")
             if not (info_actual.get("barrio") or user_barrio): missing.append("barrio")
-            if not (info_actual.get("telefono") or phone): missing.append("celular")
+            if not (info_actual.get("telefono") or phone):     missing.append("celular")
             if missing:
                 texto = build_contact_request(missing)
 
