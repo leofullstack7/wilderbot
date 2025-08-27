@@ -175,7 +175,7 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             # intención detectada: 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
             "contact_intent": None,
             "contact_requested": False,     # ya pedimos datos
-            "contact_collected": False,     # ya recibimos algún dato
+            "contact_collected": False,     # ya recibimos algún dato (ojo: se considera suficiente solo si hay teléfono)
             "contact_info": {               # lo que logremos extraer
                 "nombre": None,
                 "barrio": None,
@@ -355,6 +355,23 @@ def parse_contact_from_text(text: str) -> Dict[str, Optional[str]]:
 
     return {"nombre": nombre, "barrio": barrio, "telefono": tel}
 
+def build_contact_request(missing: List[str]) -> str:
+    # missing puede contener: "nombre", "barrio", "celular"
+    etiquetas = {
+        "nombre": "tu nombre",
+        "barrio": "tu barrio",
+        "celular": "un número de contacto"
+    }
+    pedir = [etiquetas[m] for m in missing]
+    if len(pedir) == 1:
+        frase = pedir[0]
+    else:
+        frase = ", ".join(pedir[:-1]) + " y " + pedir[-1]
+    return (
+        f"Gracias por los detalles. Para escalar el caso y darle seguimiento, "
+        f"¿me compartes {frase}? Lo usamos solo para informarte avances."
+    )
+
 # =========================================================
 #  RAG
 # =========================================================
@@ -519,38 +536,40 @@ async def responder(data: Entrada):
         else:
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
-        # === NUEVO: detectar datos de contacto en el mensaje actual ===
-        parsed = parse_contact_from_text(data.mensaje)
-        got_any_contact = any(parsed.values())
+        # === PARSING DE CONTACTO (no cerrar sin teléfono) ===
+        parsed = parse_contact_from_text(data.mensaje)           # {"nombre":..., "barrio":..., "telefono":...}
+        partials = {k: v for k, v in parsed.items() if v}
+        tel = parsed.get("telefono")
 
-        if got_any_contact:
-            # Guardar en conv + usuarios
+        if partials:
             current_info = (conv_data.get("contact_info") or {})
             new_info = {**current_info, **{k: v or current_info.get(k) for k, v in parsed.items()}}
-            conv_ref.update({
-                "contact_collected": True,
-                "contact_info": new_info
-            })
-            # También en 'usuarios' si hay teléfono/nombre
-            tel = new_info.get("telefono")
-            nom = new_info.get("nombre") or (data.nombre or data.usuario)
-            if tel:
-                upsert_usuario_o_anon(chat_id, nom, tel, data.canal)
+            conv_ref.update({"contact_info": new_info})
+            if tel:  # contacto "suficiente"
+                conv_ref.update({"contact_collected": True})
+                # Refrescar 'usuarios' si corresponde
+                upsert_usuario_o_anon(chat_id, new_info.get("nombre") or data.nombre or data.usuario, tel, data.canal)
 
-        # === Política de cuándo pedir contacto ===
+        # === Política: ¿ya es momento de pedir contacto? ===
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
         intent = policy.get("intent", "otro")
-        already_req = bool((conv_data.get("contact_requested")))
-        already_col = bool((conv_data.get("contact_collected"))) or got_any_contact
+        already_req = bool(conv_data.get("contact_requested"))
+        already_col = bool(conv_data.get("contact_collected")) or bool(tel)
 
-        # Si debemos pedir contacto y aún no lo hicimos ni lo tenemos
-        emphasize_contact = (policy.get("should_request") and (not already_req) and (not already_col) and intent in ("propuesta","problema"))
+        should_ask_now = (policy.get("should_request") and intent in ("propuesta", "problema") and not already_col)
 
-        if emphasize_contact:
-            conv_ref.update({
-                "contact_intent": intent,
-                "contact_requested": True
-            })
+        # Marcar que pedimos contacto
+        if should_ask_now and not already_req:
+            conv_ref.update({"contact_intent": intent, "contact_requested": True})
+
+        # Si debemos pedir y el usuario no dio nada aún -> atajo (sin LLM)
+        if should_ask_now and not partials:
+            texto_directo = build_contact_request(["nombre", "celular"])  # barrio opcional
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": texto_directo}
+            ])
+            return {"respuesta": texto_directo, "fuentes": [], "chat_id": chat_id}
 
         # 4) RAG + prompt final
         hits = rag_search(data.mensaje, top_k=5)
@@ -563,7 +582,7 @@ async def responder(data: Entrada):
             prev_summary=prev_sum,
             new_summary=curr_sum,
             intro_hint=intro_hint,
-            emphasize_contact=emphasize_contact,
+            emphasize_contact=should_ask_now,
             intent=intent,
             contact_already_requested=already_req,
             contact_already_collected=already_col,
@@ -578,18 +597,27 @@ async def responder(data: Entrada):
         )
         texto = completion.choices[0].message.content.strip()
 
-        # Si el usuario ya dio contacto en este mismo turno, forzamos un cierre amable
-        if got_any_contact:
-            nombre_txt = parsed.get("nombre") or ""
-            cierre = (
-                f"¡Gracias {nombre_txt}!" if nombre_txt else "¡Gracias!"
-            )
-            cierre += " Con estos datos podemos escalar el caso y hacer seguimiento. Te iremos contando avances."
-            # Evitar dobletes largos: si el modelo volvió a pedir contacto, lo reemplazamos por cierre
-            if len(texto) < 30 or "tel" in texto.lower() or "celu" in texto.lower():
+        # --- POST: cierre amable si llegó teléfono en este turno ---
+        if tel:
+            nombre_txt = (parsed.get("nombre") or "").strip()
+            cierre = (f"¡Gracias {nombre_txt}! " if nombre_txt else "¡Gracias! ")
+            cierre += "Con estos datos podemos escalar el caso y hacer seguimiento. Te iremos contando avances."
+            # Si el modelo pidió de nuevo contacto, sustituimos por el cierre
+            if "tel" in texto.lower() or "celu" in texto.lower() or len(texto) < 30:
                 texto = cierre
             else:
-                texto = texto + "\n\n" + cierre
+                texto += "\n\n" + cierre
+
+        # --- POST: si no hay teléfono pero sí dio algo y tocaba pedir -> pide lo que falta ---
+        elif partials and should_ask_now:
+            info_actual = (conv_data.get("contact_info") or {})
+            missing = []
+            if not (info_actual.get("nombre") or parsed.get("nombre")):
+                missing.append("nombre")
+            if not (info_actual.get("telefono") or parsed.get("telefono")):
+                missing.append("celular")
+            if missing:
+                texto = build_contact_request(missing)
 
         # 6) Guardar turnos
         append_mensajes(conv_ref, [
