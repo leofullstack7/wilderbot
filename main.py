@@ -149,10 +149,10 @@ def upsert_usuario_o_anon(chat_id: str, nombre: Optional[str], telefono: Optiona
 
 def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]):
     """
-    Crea conversaciones/{chat_id} si no existe y añade campos de contacto.
+    Crea conversaciones/{chat_id} si no existe y añade campos de contacto y flags de argumento.
     """
     conv_ref = db.collection("conversaciones").document(chat_id)
-    if not conv_ref.get().exists:
+    if not conv_ref.get().exists():
         conv_ref.set({
             "usuario_id": usuario_id,
             "faq_origen": faq_origen or None,
@@ -171,11 +171,13 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             "candidate_new_topic_vec": None,
             "topics_history": [],
 
-            # === Flujo de contacto ===
+            # === Flujo de argumento + contacto ===
+            "argument_requested": False,   # ya pedimos una pregunta de argumento
+            "argument_collected": False,   # detectamos motivo/impacto del ciudadano
             # intención detectada: 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
             "contact_intent": None,
-            "contact_requested": False,     # ya pedimos datos
-            "contact_collected": False,     # solo en True si hay teléfono
+            "contact_requested": False,    # ya pedimos datos
+            "contact_collected": False,    # solo True si hay teléfono
             "contact_info": {
                 "nombre": None,
                 "barrio": None,
@@ -248,7 +250,8 @@ def has_argument_text(t: str) -> bool:
     t = _normalize_text(t)
     keys = [
         "porque","ya que","debido","para que","para ","peligro","riesgo","falta","no hay",
-        "estan oxida","esta roto","es necesario","urge","hace falta","afecta","impacta"
+        "estan oxida","esta roto","es necesario","urge","hace falta","afecta","impacta","contamina",
+        "seguridad","salud","empleo","tránsito","movilidad","ambiental"
     ]
     return any(k in t for k in keys)
 
@@ -305,8 +308,6 @@ def llm_contact_policy(summary_so_far: str, last_user: str) -> Dict[str, Any]:
     """
     Decide si corresponde PEDIR contacto ahora y el tipo de intención.
     Devuelve JSON: { "should_request": bool, "intent": "propuesta|problema|reconocimiento|otro", "reason": "..." }
-    Criterio: cuando el ciudadano ya enunció una acción/idea concreta o una necesidad específica.
-    No pedir para 'reconocimiento' salvo que el usuario quiera que contactemos.
     """
     sys = (
         "Eres un clasificador de intención y oportunidad de contacto para un bot cívico.\n"
@@ -315,7 +316,7 @@ def llm_contact_policy(summary_so_far: str, last_user: str) -> Dict[str, Any]:
         "Reglas:\n"
         "- PIDE contacto cuando hay propuesta/acción específica o problema concreto con detalles.\n"
         "- NO preguntes si es un reconocimiento/elogio sin pedido de gestión.\n"
-        "- Evita desviar con preguntas como '¿ya hablaste con X?'. El bot es el intermediario.\n"
+        "- Evita desviar con preguntas como '¿ya hablaste con X?'. El bot es el intermediario."
     )
     usr = (
         f"Tema/Resumen vigente: {summary_so_far or '(ninguno)'}\n"
@@ -364,7 +365,6 @@ def parse_contact_from_text(text: str) -> Dict[str, Optional[str]]:
         m = re.search(r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)', text)
         if m:
             posible = m.group(1).strip()
-            # Evitar falsos positivos como "Hola"
             if posible.lower() not in {"hola","buenas","buenos dias","buenas tardes","buenas noches"}:
                 nombre = posible
 
@@ -378,20 +378,10 @@ def parse_contact_from_text(text: str) -> Dict[str, Optional[str]]:
 
 def build_contact_request(missing: List[str]) -> str:
     # missing puede contener: "nombre", "barrio", "celular"
-    etiquetas = {
-        "nombre": "tu nombre",
-        "barrio": "tu barrio",
-        "celular": "un número de contacto"
-    }
+    etiquetas = {"nombre": "tu nombre", "barrio": "tu barrio", "celular": "un número de contacto"}
     pedir = [etiquetas[m] for m in missing]
-    if len(pedir) == 1:
-        frase = pedir[0]
-    else:
-        frase = ", ".join(pedir[:-1]) + " y " + pedir[-1]
-    return (
-        f"Gracias por los detalles. Para escalar el caso y darle seguimiento, "
-        f"¿me compartes {frase}? Lo usamos solo para informarte avances."
-    )
+    frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
+    return f"Para escalar y darle seguimiento, ¿me compartes {frase}? Lo usamos solo para informarte avances."
 
 # =========================================================
 #  RAG
@@ -422,6 +412,7 @@ def build_messages(
     new_summary: str = "",
     intro_hint: bool = False,
     emphasize_contact: bool = False,
+    emphasize_argument: bool = False,
     intent: str = "otro",
     contact_already_requested: bool = False,
     contact_already_collected: bool = False,
@@ -430,38 +421,34 @@ def build_messages(
 
     system_msg = (
         "Actúa como Wilder Escobar, Representante a la Cámara en Colombia.\n"
-        "Tono cercano, empático y humano. **Máximo 4 frases**.\n"
+        "Tono cercano y claro. **Máximo 3–4 frases, sin párrafos largos.**\n"
         "Sé el **intermediario**: evita preguntar si ya habló con otras autoridades; enfoca en escuchar y canalizar.\n"
-        "Cuando pidas datos, haz **una sola solicitud clara** (nombre, barrio y celular — acepta lo que el ciudadano quiera dar).\n"
+        "No saludes de nuevo ('Hola', etc.). Llama por el nombre solo si ya lo sabes.\n"
+        "Cuando pidas datos, haz **una sola solicitud** (nombre, barrio y celular; acepta lo que la persona quiera dar)."
     )
 
     if intro_hint:
+        system_msg += "\nSi es solo un saludo y no hay tema, preséntate e invita con **una pregunta** a contar la situación o idea."
+
+    if emphasize_argument:
         system_msg += (
-            "\nCUANDO SEA SOLO UN SALUDO (sin tema): preséntate brevemente e invita a contar la situación/idea con **una** pregunta."
+            "\nAHORA PRIORIZA UNA ÚNICA PREGUNTA BREVE para entender el **motivo/impacto** o un detalle clave de la propuesta/problema. "
+            "No pidas contacto en este turno."
         )
 
-    # Contact policy
     if emphasize_contact and intent in ("propuesta", "problema") and (not contact_already_collected):
         system_msg += (
-            "\nAHORA PRIORIZA PEDIR CONTACTO: Agradece la idea/detalle y pide con suavidad nombre, barrio y celular "
-            "para escalar el caso. Aclara que es para darle seguimiento. No hagas más preguntas abiertas."
+            "\nAHORA PRIORIZA PEDIR CONTACTO: Agradece el detalle y solicita con suavidad nombre, barrio y celular "
+            "para escalar el caso y dar seguimiento. No hagas más preguntas abiertas."
         )
     elif intent == "reconocimiento":
-        system_msg += (
-            "\nSi es un **reconocimiento/elogio**, agradece, no pidas contacto (salvo que el ciudadano explícitamente quiera que los contactemos)."
-        )
+        system_msg += "\nSi es un reconocimiento/elogio, agradece y no pidas contacto salvo que lo solicite."
 
     if topic_change_suspect and new_summary:
         human_q = (
-            f'Valoro mucho tus aportes, ¿quieres que terminemos de hablar acerca de '
-            f'"{(prev_summary or "el tema anterior")}" o prefieres que pasemos a hablar '
-            f'sobre "{new_summary}"?'
+            f'Valoro tus aportes, ¿seguimos con "{(prev_summary or "el tema anterior")}" o pasamos a "{new_summary}"?'
         )
-        system_msg += (
-            "\nDetecto posible **cambio de tema**. Primero pregunta con aprecio:\n"
-            f'- "{human_q}"\n'
-            "Espera confirmación antes de registrar como tema aparte."
-        )
+        system_msg += "\nSi detectas cambio de tema, pregunta primero: " + human_q
 
     contexto_msg = "Contexto recuperado (frases reales de Wilder):\n" + (contexto if contexto else "(sin coincidencias relevantes)")
 
@@ -557,7 +544,7 @@ async def responder(data: Entrada):
         else:
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
-        # === PARSING DE CONTACTO (no cerrar sin teléfono) ===
+        # === PARSING DE CONTACTO (no cerramos sin teléfono) ===
         parsed = parse_contact_from_text(data.mensaje)           # {"nombre":..., "barrio":..., "telefono":...}
         partials = {k: v for k, v in parsed.items() if v}
         tel = parsed.get("telefono")
@@ -571,24 +558,34 @@ async def responder(data: Entrada):
                 # Refrescar 'usuarios' si corresponde
                 upsert_usuario_o_anon(chat_id, new_info.get("nombre") or data.nombre or data.usuario, tel, data.canal)
 
-        # === Política: ¿ya es momento de pedir contacto? ===
-        # Requisito: que este turno sea respuesta a una repregunta del bot Y contenga argumento.
-        prev_role = historial_for_decider[-1]["role"] if historial_for_decider else None
-        argument_ready = (prev_role == "assistant") and has_argument_text(data.mensaje)
-
+        # === Política de argumento y contacto ===
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
         intent = policy.get("intent", "otro")
+
+        # ¿Este turno contiene argumento?
+        prev_role = historial_for_decider[-1]["role"] if historial_for_decider else None
+        argument_ready = (prev_role == "assistant") and has_argument_text(data.mensaje)
+        if argument_ready and not conv_data.get("argument_collected"):
+            conv_ref.update({"argument_collected": True})
+
+        # ¿Debemos pedir argumento ahora?
+        need_argument_now = (intent in ("propuesta", "problema")
+                             and not (conv_data.get("argument_requested") or conv_data.get("argument_collected")))
+        if need_argument_now:
+            conv_ref.update({"argument_requested": True})
+
+        # ¿Debemos pedir contacto ahora? (solo después de tener argumento)
         already_req = bool(conv_data.get("contact_requested"))
         already_col = bool(conv_data.get("contact_collected")) or bool(tel)
+        should_ask_now = (policy.get("should_request")
+                          and intent in ("propuesta", "problema")
+                          and (conv_data.get("argument_collected") or argument_ready)
+                          and not already_col)
 
-        should_ask_now = (argument_ready and policy.get("should_request")
-                          and intent in ("propuesta", "problema") and not already_col)
-
-        # Marcar que pedimos contacto
         if should_ask_now and not already_req:
             conv_ref.update({"contact_intent": intent, "contact_requested": True})
 
-        # Si debemos pedir y el usuario no dio nada aún -> atajo (sin LLM)
+        # Si debemos pedir contacto y el usuario no dio nada aún -> atajo (sin LLM)
         if should_ask_now and not partials:
             texto_directo = build_contact_request(["nombre", "celular"])  # barrio opcional
             append_mensajes(conv_ref, [
@@ -609,6 +606,7 @@ async def responder(data: Entrada):
             new_summary=curr_sum,
             intro_hint=intro_hint,
             emphasize_contact=should_ask_now,
+            emphasize_argument=need_argument_now,
             intent=intent,
             contact_already_requested=already_req,
             contact_already_collected=already_col,
@@ -618,16 +616,16 @@ async def responder(data: Entrada):
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            temperature=0.4,
-            max_tokens=350
+            temperature=0.3,
+            max_tokens=280
         )
         texto = completion.choices[0].message.content.strip()
 
-        # --- POST: cierre amable si llegó teléfono en este turno ---
+        # --- POST: cierre conciso si llegó teléfono en este turno ---
         if tel:
             nombre_txt = (parsed.get("nombre") or "").strip()
-            cierre = (f"¡Gracias {nombre_txt}! " if nombre_txt else "¡Gracias! ")
-            cierre += "Con estos datos podemos escalar el caso y hacer seguimiento. Te iremos contando avances."
+            cierre = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
+            cierre += "Con estos datos escalamos el caso y te contamos avances."
             # Si el modelo pidió de nuevo contacto, sustituimos por el cierre
             if "tel" in texto.lower() or "celu" in texto.lower() or len(texto) < 30:
                 texto = cierre
@@ -670,7 +668,7 @@ def get_prompt_base() -> str:
 def read_last_user_and_bot(chat_id: str) -> Tuple[str, str, dict]:
     conv_ref = db.collection("conversaciones").document(chat_id)
     snap = conv_ref.get()
-    if not snap.exists:
+    if not snap.exists():
         return "", "", {}
     data = snap.to_dict() or {}
     mensajes = data.get("mensajes", [])
