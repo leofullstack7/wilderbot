@@ -108,17 +108,28 @@ async def health():
 def normalize_chat_id(canal: Optional[str], chat_id: Optional[str]) -> str:
     """
     Prefijos por canal para evitar colisiones:
-    - whatsapp -> wa_<id>
-    - telegram -> tg_<id>
+    - whatsapp -> wa_<id> (acepta 'whatsapp', 'wa', 'whats')
+    - telegram -> tg_<id> (acepta 'telegram', 'tg', 'tele')
     - web/otros -> como venga o web_<hex> si falta
     """
     if chat_id:
-        if (canal or "").lower() == "whatsapp":
+        c = (canal or "").lower().strip()
+        if c.startswith("what") or c == "wa":
             return chat_id if chat_id.startswith("wa_") else f"wa_{chat_id}"
-        if (canal or "").lower() == "telegram":
+        if c.startswith("tele") or c == "tg":
             return chat_id if chat_id.startswith("tg_") else f"tg_{chat_id}"
         return chat_id
     return f"web_{os.urandom(4).hex()}"
+
+def canonical_canal(c: Optional[str]) -> str:
+    c = (c or "web").lower().strip()
+    if c.startswith("what") or c == "wa":
+        return "whatsapp"
+    if c.startswith("tele") or c == "tg":
+        return "telegram"
+    return c or "web"
+
+
 
 def resolve_existing_conversation_id(raw_id: str) -> str:
     """
@@ -389,19 +400,42 @@ def is_data_only_reply(text: str) -> bool:
 
 def intent_heuristic(text: str) -> str:
     t = _normalize_text(text)
-    # Propuesta (verbos/expresiones de acción)
+
+    # --- Propuesta (verbos/expresiones de acción) ---
     if "propon" in t or "propuesta" in t or (
         any(k in t for k in ("me gustaria","quiero","solicito","pido"))
-        and any(a in t for a in ("mejor","instal","arregl","constru","crear","repar","alumbr","luz","seguridad","parque","colegio","via"))
+        and any(a in t for a in ("mejor","instal","arregl","constru","crear","repar","alumbr","luz","seguridad","parque","colegio","via","vial","muro","poste","ilumin","anden","andén"))
     ):
         return "propuesta"
-    # Problema
-    if any(p in t for p in ("problema","denuncia","queja","no hay","sin luz","apagado","hueco","dañado","inseguridad","basura","fuga")):
+
+    # --- Problema (riesgo/daño/urgencia) ---
+    risk_tokens = (
+        "peligro","riesgo","accidente","se puede caer","se cae","se desploma","colapsa","colapso",
+        "derrumbe","desliz","grieta","grietas","fisura","fisuras","fractura","roto","rota",
+        "quebrado","quebrada","mal estado","muy mal estado","dañado","deteriorado","inundacion","inundación",
+        "sin luz","apagado","apagada","inseguridad","delincuencia","amenaza"
+    )
+    infra_tokens = (
+        "muro","pared","colegio","escuela","via","vial","calle","avenida","puente","parque","poste",
+        "alumbrado","luminaria","acera","anden","andén","alcantarilla","acueducto","hospital","eps","centro de salud"
+    )
+
+    # 1) "preocup..." + infraestructura suele ser reporte de problema
+    if "preocup" in t and any(i in t for i in infra_tokens):
         return "problema"
-    # Reconocimiento
+    # 2) riesgo/daño explícito
+    if any(r in t for r in risk_tokens):
+        return "problema"
+    # 3) infraestructura + estado negativo típico
+    if any(i in t for i in infra_tokens) and any(k in t for k in ("hueco","huecos","bache","baches","mal estado","se hunde","sin luz","apagado")):
+        return "problema"
+
+    # --- Reconocimiento ---
     if any(r in t for r in ("gracias","felicit","bien hecho","buen trabajo","apoyo")):
         return "reconocimiento"
+
     return "otro"
+
 
 def last_assistant_was_open_question(hist: List[Dict[str,str]]) -> Tuple[bool, str]:
     """Mira el último mensaje del asistente y decide si fue pregunta abierta."""
@@ -660,8 +694,9 @@ def build_messages(
 async def responder(data: Entrada):
     try:
         # Normaliza canal e id
-        canal = (data.canal or "web").lower().strip()
-        chat_id = normalize_chat_id(canal, data.chat_id)
+        canal_in = (data.canal or "web").lower().strip()
+        canal = canonical_canal(canal_in)
+        chat_id = normalize_chat_id(canal_in, data.chat_id)
 
         # Ignora vacíos
         if not data.mensaje or not data.mensaje.strip():
