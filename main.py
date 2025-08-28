@@ -8,6 +8,7 @@
 #   * Reconocimiento de datos sueltos SOLO si no hay verbos de acción ni argumento
 #   * Mensajes de “ack + continuidad” contextuales (no plantilla fija)
 #   * Normalización de chat_id en ambos endpoints
+#   * **Primero se argumenta y luego, recién, se piden datos**
 # ============================
 
 from fastapi import FastAPI
@@ -720,33 +721,18 @@ async def responder(data: Entrada):
         just_asked_argument = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
         user_replied_after_arg_q = just_asked_argument and (len(_normalize_text(data.mensaje)) >= 2)
 
+        # Marcar argumento colectado si corresponde
         argument_ready = user_replied_after_arg_q or has_argument_text(data.mensaje)
         if argument_ready and not conv_data.get("argument_collected"):
             conv_ref.update({"argument_collected": True})
 
+        # ⚠️ IMPORTANTE:
+        # * Siempre pedimos argumentación la PRIMERA vez que se detecta propuesta/problema,
+        #   aunque el mensaje ya traiga argumento.
         need_argument_now = (intent in ("propuesta", "problema")
-                             and not conv_data.get("argument_requested")
-                             and not conv_data.get("argument_collected"))
+                             and not conv_data.get("argument_requested"))
         if need_argument_now:
             conv_ref.update({"argument_requested": True})
-
-        # -------- ACK + continuidad (contextual) --------
-        if was_open_q and not conv_data.get("argument_collected") and (is_data_only_reply(data.mensaje) or is_short_ack(data.mensaje)):
-            found = {
-                "name": name,
-                "phone": phone,
-                "barrio_res": user_barrio,
-                "barrio_proj": any_barrio
-            }
-            texto = craft_ack_continue(prev_sum or curr_sum, {k:v for k,v in found.items() if v})
-            append_mensajes(conv_ref, [
-                {"role": "user", "content": data.mensaje},
-                {"role": "assistant", "content": texto}
-            ])
-            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-
-        # Si toca pedir argumento (turno normal), sin pedir contacto
-        if need_argument_now:
             texto = craft_argument_question(name, proj_loc, prev_sum or curr_sum)
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
@@ -758,13 +744,16 @@ async def responder(data: Entrada):
         if detect_contact_refusal(data.mensaje):
             conv_ref.update({"contact_refused": True, "contact_requested": True})
 
-        # ¿Debemos pedir contacto ahora? -> solo después del argumento
+        # ¿Debemos pedir contacto ahora?
         already_req = bool(conv_data.get("contact_requested"))
         already_col = bool(conv_data.get("contact_collected")) or bool(phone)
         contact_refused = bool(conv_data.get("contact_refused"))
+
+        # ✅ Solo pedimos contacto DESPUÉS de haber preguntado por argumento (alguna vez)
         should_ask_now = (policy.get("should_request")
                           and intent in ("propuesta", "problema")
                           and bool(conv_data.get("argument_collected"))
+                          and (bool(conv_data.get("argument_requested")) or just_asked_argument)
                           and not already_col
                           and not contact_refused)
 
