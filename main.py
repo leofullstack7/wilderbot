@@ -386,6 +386,22 @@ def is_data_only_reply(text: str) -> bool:
         return False
     return len(t) <= 80
 
+def intent_heuristic(text: str) -> str:
+    t = _normalize_text(text)
+    # Propuesta (verbos/expresiones de acción)
+    if "propon" in t or "propuesta" in t or (
+        any(k in t for k in ("me gustaria","quiero","solicito","pido"))
+        and any(a in t for a in ("mejor","instal","arregl","constru","crear","repar","alumbr","luz","seguridad","parque","colegio","via"))
+    ):
+        return "propuesta"
+    # Problema
+    if any(p in t for p in ("problema","denuncia","queja","no hay","sin luz","apagado","hueco","dañado","inseguridad","basura","fuga")):
+        return "problema"
+    # Reconocimiento
+    if any(r in t for r in ("gracias","felicit","bien hecho","buen trabajo","apoyo")):
+        return "reconocimiento"
+    return "otro"
+
 def last_assistant_was_open_question(hist: List[Dict[str,str]]) -> Tuple[bool, str]:
     """Mira el último mensaje del asistente y decide si fue pregunta abierta."""
     last_assistant = ""
@@ -746,6 +762,10 @@ async def responder(data: Entrada):
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
         intent = policy.get("intent", "otro")
 
+        # Refuerzo determinístico para no fallar en el primer turno
+        ih = intent_heuristic(data.mensaje)
+        if ih in ("propuesta","problema","reconocimiento"):
+            intent = ih
         # ¿Acabamos de pedir argumento?
         last_role = historial_for_decider[-1]["role"] if historial_for_decider else None
         just_asked_argument = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
@@ -762,7 +782,7 @@ async def responder(data: Entrada):
                                and not asked_argument_before)
         if (intent in ("propuesta","problema") and not conv_data.get("argument_requested")) or need_argument_first:
             conv_ref.update({"argument_requested": True})
-            texto = craft_argument_question(name, proj_loc, prev_sum or curr_sum)
+            texto = craft_argument_question(name, proj_loc, data.mensaje)
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto}
