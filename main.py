@@ -2,22 +2,18 @@
 #  WilderBot API (FastAPI)
 #  - /responder : RAG + historial + guardado en tu BD
 #  - /clasificar: clasifica la conversación y actualiza panel
-#  Adaptado para WhatsApp y Telegram (chat_id normalizado)
+#  Correcciones: gating de clasificación, continuidad de tema,
+#  reconocimiento de datos sueltos (barrio, sí/no, tel, nombre),
+#  y normalización de chat_id en ambos endpoints.
 # ============================
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-# --- OpenAI (SDK v1.x) para chat y embeddings
 from openai import OpenAI
-
-# --- Pinecone (SDK nuevo) para búsqueda vectorial
 from pinecone import Pinecone
 
-# --- Tipos útiles
 from typing import Optional, List, Dict, Any, Tuple
-
-# --- Firestore helpers (incrementos atómicos)
 from google.cloud.firestore_v1 import Increment
 
 import json
@@ -74,7 +70,7 @@ except ValueError:
 db = firestore.client()
 
 # =========================================================
-#  Esquemas de entrada
+#  Esquemas
 # =========================================================
 
 class Entrada(BaseModel):
@@ -104,20 +100,29 @@ async def health():
 
 def normalize_chat_id(canal: Optional[str], chat_id: Optional[str]) -> str:
     """
-    Asegura prefijos únicos por canal para evitar colisiones y facilitar analytics.
+    Prefijos por canal para evitar colisiones:
     - whatsapp -> wa_<id>
-    - telegram -> tg_<id> (si n8n no lo envía ya prefijado)
-    - web/otros -> web_<hex>
+    - telegram -> tg_<id>
+    - web/otros -> como venga o web_<hex> si falta
     """
     if chat_id:
         if (canal or "").lower() == "whatsapp":
             return chat_id if chat_id.startswith("wa_") else f"wa_{chat_id}"
         if (canal or "").lower() == "telegram":
             return chat_id if chat_id.startswith("tg_") else f"tg_{chat_id}"
-        # otros canales mantienen el ID recibido
         return chat_id
-    # fallback web si no llega chat_id
     return f"web_{os.urandom(4).hex()}"
+
+def resolve_existing_conversation_id(raw_id: str) -> str:
+    """
+    Dado un id sin prefijo, intenta resolver el doc existente:
+    raw, wa_raw, tg_raw (en ese orden).
+    """
+    candidates = [raw_id, f"wa_{raw_id}", f"tg_{raw_id}"]
+    for cid in candidates:
+        if db.collection("conversaciones").document(cid).get().exists:
+            return cid
+    return raw_id
 
 # =========================================================
 #  Helpers de BD
@@ -167,12 +172,8 @@ def ensure_conversacion(
     chat_id: str,
     usuario_id: str,
     faq_origen: Optional[str],
-    canal: Optional[str],   # <-- guarda canal
+    canal: Optional[str],
 ):
-    """
-    Crea conversaciones/{chat_id} si no existe y añade campos de contacto + flags.
-    También fija 'canal' (telegram|whatsapp|web).
-    """
     conv_ref = db.collection("conversaciones").document(chat_id)
     snap = conv_ref.get()
     canal_val = (canal or "web")
@@ -188,7 +189,7 @@ def ensure_conversacion(
             "ultima_fecha": firestore.SERVER_TIMESTAMP,
             "tono_detectado": None,
 
-            # Estado de conversación/tema
+            # Estado de tema
             "last_topic_vec": None,
             "last_topic_summary": None,
             "awaiting_topic_confirm": False,
@@ -212,15 +213,12 @@ def ensure_conversacion(
             "canal": canal_val,
         })
     else:
-        # Actualiza timestamp y, si falta, fija canal
         data = snap.to_dict() or {}
         updates = {"ultima_fecha": firestore.SERVER_TIMESTAMP}
         if "canal" not in data and canal_val:
             updates["canal"] = canal_val
         conv_ref.update(updates)
-
     return conv_ref
-
 
 
 def append_mensajes(conv_ref, nuevos: List[Dict[str, Any]]):
@@ -280,10 +278,6 @@ def is_plain_greeting(text: str) -> bool:
     return short and has_kw and not topicish
 
 def has_argument_text(t: str) -> bool:
-    """
-    Heurística para detectar 'argumento/razón'.
-    Más estricta: NO dispara por 'para' suelto (evita falsos positivos como 'para los niños').
-    """
     t = _normalize_text(t)
     keys = [
         "porque", "ya que", "debido", "por que", "porqué",
@@ -294,14 +288,13 @@ def has_argument_text(t: str) -> bool:
     return any(k in t for k in keys)
 
 # =========================================================
-#  Extracciones específicas
+#  Extracciones específicas (contacto/detalles)
 # =========================================================
 
 def extract_user_name(text: str) -> Optional[str]:
     m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40})', text, flags=re.IGNORECASE)
     if m:
         return m.group(1).strip()
-    # Nombre al inicio antes de coma o conectores
     m = re.search(r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)', text)
     if m:
         posible = m.group(1).strip()
@@ -317,9 +310,6 @@ def extract_phone(text: str) -> Optional[str]:
     return tel if 8 <= len(tel) <= 12 else None
 
 def extract_user_barrio(text: str) -> Optional[str]:
-    """
-    Solo tomamos barrio de RESIDENCIA con patrones explícitos (para no confundir con el del proyecto).
-    """
     patterns = [
         r'\bvivo en el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})',
         r'\bresido en el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})',
@@ -332,15 +322,20 @@ def extract_user_barrio(text: str) -> Optional[str]:
             return m.group(1).strip(" .,")
     return None
 
+def extract_any_barrio(text: str) -> Optional[str]:
+    """
+    Detecta 'en el barrio X' o 'barrio X' como dato suelto (para ubicación del tema/proyecto).
+    No confunde con 'vivo/resido/soy del'.
+    """
+    if re.search(r'\b(vivo|resido|soy del|mi barrio)\b', text, flags=re.IGNORECASE):
+        return None  # esto es residencia -> lo maneja extract_user_barrio
+    m = re.search(r'\b(?:en\s+el\s+)?barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+    return m.group(1).strip(" .,") if m else None
+
 def extract_project_location(text: str) -> Optional[str]:
-    """
-    Detecta ubicación de la propuesta (p.ej., 'parque en el barrio Colinas').
-    No se guarda como contacto.
-    """
     m = re.search(r'(?:parque|colegio|cancha|centro|obra|hospital|biblioteca|sendero|paradero|jardin)\s+(?:en|para)\s+el\s+barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
     if m:
         return m.group(1).strip(" .,")
-    # fallback genérico 'en el barrio X' si el mensaje habla de 'construir'/'hacer'
     if re.search(r'\b(construir|hacer|instalar|crear|mejorar)\b', text, flags=re.IGNORECASE):
         m = re.search(r'\ben el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
         if m:
@@ -362,7 +357,26 @@ def detect_contact_refusal(text: str) -> bool:
     return any(p in t for p in patterns)
 
 # =========================================================
-#  Pequeñas “LLM tools” (clasificadores ligeros)
+#  Heurísticas de continuidad
+# =========================================================
+
+SHORT_ACKS = {"si","sí","no","ok","okay","vale","listo","dale","de acuerdo","tal vez","quizas","quizás","puede ser","gracias"}
+
+def is_short_ack(text: str) -> bool:
+    t = _normalize_text(text)
+    return t in SHORT_ACKS or (len(t) <= 6 and t in {"si","sí","no","ok"})
+
+def should_force_continue_topic(text: str) -> bool:
+    return bool(
+        is_short_ack(text) or
+        extract_phone(text) or
+        extract_user_name(text) or
+        extract_user_barrio(text) or
+        extract_any_barrio(text)
+    )
+
+# =========================================================
+#  Pequeñas “LLM tools”
 # =========================================================
 
 def llm_decide_turn(
@@ -457,14 +471,12 @@ PRIVACY_REPLY = (
     "para escalar tu propuesta y ayudar a que pueda hacerse realidad."
 )
 
-# --- helpers para forzar pregunta de argumento y limpiar pedidos de contacto
 def craft_argument_question(name: Optional[str], project_location: Optional[str]) -> str:
-    saludo = f"Hola, {name}." if name else "¡Qué buena iniciativa!"
+    saludo = f"Hola, {name}." if name else "Gracias por contarlo."
     lugar = f" en el barrio {project_location}" if project_location else ""
-    # 1 sola pregunta, sin pedir datos
     return (
-        f"{saludo} La idea de construir un parque{lugar} suena excelente para fomentar espacios de recreación. "
-        "¿Por qué crees que deba hacerse en ese sector?"
+        f"{saludo} Sigamos con el mismo tema{lugar}. "
+        "¿Podrías contarme por qué es importante y qué impacto tendría?"
     )
 
 CONTACT_PATTERNS = re.compile(
@@ -472,7 +484,6 @@ CONTACT_PATTERNS = re.compile(
     r"(tu\s+)?(nombre|barrio|celular|tel[eé]fono|n[uú]mero|contacto)", re.IGNORECASE)
 
 def strip_contact_requests(texto: str) -> str:
-    # Elimina frases que pidan datos de contacto si aún no corresponde
     sent_split = re.split(r'(?<=[\.\?!])\s+', texto.strip())
     limpio = [s for s in sent_split if not CONTACT_PATTERNS.search(s)]
     out = " ".join([s for s in limpio if s])
@@ -552,15 +563,15 @@ def build_messages(
 @app.post("/responder")
 async def responder(data: Entrada):
     try:
-        # --- Normaliza canal e ID de chat para evitar colisiones entre WhatsApp y Telegram ---
+        # Normaliza canal e id
         canal = (data.canal or "web").lower().strip()
         chat_id = normalize_chat_id(canal, data.chat_id)
 
-        # Guardas simples para evitar loops por mensajes vacíos o echos accidentales
+        # Ignora vacíos
         if not data.mensaje or not data.mensaje.strip():
             return {"respuesta": "", "fuentes": [], "chat_id": chat_id}
 
-        # Crea/actualiza usuario y conversación (guarda canal)
+        # Usuario + conversación
         usuario_id = upsert_usuario_o_anon(chat_id, data.nombre or data.usuario, data.celular, canal)
         conv_ref = ensure_conversacion(chat_id, usuario_id, data.faq_origen, canal)
 
@@ -588,6 +599,10 @@ async def responder(data: Entrada):
         action = decision.get("action")
         curr_sum = (decision.get("current_summary") or data.mensaje[:120]).strip()
         intro_hint = (action in ("greeting_smalltalk", "meta")) and (not prev_sum) and (not awaiting_confirm)
+
+        # Fuerza continuidad si es ack/dato suelto
+        if should_force_continue_topic(data.mensaje):
+            action = "continue_topic"
 
         if intro_hint:
             append_mensajes(conv_ref, [
@@ -642,10 +657,11 @@ async def responder(data: Entrada):
         # === EXTRAER datos sueltos del texto ===
         name = extract_user_name(data.mensaje)
         phone = extract_phone(data.mensaje)
-        user_barrio = extract_user_barrio(data.mensaje)  # residencia
-        proj_loc = extract_project_location(data.mensaje)  # ubicación propuesta
+        user_barrio = extract_user_barrio(data.mensaje)            # residencia
+        any_barrio = extract_any_barrio(data.mensaje)              # dato del tema/proyecto
+        proj_loc = extract_project_location(data.mensaje) or any_barrio
 
-        if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
+        if proj_loc and (conv_data.get("project_location") or "").strip().lower() != (proj_loc or "").lower():
             conv_ref.update({"project_location": proj_loc})
 
         partials = {}
@@ -665,25 +681,32 @@ async def responder(data: Entrada):
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
         intent = policy.get("intent", "otro")
 
-        # ¿El usuario acaba de responder nuestra pregunta de argumento?
+        # ¿Acabamos de pedir argumento?
         last_role = historial_for_decider[-1]["role"] if historial_for_decider else None
         just_asked_argument = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
-        user_replied_after_arg_q = just_asked_argument and (len(_normalize_text(data.mensaje)) >= 5)
+        user_replied_after_arg_q = just_asked_argument and (len(_normalize_text(data.mensaje)) >= 2)
 
-        # Consideramos argumento listo SOLO si respondió a nuestra pregunta
-        # o si hay señales fuertes (porque/ya que/debido…).
         argument_ready = user_replied_after_arg_q or has_argument_text(data.mensaje)
         if argument_ready and not conv_data.get("argument_collected"):
             conv_ref.update({"argument_collected": True})
 
-        # ¿Debemos pedir argumento (UNA sola vez)?
         need_argument_now = (intent in ("propuesta", "problema")
                              and not conv_data.get("argument_requested")
                              and not conv_data.get("argument_collected"))
         if need_argument_now:
             conv_ref.update({"argument_requested": True})
 
-        # --- Si toca pedir argumento, respondemos con UNA sola pregunta (sin pedir contacto) ---
+        # ACK + continuidad si llega un dato suelto (barrio o ack)
+        if (any_barrio or is_short_ack(data.mensaje)) and not conv_data.get("argument_collected"):
+            ack = f"Entiendo que estás en el barrio {any_barrio}. " if any_barrio else ""
+            texto = ack + "Sigamos con el mismo tema: ¿podrías contarme un poco más sobre tu idea o necesidad?"
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": texto}
+            ])
+            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
+        # Si toca pedir argumento (primero el 'por qué'), sin pedir contacto
         if need_argument_now:
             texto = craft_argument_question(name, proj_loc)
             append_mensajes(conv_ref, [
@@ -692,11 +715,11 @@ async def responder(data: Entrada):
             ])
             return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-        # ¿El usuario rechazó dar datos?
+        # ¿El usuario rechazó datos?
         if detect_contact_refusal(data.mensaje):
             conv_ref.update({"contact_refused": True, "contact_requested": True})
 
-        # ¿Debemos pedir contacto ahora? -> SOLO después de tener argumento
+        # ¿Debemos pedir contacto ahora? -> solo después del argumento
         already_req = bool(conv_data.get("contact_requested"))
         already_col = bool(conv_data.get("contact_collected")) or bool(phone)
         contact_refused = bool(conv_data.get("contact_refused"))
@@ -709,7 +732,6 @@ async def responder(data: Entrada):
         if should_ask_now and not already_req:
             conv_ref.update({"contact_intent": intent, "contact_requested": True})
 
-        # Si toca pedir contacto y el usuario no dio nada aún -> atajo directo
         if should_ask_now and not (name or phone or user_barrio):
             info_actual = (conv_data.get("contact_info") or {})
             faltan = []
@@ -723,7 +745,6 @@ async def responder(data: Entrada):
             ])
             return {"respuesta": texto_directo, "fuentes": [], "chat_id": chat_id}
 
-        # Si el usuario rechazó dar datos y ya se los habíamos pedido -> mensaje de tranquilidad
         if contact_refused and already_req and not already_col:
             texto = PRIVACY_REPLY
             append_mensajes(conv_ref, [
@@ -732,7 +753,7 @@ async def responder(data: Entrada):
             ])
             return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-        # 4) RAG + prompt final
+        # 4) RAG + respuesta
         hits = rag_search(data.mensaje, top_k=5)
         historial = load_historial_para_prompt(conv_ref)
         messages = build_messages(
@@ -750,7 +771,6 @@ async def responder(data: Entrada):
             contact_already_collected=already_col,
         )
 
-        # 5) LLM (respuesta final)
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
@@ -759,11 +779,9 @@ async def responder(data: Entrada):
         )
         texto = completion.choices[0].message.content.strip()
 
-        # --- Si aún NO debemos pedir contacto, limpiamos cualquier intento del LLM ---
         if not should_ask_now:
             texto = strip_contact_requests(texto)
 
-        # --- Cierre conciso si llegó teléfono en este turno ---
         if phone:
             nombre_txt = (name or (conv_data.get("contact_info") or {}).get("nombre") or "").strip()
             cierre = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
@@ -772,8 +790,6 @@ async def responder(data: Entrada):
                 texto = cierre
             else:
                 texto += "\n\n" + cierre
-
-        # --- Si falta algo y ya toca pedir contacto -> pide lo que falte (sin repetir lo ya dado) ---
         elif should_ask_now:
             info_actual = (conv_data.get("contact_info") or {})
             missing = []
@@ -783,7 +799,6 @@ async def responder(data: Entrada):
             if missing:
                 texto = build_contact_request(missing)
 
-        # 6) Guardar turnos
         append_mensajes(conv_ref, [
             {"role": "user", "content": data.mensaje},
             {"role": "assistant", "content": texto}
@@ -795,7 +810,7 @@ async def responder(data: Entrada):
         return {"error": str(e)}
 
 # =========================================================
-#  Clasificación y Panel
+#  Clasificación y Panel (con gating fuerte)
 # =========================================================
 
 def get_prompt_base() -> str:
@@ -853,10 +868,21 @@ def update_panel_resumen(categoria: str, tono: str, titulo: str, usuario_id: str
 @app.post("/clasificar")
 async def clasificar(body: ClasificarIn):
     try:
-        chat_id = body.chat_id
+        # Resolver id (con o sin prefijo)
+        chat_id_raw = body.chat_id
+        chat_id = resolve_existing_conversation_id(chat_id_raw)
+
         ultimo_u, ultima_a, conv_data = read_last_user_and_bot(chat_id)
         if not ultimo_u:
             return {"ok": False, "mensaje": "No hay mensajes para clasificar."}
+
+        # --- NUEVO: gating por intención y argumento ---
+        intent_now = llm_contact_policy(conv_data.get("last_topic_summary") or ultimo_u, ultimo_u).get("intent", "otro")
+        if intent_now not in ("propuesta", "problema"):
+            return {"ok": True, "skipped": True, "reason": "sin_intencion_de_propuesta_o_problema"}
+
+        if not conv_data.get("argument_collected"):
+            return {"ok": True, "skipped": True, "reason": "sin_argumento_recogido"}
 
         decision_cls = llm_decide_turn(
             last_topic_summary=(conv_data.get("last_topic_summary") or ""),
