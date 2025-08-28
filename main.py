@@ -11,6 +11,7 @@
 #   * **Primero se argumenta y luego, recién, se piden datos**
 #   * Guardia dura para impedir pedir contacto en el primer turno
 #   * Stripper ampliado para borrar frases de “pásame/darme/bríndame” datos
+#   * **Clasificación en-línea** tras la argumentación para guardar título/categoría/tono
 # ============================
 
 from fastapi import FastAPI
@@ -773,6 +774,11 @@ async def responder(data: Entrada):
         ih = intent_heuristic(data.mensaje)
         if ih in ("propuesta","problema","reconocimiento"):
             intent = ih
+
+        # EXTRA: si el resumen del tema vigente sugiere propuesta/problema, úsalo
+        ih_prev = intent_heuristic(prev_sum or curr_sum)
+        if ih_prev in ("propuesta", "problema") and intent not in ("propuesta", "problema"):
+            intent = ih_prev
         # ¿Acabamos de pedir argumento?
         last_role = historial_for_decider[-1]["role"] if historial_for_decider else None
         just_asked_argument = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
@@ -822,11 +828,15 @@ async def responder(data: Entrada):
         #   4) no tenemos aún contacto y no fue rechazado.
         argument_collected_now = bool(conv_data.get("argument_collected") or argument_ready)
         allow_contact = (
-            intent in ("propuesta","problema") and
-            asked_argument_before and
-            argument_collected_now and
-            not already_col and
-            not contact_refused
+            # intención a nivel de conversación (no solo el último turno)
+            (intent in ("propuesta", "problema") or intent_heuristic(prev_sum or curr_sum) in ("propuesta", "problema"))
+            # sabemos que el bot preguntó argumento (por historial) o marcamos que lo preguntó
+            and (asked_argument_before or bool(conv_data.get("argument_requested")))
+            # el usuario ya respondió algo tras esa pregunta (o se detectó razonamiento)
+            and argument_collected_now
+            # aún no tenemos teléfono y no lo rechazó
+            and not already_col
+            and not contact_refused
         )
 
         if allow_contact and not already_req:
@@ -839,9 +849,12 @@ async def responder(data: Entrada):
             if not info_actual.get("barrio"):   faltan.append("barrio")
             if not info_actual.get("telefono"): faltan.append("celular")
 
-            # NUEVO: opinión breve + solicitud de los datos que falten (sin repetir nombre si ya lo tenemos)
+            # Opinión breve + solicitud de los datos que falten (sin repetir nombre si ya lo tenemos)
             stored_name = (info_actual.get("nombre") or data.nombre or data.usuario or name)
             texto_directo = craft_opinion_and_contact(stored_name, proj_loc, data.mensaje, faltan or ["celular"])
+
+            # --- Clasificación en-línea para guardar título/categoría/tono ---
+            inline_classify_and_update(chat_id, data.mensaje, texto_directo)
 
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
@@ -896,6 +909,10 @@ async def responder(data: Entrada):
                 texto = cierre
             else:
                 texto += "\n\n" + cierre
+
+            # Guardar clasificación aunque el contacto llegue rápido
+            inline_classify_and_update(chat_id, data.mensaje, texto)
+
         elif allow_contact:
             info_actual = (conv_data.get("contact_info") or {})
             missing = []
@@ -906,6 +923,8 @@ async def responder(data: Entrada):
                 stored_name = (info_actual.get("nombre") or data.nombre or data.usuario or name)
                 texto = craft_opinion_and_contact(stored_name, proj_loc, data.mensaje, missing)
 
+                # Guardar clasificación también en esta ruta
+                inline_classify_and_update(chat_id, data.mensaje, texto)
 
         append_mensajes(conv_ref, [
             {"role": "user", "content": data.mensaje},
@@ -973,6 +992,88 @@ def update_panel_resumen(categoria: str, tono: str, titulo: str, usuario_id: str
             "fecha": firestore.SERVER_TIMESTAMP
         }])
     }, merge=True)
+
+# --- Clasificación en-línea (mismo comportamiento que /clasificar) ---
+def inline_classify_and_update(chat_id: str, ultimo_u: str, ultima_a: str):
+    try:
+        conv_ref = db.collection("conversaciones").document(chat_id)
+        snap = conv_ref.get()
+        if not snap.exists:
+            return
+        conv_data = snap.to_dict() or {}
+
+        # Solo clasificar propuestas/problemas y cuando ya hay argumento
+        sum_vigente = conv_data.get("last_topic_summary") or ultimo_u
+        intent_now = intent_heuristic(sum_vigente)
+        if intent_now not in ("propuesta", "problema"):
+            intent_now = intent_heuristic(ultimo_u)
+            if intent_now not in ("propuesta", "problema"):
+                return
+        if not conv_data.get("argument_collected"):
+            if has_argument_text(ultimo_u):
+                conv_ref.update({"argument_collected": True})
+            else:
+                return
+
+        prompt_base = get_prompt_base()
+        msgs = build_messages_for_classify(prompt_base, ultimo_u, ultima_a)
+        model_cls = os.getenv("OPENAI_MODEL_CLASSIFY", OPENAI_MODEL)
+        out = client.chat.completions.create(
+            model=model_cls, messages=msgs, temperature=0.2, max_tokens=300
+        ).choices[0].message.content.strip()
+
+        data = json.loads(out)
+        categoria = data.get("categoria_general") or data.get("categoria") or "General"
+        titulo    = data.get("titulo_propuesta") or data.get("titulo") or "Propuesta ciudadana"
+        tono      = data.get("tono_detectado") or "neutral"
+
+        awaiting = bool(conv_data.get("awaiting_topic_confirm"))
+        ya_contado = bool(conv_data.get("panel_contabilizado"))
+        debe_contar = not awaiting and not ya_contado
+
+        # Normalización arrays y de-duplicación
+        arr_cat = conv_data.get("categoria_general") or []
+        arr_tit = conv_data.get("titulo_propuesta") or []
+        if isinstance(arr_cat, str): arr_cat = [arr_cat]
+        if isinstance(arr_tit, str): arr_tit = [arr_tit]
+
+        def _norm(s: str) -> str: return re.sub(r"\s+", " ", (s or "").strip().lower())
+        cat_in = _norm(categoria) in {_norm(c) for c in arr_cat}
+        tit_in = _norm(titulo)    in {_norm(t) for t in arr_tit}
+
+        updates = {"ultima_fecha": firestore.SERVER_TIMESTAMP}
+        if not (conv_data.get("tono_detectado")) and tono:
+            updates["tono_detectado"] = tono
+
+        permitir_append = (not awaiting)
+        if permitir_append:
+            if categoria and not cat_in:
+                updates["categoria_general"] = firestore.ArrayUnion([categoria])
+            if titulo and not tit_in:
+                updates["titulo_propuesta"] = firestore.ArrayUnion([titulo])
+
+        conv_ref.set(updates, merge=True)
+
+        # topics_history
+        hist_last = (conv_data.get("topics_history") or [])
+        last_item = hist_last[-1] if hist_last else {}
+        should_append = (not last_item or last_item.get("categoria") != categoria
+                         or last_item.get("titulo") != titulo or last_item.get("tono") != tono)
+        if should_append and permitir_append:
+            conv_ref.set({"topics_history": firestore.ArrayUnion([{
+                "categoria": categoria, "titulo": titulo, "tono": tono,
+                "fecha": firestore.SERVER_TIMESTAMP
+            }])}, merge=True)
+
+        # catálogo de categorías + panel
+        db.collection("categorias_tematicas").document(categoria).set({"nombre": categoria}, merge=True)
+        if debe_contar:
+            update_panel_resumen(categoria, tono, titulo, conv_data.get("usuario_id", chat_id))
+            conv_ref.set({"panel_contabilizado": True}, merge=True)
+
+    except Exception:
+        # no romper la conversación si algo falla al clasificar
+        pass
 
 @app.post("/clasificar")
 async def clasificar(body: ClasificarIn):
