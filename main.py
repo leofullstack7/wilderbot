@@ -9,6 +9,8 @@
 #   * Mensajes de “ack + continuidad” contextuales (no plantilla fija)
 #   * Normalización de chat_id en ambos endpoints
 #   * **Primero se argumenta y luego, recién, se piden datos**
+#   * Guardia dura para impedir pedir contacto en el primer turno
+#   * Stripper ampliado para borrar frases de “pásame/darme/bríndame” datos
 # ============================
 
 from fastapi import FastAPI
@@ -361,7 +363,7 @@ def detect_contact_refusal(text: str) -> bool:
     return any(p in t for p in patterns)
 
 # =========================================================
-#  Heurísticas de continuidad más precisas
+#  Heurísticas de continuidad/argumento
 # =========================================================
 
 SHORT_ACKS = {"si","sí","no","ok","okay","vale","listo","dale","de acuerdo","tal vez","quizas","quizás","puede ser","gracias"}
@@ -382,7 +384,6 @@ def is_data_only_reply(text: str) -> bool:
         return False
     if any(st in t for st in ACTION_STEMS):
         return False
-    # si es muy largo, probablemente no es 'solo dato'
     return len(t) <= 80
 
 def last_assistant_was_open_question(hist: List[Dict[str,str]]) -> Tuple[bool, str]:
@@ -396,11 +397,21 @@ def last_assistant_was_open_question(hist: List[Dict[str,str]]) -> Tuple[bool, s
         return False, ""
     t = _normalize_text(last_assistant)
     has_qmark = "?" in last_assistant
-    cues = ("cuentame", "contame", "podrias", "podrías", "me cuentas", "ampliar", "detalles",
-            "como puedo ayudarte", "¿como puedo ayudarte", "que necesitas", "que idea", "que quisieras",
-            "sobre tu idea", "sobre el tema", "sobre tu propuesta")
+    cues = ("cuentame","contame","podrias","podrías","me cuentas","ampliar","detalles",
+            "como puedo ayudarte","¿como puedo ayudarte","que necesitas","que idea","que quisieras",
+            "sobre tu idea","sobre el tema","sobre tu propuesta","impacto","por que","porque")
     is_open = has_qmark and any(c in t for c in cues)
     return is_open, last_assistant
+
+def assistant_asked_argument_recently(hist: List[Dict[str,str]]) -> bool:
+    """¿Hay alguna pregunta del asistente pidiendo motivo/impacto/detalles en los últimos turnos?"""
+    for m in reversed(hist[-6:]):
+        if m.get("role") != "assistant":
+            continue
+        t = _normalize_text(m.get("content",""))
+        if "?" in m.get("content","") and any(k in t for k in ("por que","porque","impacto","cuentame","detalles","ampliar","explicame","mas sobre","en que consiste","que sucede","sobre tu idea","sobre tu propuesta")):
+            return True
+    return False
 
 def craft_ack_continue(topic_hint: str, found: Dict[str,str]) -> str:
     """Mensaje corto y contextual según qué dato recibimos."""
@@ -413,7 +424,6 @@ def craft_ack_continue(topic_hint: str, found: Dict[str,str]) -> str:
         parts.append(f"Vives en el barrio {found['barrio_res']}.")
     if found.get("phone"):
         parts.append("Recibí tu número.")
-
     topic_txt = f" Sigamos con {topic_hint.lower()}:" if topic_hint else ""
     ask = " ¿Podrías contarme un poco más sobre tu idea o necesidad?"
     return (" ".join(parts) + topic_txt + ask).strip()
@@ -422,13 +432,7 @@ def craft_ack_continue(topic_hint: str, found: Dict[str,str]) -> str:
 #  Pequeñas “LLM tools”
 # =========================================================
 
-def llm_decide_turn(
-    last_topic_summary: str,
-    awaiting_confirm: bool,
-    last_two_turns: List[Dict[str, str]],
-    current_text: str,
-    model: Optional[str] = None
-) -> Dict[str, Any]:
+def llm_decide_turn(last_topic_summary: str, awaiting_confirm: bool, last_two_turns: List[Dict[str, str]], current_text: str, model: Optional[str] = None) -> Dict[str, Any]:
     model = model or OPENAI_MODEL
     sys = (
         "Eres un asistente que clasifica el rol conversacional de un mensaje dado el tema vigente.\n"
@@ -518,13 +522,14 @@ def craft_argument_question(name: Optional[str], project_location: Optional[str]
     saludo = f"Hola, {name}." if name else "Gracias por contarlo."
     lugar = f" en el barrio {project_location}" if project_location else ""
     tema = f" Sobre {topic_hint.lower()}," if topic_hint else ""
-    return (
-        f"{saludo}{lugar}.{tema} ¿Podrías contarme por qué es importante y qué impacto tendría?"
-    ).strip()
+    return f"{saludo}{lugar}.{tema} ¿Podrías contarme por qué es importante y qué impacto tendría?".strip()
 
+# Detectar frases de solicitud de contacto (muy amplio)
 CONTACT_PATTERNS = re.compile(
-    r"(compart(e|ir)|env(í|i)a|dime|indícame|facilítame).{0,40}"
-    r"(tu\s+)?(nombre|barrio|celular|tel[eé]fono|n[uú]mero|contacto)", re.IGNORECASE)
+    r"(compart(?:e|ir|eme|enos)|env(?:í|i)a(?:me)?|dime|ind(?:í|i)ca(?:me|nos)?|facil(?:í|i)tame|"
+    r"dame|darme|me\s+das|nos\s+das|me\s+podr(?:í|i)as\s+dar|puedes\s+darme|podr(?:í|i)as\s+darme|"
+    r"br(?:í|i)ndame|br(?:í|i)ndanos|me\s+brindas|p(?:á|a)same|me\s+pasas)"
+    r".{0,80}(tu\s+)?(nombre|barrio|celular|tel[eé]fono|n[uú]mero|contacto)", re.IGNORECASE)
 
 def strip_contact_requests(texto: str) -> str:
     sent_split = re.split(r'(?<=[\.\?!])\s+', texto.strip())
@@ -645,6 +650,7 @@ async def responder(data: Entrada):
 
         # Si el último mensaje del asistente fue pregunta abierta
         was_open_q, _last_a = last_assistant_was_open_question(historial_for_decider)
+        asked_argument_before = assistant_asked_argument_recently(historial_for_decider)
 
         topic_change_suspect = False
         curr_vec = None
@@ -693,7 +699,7 @@ async def responder(data: Entrada):
         name = extract_user_name(data.mensaje)
         phone = extract_phone(data.mensaje)
         user_barrio = extract_user_barrio(data.mensaje)            # residencia
-        any_barrio = extract_any_barrio(data.mensaje)              # dato del tema/proyecto
+        any_barrio = extract_any_barrio(data.mensaje)              # ubicación del tema/proyecto
         proj_loc = extract_project_location(data.mensaje) or any_barrio
 
         if proj_loc and (conv_data.get("project_location") or "").strip().lower() != (proj_loc or "").lower():
@@ -721,19 +727,28 @@ async def responder(data: Entrada):
         just_asked_argument = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
         user_replied_after_arg_q = just_asked_argument and (len(_normalize_text(data.mensaje)) >= 2)
 
-        # Marcar argumento colectado si corresponde
+        # Marcar argumento colectado si corresponde (este mismo turno)
         argument_ready = user_replied_after_arg_q or has_argument_text(data.mensaje)
         if argument_ready and not conv_data.get("argument_collected"):
             conv_ref.update({"argument_collected": True})
 
-        # ⚠️ IMPORTANTE:
-        # * Siempre pedimos argumentación la PRIMERA vez que se detecta propuesta/problema,
-        #   aunque el mensaje ya traiga argumento.
-        need_argument_now = (intent in ("propuesta", "problema")
-                             and not conv_data.get("argument_requested"))
-        if need_argument_now:
+        # ⚠️ PRIMERA VEZ con propuesta/problema: SIEMPRE preguntar argumento antes de cualquier cosa.
+        need_argument_first = (intent in ("propuesta", "problema")
+                               and not conv_data.get("argument_collected")
+                               and not asked_argument_before)
+        if (intent in ("propuesta","problema") and not conv_data.get("argument_requested")) or need_argument_first:
             conv_ref.update({"argument_requested": True})
             texto = craft_argument_question(name, proj_loc, prev_sum or curr_sum)
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": texto}
+            ])
+            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
+        # -------- ACK + continuidad (contextual) --------
+        if was_open_q and not conv_data.get("argument_collected") and (is_data_only_reply(data.mensaje) or is_short_ack(data.mensaje)):
+            found = {"name": name, "phone": phone, "barrio_res": user_barrio, "barrio_proj": any_barrio}
+            texto = craft_ack_continue(prev_sum or curr_sum, {k:v for k,v in found.items() if v})
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto}
@@ -744,23 +759,29 @@ async def responder(data: Entrada):
         if detect_contact_refusal(data.mensaje):
             conv_ref.update({"contact_refused": True, "contact_requested": True})
 
-        # ¿Debemos pedir contacto ahora?
+        # Flags de contacto actuales
         already_req = bool(conv_data.get("contact_requested"))
         already_col = bool(conv_data.get("contact_collected")) or bool(phone)
         contact_refused = bool(conv_data.get("contact_refused"))
 
-        # ✅ Solo pedimos contacto DESPUÉS de haber preguntado por argumento (alguna vez)
-        should_ask_now = (policy.get("should_request")
-                          and intent in ("propuesta", "problema")
-                          and bool(conv_data.get("argument_collected"))
-                          and (bool(conv_data.get("argument_requested")) or just_asked_argument)
-                          and not already_col
-                          and not contact_refused)
+        # ✅ Solo se permite pedir contacto si:
+        #   1) intención propuesta/problema,
+        #   2) YA se preguntó argumento EN ESTA CONVERSACIÓN (historial),
+        #   3) argumento ya está recogido,
+        #   4) no tenemos aún contacto y no fue rechazado.
+        argument_collected_now = bool(conv_data.get("argument_collected") or argument_ready)
+        allow_contact = (
+            intent in ("propuesta","problema") and
+            asked_argument_before and
+            argument_collected_now and
+            not already_col and
+            not contact_refused
+        )
 
-        if should_ask_now and not already_req:
+        if allow_contact and not already_req:
             conv_ref.update({"contact_intent": intent, "contact_requested": True})
 
-        if should_ask_now and not (name or phone or user_barrio):
+        if allow_contact and not (name or phone or user_barrio):
             info_actual = (conv_data.get("contact_info") or {})
             faltan = []
             if not info_actual.get("nombre"):   faltan.append("nombre")
@@ -792,7 +813,7 @@ async def responder(data: Entrada):
             prev_summary=prev_sum,
             new_summary=curr_sum,
             intro_hint=intro_hint,
-            emphasize_contact=should_ask_now,
+            emphasize_contact=allow_contact,              # solo si está permitido
             emphasize_argument=False,
             intent=intent,
             contact_already_requested=already_req,
@@ -807,9 +828,11 @@ async def responder(data: Entrada):
         )
         texto = completion.choices[0].message.content.strip()
 
-        if not should_ask_now:
+        # Si NO está permitido pedir contacto, borro cualquier frase que lo pida
+        if not allow_contact:
             texto = strip_contact_requests(texto)
 
+        # Si llegó el teléfono ahora, cierro con confirmación
         if phone:
             nombre_txt = (name or (conv_data.get("contact_info") or {}).get("nombre") or "").strip()
             cierre = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
@@ -818,7 +841,8 @@ async def responder(data: Entrada):
                 texto = cierre
             else:
                 texto += "\n\n" + cierre
-        elif should_ask_now:
+        elif allow_contact:
+            # Pedir explícitamente solo lo que falte (por si el modelo no lo dijo claro)
             info_actual = (conv_data.get("contact_info") or {})
             missing = []
             if not (info_actual.get("nombre") or name):        missing.append("nombre")
@@ -836,6 +860,7 @@ async def responder(data: Entrada):
 
     except Exception as e:
         return {"error": str(e)}
+
 
 # =========================================================
 #  Clasificación y Panel (con gating fuerte)
