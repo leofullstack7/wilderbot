@@ -2,6 +2,7 @@
 #  WilderBot API (FastAPI)
 #  - /responder : RAG + historial + guardado en tu BD
 #  - /clasificar: clasifica la conversación y actualiza panel
+#  Adaptado para WhatsApp y Telegram (chat_id normalizado)
 # ============================
 
 from fastapi import FastAPI
@@ -98,6 +99,27 @@ async def health():
     return {"status": "ok"}
 
 # =========================================================
+#  Helpers de canal / IDs
+# =========================================================
+
+def normalize_chat_id(canal: Optional[str], chat_id: Optional[str]) -> str:
+    """
+    Asegura prefijos únicos por canal para evitar colisiones y facilitar analytics.
+    - whatsapp -> wa_<id>
+    - telegram -> tg_<id> (si n8n no lo envía ya prefijado)
+    - web/otros -> web_<hex>
+    """
+    if chat_id:
+        if (canal or "").lower() == "whatsapp":
+            return chat_id if chat_id.startswith("wa_") else f"wa_{chat_id}"
+        if (canal or "").lower() == "telegram":
+            return chat_id if chat_id.startswith("tg_") else f"tg_{chat_id}"
+        # otros canales mantienen el ID recibido
+        return chat_id
+    # fallback web si no llega chat_id
+    return f"web_{os.urandom(4).hex()}"
+
+# =========================================================
 #  Helpers de BD
 # =========================================================
 
@@ -141,12 +163,21 @@ def upsert_usuario_o_anon(chat_id: str, nombre: Optional[str], telefono: Optiona
     return usuario_id
 
 
-def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]):
+def ensure_conversacion(
+    chat_id: str,
+    usuario_id: str,
+    faq_origen: Optional[str],
+    canal: Optional[str],   # <-- guarda canal
+):
     """
-    Crea conversaciones/{chat_id} si no existe y añade campos de contacto + flags de argumento.
+    Crea conversaciones/{chat_id} si no existe y añade campos de contacto + flags.
+    También fija 'canal' (telegram|whatsapp|web).
     """
     conv_ref = db.collection("conversaciones").document(chat_id)
-    if not conv_ref.get().exists:
+    snap = conv_ref.get()
+    canal_val = (canal or "web")
+
+    if not snap.exists:
         conv_ref.set({
             "usuario_id": usuario_id,
             "faq_origen": faq_origen or None,
@@ -165,21 +196,31 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             "candidate_new_topic_vec": None,
             "topics_history": [],
 
-            # === Flujo argumento + contacto ===
-            "argument_requested": False,   # hicimos la ÚNICA pregunta de argumento
-            "argument_collected": False,   # el ciudadano ya respondió
-            "contact_intent": None,        # 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
+            # Flujo argumento + contacto
+            "argument_requested": False,
+            "argument_collected": False,
+            "contact_intent": None,
             "contact_requested": False,
-            "contact_collected": False,    # True solo si hay teléfono
-            "contact_refused": False,      # rechazo explícito
+            "contact_collected": False,
+            "contact_refused": False,
             "contact_info": {"nombre": None, "barrio": None, "telefono": None},
 
-            # Lugar de la propuesta (no confundir con barrio de residencia)
+            # Lugar de la propuesta
             "project_location": None,
+
+            # Canal
+            "canal": canal_val,
         })
     else:
-        conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
+        # Actualiza timestamp y, si falta, fija canal
+        data = snap.to_dict() or {}
+        updates = {"ultima_fecha": firestore.SERVER_TIMESTAMP}
+        if "canal" not in data and canal_val:
+            updates["canal"] = canal_val
+        conv_ref.update(updates)
+
     return conv_ref
+
 
 
 def append_mensajes(conv_ref, nuevos: List[Dict[str, Any]]):
@@ -416,7 +457,7 @@ PRIVACY_REPLY = (
     "para escalar tu propuesta y ayudar a que pueda hacerse realidad."
 )
 
-# --- NUEVO: helpers para forzar pregunta de argumento y limpiar pedidos de contacto
+# --- helpers para forzar pregunta de argumento y limpiar pedidos de contacto
 def craft_argument_question(name: Optional[str], project_location: Optional[str]) -> str:
     saludo = f"Hola, {name}." if name else "¡Qué buena iniciativa!"
     lugar = f" en el barrio {project_location}" if project_location else ""
@@ -432,7 +473,6 @@ CONTACT_PATTERNS = re.compile(
 
 def strip_contact_requests(texto: str) -> str:
     # Elimina frases que pidan datos de contacto si aún no corresponde
-    # Dividimos por oraciones simples para remover selectivamente
     sent_split = re.split(r'(?<=[\.\?!])\s+', texto.strip())
     limpio = [s for s in sent_split if not CONTACT_PATTERNS.search(s)]
     out = " ".join([s for s in limpio if s])
@@ -512,9 +552,17 @@ def build_messages(
 @app.post("/responder")
 async def responder(data: Entrada):
     try:
-        chat_id = data.chat_id or f"web_{os.urandom(4).hex()}"
-        usuario_id = upsert_usuario_o_anon(chat_id, data.nombre or data.usuario, data.celular, data.canal)
-        conv_ref = ensure_conversacion(chat_id, usuario_id, data.faq_origen)
+        # --- Normaliza canal e ID de chat para evitar colisiones entre WhatsApp y Telegram ---
+        canal = (data.canal or "web").lower().strip()
+        chat_id = normalize_chat_id(canal, data.chat_id)
+
+        # Guardas simples para evitar loops por mensajes vacíos o echos accidentales
+        if not data.mensaje or not data.mensaje.strip():
+            return {"respuesta": "", "fuentes": [], "chat_id": chat_id}
+
+        # Crea/actualiza usuario y conversación (guarda canal)
+        usuario_id = upsert_usuario_o_anon(chat_id, data.nombre or data.usuario, data.celular, canal)
+        conv_ref = ensure_conversacion(chat_id, usuario_id, data.faq_origen, canal)
 
         conv_data = (conv_ref.get().to_dict() or {})
         prev_vec = conv_data.get("last_topic_vec")
@@ -611,7 +659,7 @@ async def responder(data: Entrada):
             conv_ref.update({"contact_info": new_info})
             if phone:
                 conv_ref.update({"contact_collected": True})
-                upsert_usuario_o_anon(chat_id, new_info.get("nombre") or data.nombre or data.usuario, phone, data.canal)
+                upsert_usuario_o_anon(chat_id, new_info.get("nombre") or data.nombre or data.usuario, phone, canal)
 
         # === Política argumento + contacto ===
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
@@ -635,7 +683,7 @@ async def responder(data: Entrada):
         if need_argument_now:
             conv_ref.update({"argument_requested": True})
 
-        # --- NUEVO: si toca pedir argumento, no usamos LLM; respondemos con UNA sola pregunta
+        # --- Si toca pedir argumento, respondemos con UNA sola pregunta (sin pedir contacto) ---
         if need_argument_now:
             texto = craft_argument_question(name, proj_loc)
             append_mensajes(conv_ref, [
@@ -648,13 +696,13 @@ async def responder(data: Entrada):
         if detect_contact_refusal(data.mensaje):
             conv_ref.update({"contact_refused": True, "contact_requested": True})
 
-        # ¿Debemos pedir contacto ahora? -> SOLO después de tener argumento (no en 1er turno)
+        # ¿Debemos pedir contacto ahora? -> SOLO después de tener argumento
         already_req = bool(conv_data.get("contact_requested"))
         already_col = bool(conv_data.get("contact_collected")) or bool(phone)
         contact_refused = bool(conv_data.get("contact_refused"))
         should_ask_now = (policy.get("should_request")
                           and intent in ("propuesta", "problema")
-                          and bool(conv_data.get("argument_collected"))   # <-- clave: ya tenemos argumento
+                          and bool(conv_data.get("argument_collected"))
                           and not already_col
                           and not contact_refused)
 
@@ -675,7 +723,7 @@ async def responder(data: Entrada):
             ])
             return {"respuesta": texto_directo, "fuentes": [], "chat_id": chat_id}
 
-        # Si el usuario rechazó dar datos y ya se los habíamos pedido -> envia mensaje de tranquilidad
+        # Si el usuario rechazó dar datos y ya se los habíamos pedido -> mensaje de tranquilidad
         if contact_refused and already_req and not already_col:
             texto = PRIVACY_REPLY
             append_mensajes(conv_ref, [
@@ -691,12 +739,12 @@ async def responder(data: Entrada):
             data.mensaje,
             [h["texto"] for h in hits],
             historial,
-            topic_change_suspect=topic_change_suspect,
+            topic_change_suspect=False,
             prev_summary=prev_sum,
             new_summary=curr_sum,
             intro_hint=intro_hint,
             emphasize_contact=should_ask_now,
-            emphasize_argument=False,   # ya no toca: si tocaba, devolvimos antes
+            emphasize_argument=False,
             intent=intent,
             contact_already_requested=already_req,
             contact_already_collected=already_col,
@@ -711,11 +759,11 @@ async def responder(data: Entrada):
         )
         texto = completion.choices[0].message.content.strip()
 
-        # --- NUEVO: si aún NO debemos pedir contacto, limpiamos cualquier intento del LLM
+        # --- Si aún NO debemos pedir contacto, limpiamos cualquier intento del LLM ---
         if not should_ask_now:
             texto = strip_contact_requests(texto)
 
-        # --- POST: cierre conciso si llegó teléfono en este turno ---
+        # --- Cierre conciso si llegó teléfono en este turno ---
         if phone:
             nombre_txt = (name or (conv_data.get("contact_info") or {}).get("nombre") or "").strip()
             cierre = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
@@ -725,7 +773,7 @@ async def responder(data: Entrada):
             else:
                 texto += "\n\n" + cierre
 
-        # --- POST: si falta algo y ya toca pedir contacto -> pide lo que falte (sin repetir lo ya dado) ---
+        # --- Si falta algo y ya toca pedir contacto -> pide lo que falte (sin repetir lo ya dado) ---
         elif should_ask_now:
             info_actual = (conv_data.get("contact_info") or {})
             missing = []
