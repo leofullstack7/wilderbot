@@ -466,6 +466,13 @@ def short_supportive_pov(topic_text: str) -> str:
     return "Trabajar en este tema puede mejorar la calidad de vida de la comunidad."
 
 
+def craft_opinion_and_contact(name: Optional[str], project_location: Optional[str], user_text: str, missing_keys: List[str]) -> str:
+    """Arma: opinión corta contextual + pedido de contacto con solo lo que falte."""
+    saludo = f"Entiendo, {name}." if name else "Entiendo."
+    loc = f" En el barrio {project_location}." if project_location else ""
+    pov = " " + short_supportive_pov(user_text)
+    pedido = " " + build_contact_request(missing_keys)
+    return (saludo + loc + pov + pedido).strip()
 # =========================================================
 #  Pequeñas “LLM tools”
 # =========================================================
@@ -831,7 +838,11 @@ async def responder(data: Entrada):
             if not info_actual.get("nombre"):   faltan.append("nombre")
             if not info_actual.get("barrio"):   faltan.append("barrio")
             if not info_actual.get("telefono"): faltan.append("celular")
-            texto_directo = build_contact_request(faltan or ["celular"])
+
+            # NUEVO: opinión breve + solicitud de los datos que falten (sin repetir nombre si ya lo tenemos)
+            stored_name = (info_actual.get("nombre") or data.nombre or data.usuario or name)
+            texto_directo = craft_opinion_and_contact(stored_name, proj_loc, data.mensaje, faltan or ["celular"])
+
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto_directo}
@@ -886,14 +897,15 @@ async def responder(data: Entrada):
             else:
                 texto += "\n\n" + cierre
         elif allow_contact:
-            # Pedir explícitamente solo lo que falte (por si el modelo no lo dijo claro)
             info_actual = (conv_data.get("contact_info") or {})
             missing = []
             if not (info_actual.get("nombre") or name):        missing.append("nombre")
             if not (info_actual.get("barrio") or user_barrio): missing.append("barrio")
             if not (info_actual.get("telefono") or phone):     missing.append("celular")
             if missing:
-                texto = build_contact_request(missing)
+                stored_name = (info_actual.get("nombre") or data.nombre or data.usuario or name)
+                texto = craft_opinion_and_contact(stored_name, proj_loc, data.mensaje, missing)
+
 
         append_mensajes(conv_ref, [
             {"role": "user", "content": data.mensaje},
