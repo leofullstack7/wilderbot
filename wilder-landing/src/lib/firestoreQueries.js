@@ -3,6 +3,8 @@ import {
   collection,
   doc,
   getDoc,
+  getFirestore,
+  deleteDoc,
   getDocs,
   onSnapshot,
   orderBy,
@@ -20,6 +22,7 @@ import { db } from "./firebase";
  * Otros filtros se aplican en cliente dentro del callback.
  */
 
+
 export async function setPropuestaPotencial(id, value) {
   const ref = doc(db, "conversaciones", id);
   await updateDoc(ref, { propuesta_potencial: !!value });
@@ -35,6 +38,8 @@ export function listenConversationsByDate({ from, to, pageSize = 100 }, callback
     orderBy("ultima_fecha", "desc"),
     qLimit(pageSize)
   );
+
+  
 
   const unsub = onSnapshot(q, (snap) => {
     const rows = [];
@@ -83,3 +88,18 @@ export const formatDate = (ts) => {
     return "—";
   }
 };
+
+/** Marca la conversación como archivada (soft delete) */
+export async function archiveConversation(id) {
+  const ref = doc(db, "conversaciones", id);
+  await updateDoc(ref, {
+    archivado: true,
+    archivado_fecha: serverTimestamp(),
+  });
+}
+
+/** Elimina definitivamente la conversación (hard delete) */
+export async function deleteConversation(id) {
+  const ref = doc(db, "conversaciones", id);
+  await deleteDoc(ref);
+}

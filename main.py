@@ -2,9 +2,12 @@
 #  WilderBot API (FastAPI)
 #  - /responder : RAG + historial + guardado en tu BD
 #  - /clasificar: clasifica la conversación y actualiza panel
-#  Correcciones: gating de clasificación, continuidad de tema,
-#  reconocimiento de datos sueltos (barrio, sí/no, tel, nombre),
-#  y normalización de chat_id en ambos endpoints.
+#  Correcciones:
+#   * Gating fuerte de clasificación
+#   * Continuidad de tema basada en historial (última pregunta abierta del bot)
+#   * Reconocimiento de datos sueltos SOLO si no hay verbos de acción ni argumento
+#   * Mensajes de “ack + continuidad” contextuales (no plantilla fija)
+#   * Normalización de chat_id en ambos endpoints
 # ============================
 
 from fastapi import FastAPI
@@ -328,7 +331,7 @@ def extract_any_barrio(text: str) -> Optional[str]:
     No confunde con 'vivo/resido/soy del'.
     """
     if re.search(r'\b(vivo|resido|soy del|mi barrio)\b', text, flags=re.IGNORECASE):
-        return None  # esto es residencia -> lo maneja extract_user_barrio
+        return None  # residencia -> lo maneja extract_user_barrio
     m = re.search(r'\b(?:en\s+el\s+)?barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
     return m.group(1).strip(" .,") if m else None
 
@@ -357,7 +360,7 @@ def detect_contact_refusal(text: str) -> bool:
     return any(p in t for p in patterns)
 
 # =========================================================
-#  Heurísticas de continuidad
+#  Heurísticas de continuidad más precisas
 # =========================================================
 
 SHORT_ACKS = {"si","sí","no","ok","okay","vale","listo","dale","de acuerdo","tal vez","quizas","quizás","puede ser","gracias"}
@@ -366,14 +369,53 @@ def is_short_ack(text: str) -> bool:
     t = _normalize_text(text)
     return t in SHORT_ACKS or (len(t) <= 6 and t in {"si","sí","no","ok"})
 
-def should_force_continue_topic(text: str) -> bool:
-    return bool(
-        is_short_ack(text) or
-        extract_phone(text) or
-        extract_user_name(text) or
-        extract_user_barrio(text) or
-        extract_any_barrio(text)
-    )
+ACTION_STEMS = ("propon","mejor","arregl","instal","crear","hacer","quiero","necesit","hay ","repar","constru","gestionar","solic","denunc","impuls","apoy","proyecto","problema","idea")
+
+def is_data_only_reply(text: str) -> bool:
+    """Dato suelto (nombre/teléfono/barrio) SIN verbos de acción ni señales de argumento."""
+    t = _normalize_text(text)
+    has_datum = bool(extract_phone(text) or extract_user_barrio(text) or extract_any_barrio(text) or extract_user_name(text))
+    if not has_datum:
+        return False
+    if has_argument_text(text):
+        return False
+    if any(st in t for st in ACTION_STEMS):
+        return False
+    # si es muy largo, probablemente no es 'solo dato'
+    return len(t) <= 80
+
+def last_assistant_was_open_question(hist: List[Dict[str,str]]) -> Tuple[bool, str]:
+    """Mira el último mensaje del asistente y decide si fue pregunta abierta."""
+    last_assistant = ""
+    for m in reversed(hist or []):
+        if m.get("role") == "assistant":
+            last_assistant = m.get("content","")
+            break
+    if not last_assistant:
+        return False, ""
+    t = _normalize_text(last_assistant)
+    has_qmark = "?" in last_assistant
+    cues = ("cuentame", "contame", "podrias", "podrías", "me cuentas", "ampliar", "detalles",
+            "como puedo ayudarte", "¿como puedo ayudarte", "que necesitas", "que idea", "que quisieras",
+            "sobre tu idea", "sobre el tema", "sobre tu propuesta")
+    is_open = has_qmark and any(c in t for c in cues)
+    return is_open, last_assistant
+
+def craft_ack_continue(topic_hint: str, found: Dict[str,str]) -> str:
+    """Mensaje corto y contextual según qué dato recibimos."""
+    parts = []
+    if found.get("name"):
+        parts.append(f"Gracias, {found['name']}.")
+    if found.get("barrio_proj"):
+        parts.append(f"Anoté el barrio {found['barrio_proj']}.")
+    if found.get("barrio_res"):
+        parts.append(f"Vives en el barrio {found['barrio_res']}.")
+    if found.get("phone"):
+        parts.append("Recibí tu número.")
+
+    topic_txt = f" Sigamos con {topic_hint.lower()}:" if topic_hint else ""
+    ask = " ¿Podrías contarme un poco más sobre tu idea o necesidad?"
+    return (" ".join(parts) + topic_txt + ask).strip()
 
 # =========================================================
 #  Pequeñas “LLM tools”
@@ -471,13 +513,13 @@ PRIVACY_REPLY = (
     "para escalar tu propuesta y ayudar a que pueda hacerse realidad."
 )
 
-def craft_argument_question(name: Optional[str], project_location: Optional[str]) -> str:
+def craft_argument_question(name: Optional[str], project_location: Optional[str], topic_hint: Optional[str] = None) -> str:
     saludo = f"Hola, {name}." if name else "Gracias por contarlo."
     lugar = f" en el barrio {project_location}" if project_location else ""
+    tema = f" Sobre {topic_hint.lower()}," if topic_hint else ""
     return (
-        f"{saludo} Sigamos con el mismo tema{lugar}. "
-        "¿Podrías contarme por qué es importante y qué impacto tendría?"
-    )
+        f"{saludo}{lugar}.{tema} ¿Podrías contarme por qué es importante y qué impacto tendría?"
+    ).strip()
 
 CONTACT_PATTERNS = re.compile(
     r"(compart(e|ir)|env(í|i)a|dime|indícame|facilítame).{0,40}"
@@ -600,16 +642,8 @@ async def responder(data: Entrada):
         curr_sum = (decision.get("current_summary") or data.mensaje[:120]).strip()
         intro_hint = (action in ("greeting_smalltalk", "meta")) and (not prev_sum) and (not awaiting_confirm)
 
-        # Fuerza continuidad si es ack/dato suelto
-        if should_force_continue_topic(data.mensaje):
-            action = "continue_topic"
-
-        if intro_hint:
-            append_mensajes(conv_ref, [
-                {"role": "user", "content": data.mensaje},
-                {"role": "assistant", "content": BOT_INTRO_TEXT}
-            ])
-            return {"respuesta": BOT_INTRO_TEXT, "fuentes": [], "chat_id": chat_id}
+        # Si el último mensaje del asistente fue pregunta abierta
+        was_open_q, _last_a = last_assistant_was_open_question(historial_for_decider)
 
         topic_change_suspect = False
         curr_vec = None
@@ -654,7 +688,7 @@ async def responder(data: Entrada):
         else:
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
-        # === EXTRAER datos sueltos del texto ===
+        # === EXTRAER datos del turno ===
         name = extract_user_name(data.mensaje)
         phone = extract_phone(data.mensaje)
         user_barrio = extract_user_barrio(data.mensaje)            # residencia
@@ -696,19 +730,24 @@ async def responder(data: Entrada):
         if need_argument_now:
             conv_ref.update({"argument_requested": True})
 
-        # ACK + continuidad si llega un dato suelto (barrio o ack)
-        if (any_barrio or is_short_ack(data.mensaje)) and not conv_data.get("argument_collected"):
-            ack = f"Entiendo que estás en el barrio {any_barrio}. " if any_barrio else ""
-            texto = ack + "Sigamos con el mismo tema: ¿podrías contarme un poco más sobre tu idea o necesidad?"
+        # -------- ACK + continuidad (contextual) --------
+        if was_open_q and not conv_data.get("argument_collected") and (is_data_only_reply(data.mensaje) or is_short_ack(data.mensaje)):
+            found = {
+                "name": name,
+                "phone": phone,
+                "barrio_res": user_barrio,
+                "barrio_proj": any_barrio
+            }
+            texto = craft_ack_continue(prev_sum or curr_sum, {k:v for k,v in found.items() if v})
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto}
             ])
             return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-        # Si toca pedir argumento (primero el 'por qué'), sin pedir contacto
+        # Si toca pedir argumento (turno normal), sin pedir contacto
         if need_argument_now:
-            texto = craft_argument_question(name, proj_loc)
+            texto = craft_argument_question(name, proj_loc, prev_sum or curr_sum)
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto}
@@ -876,7 +915,7 @@ async def clasificar(body: ClasificarIn):
         if not ultimo_u:
             return {"ok": False, "mensaje": "No hay mensajes para clasificar."}
 
-        # --- NUEVO: gating por intención y argumento ---
+        # Gating por intención y argumento
         intent_now = llm_contact_policy(conv_data.get("last_topic_summary") or ultimo_u, ultimo_u).get("intent", "otro")
         if intent_now not in ("propuesta", "problema"):
             return {"ok": True, "skipped": True, "reason": "sin_intencion_de_propuesta_o_problema"}

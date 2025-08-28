@@ -5,6 +5,9 @@ import {
     listenConversationsByDate,
     formatDate,
     firstOr,
+    // ⬇️ NUEVO: importa helpers
+    archiveConversation,
+    deleteConversation,
 } from "../lib/firestoreQueries";
 import ConversacionDetalle from "./ConversacionDetalle";
 import { CATEGORIAS_CANON, normalizeCategoriaDocValue } from "../lib/categorias";
@@ -49,6 +52,9 @@ export default function Propuestas() {
     const [sel, setSel] = useState(null);
     const [loading, setLoading] = useState(true);
 
+    // Busy para acciones
+    const [busyId, setBusyId] = useState(null);
+
     // Suscripción Firestore por rango
     useEffect(() => {
         setLoading(true);
@@ -60,19 +66,44 @@ export default function Propuestas() {
                     ? now.subtract(30, "day")
                     : dayjs("2000-01-01");
 
-        const unsub = listenConversationsByDate(
-            { from, to: now, pageSize: 300 },
-            (rows) => {
-                setRawRows(rows);
-                setLoading(false);
-            }
-        );
+        const unsub = listenConversationsByDate({ from, to: now, pageSize: 300 }, (rows) => {
+            setRawRows(rows);
+            setLoading(false);
+        });
         return () => unsub();
     }, [range]);
 
-    // Aplicar filtros en cliente (y excluir sin categoría/título)
+    // Acciones
+    const handleArchive = async (id) => {
+        if (!id) return;
+        const ok = window.confirm("¿Archivar este registro? Podrás verlo luego desde la base de datos.");
+        if (!ok) return;
+        try {
+            setBusyId(`arch-${id}`);
+            await archiveConversation(id);
+        } finally {
+            setBusyId(null);
+        }
+    };
+
+    const handleDelete = async (id) => {
+        if (!id) return;
+        const ok = window.confirm("Esto eliminará definitivamente este registro. ¿Continuar?");
+        if (!ok) return;
+        try {
+            setBusyId(`del-${id}`);
+            await deleteConversation(id);
+        } finally {
+            setBusyId(null);
+        }
+    };
+
+    // Aplicar filtros en cliente (y excluir sin categoría/título y archivados/eliminados)
     const rows = useMemo(() => {
         return rawRows.filter((r) => {
+            // Ocultar archivados o marcados como eliminados si existiera soft flag
+            if (r.archivado || r.eliminado) return false;
+
             const catRaw = firstOr(r.categoria_general, "");
             const titRaw = firstOr(r.titulo_propuesta, "");
             const catHas = String(catRaw || "").trim();
@@ -83,10 +114,8 @@ export default function Propuestas() {
             const catNorm = normalizeCategoriaDocValue(r.categoria_general);
 
             if (fCategoria && catNorm !== fCategoria) return false;
-            if (fTitulo && !tit.toLowerCase().includes(fTitulo.toLowerCase()))
-                return false;
-            if (fTono && (r.tono_detectado || "").toLowerCase() !== fTono)
-                return false;
+            if (fTitulo && !tit.toLowerCase().includes(fTitulo.toLowerCase())) return false;
+            if (fTono && (r.tono_detectado || "").toLowerCase() !== fTono) return false;
             if (fCanal && (r.canal || "").toLowerCase() !== fCanal) return false;
             if (fEstado && (r.estado || "") !== fEstado) return false;
 
@@ -244,7 +273,16 @@ export default function Propuestas() {
                 {loading ? (
                     <div className="text-center text-gray-500 py-6">Cargando…</div>
                 ) : pageRows.length ? (
-                    pageRows.map((r) => <RowCard key={r.id} r={r} onVer={() => setSel(r.id)} />)
+                    pageRows.map((r) => (
+                        <RowCard
+                            key={r.id}
+                            r={r}
+                            onVer={() => setSel(r.id)}
+                            onArchivar={() => handleArchive(r.id)}
+                            onEliminar={() => handleDelete(r.id)}
+                            busyId={busyId}
+                        />
+                    ))
                 ) : (
                     <div className="text-center text-gray-500 py-6">Sin resultados</div>
                 )}
@@ -259,23 +297,25 @@ export default function Propuestas() {
                             <Th className="w-52">Categoría</Th>
                             <Th>Título</Th>
                             <Th className="w-36">Tono</Th>
-                            <Th className="w-36">Canal</Th> {/* NUEVA COLUMNA */}
+                            <Th className="w-36">Canal</Th>
                             <Th className="w-56">Barrio (proyecto)</Th>
                             <Th className="w-40">Estado</Th>
                             <Th className="w-28">Contacto</Th>
-                            <Th className="w-28">Ver</Th>
+                            <Th className="w-56">Acciones</Th> {/* ⬅️ NUEVO */}
                         </tr>
                     </thead>
                     <tbody>
                         {loading ? (
                             <tr>
-                                <td colSpan={9} className="p-4 text-center text-gray-500">
+                                <td colSpan={10} className="p-4 text-center text-gray-500">
                                     Cargando…
                                 </td>
                             </tr>
                         ) : pageRows.length ? (
                             pageRows.map((r) => {
                                 const categoria = normalizeCategoriaDocValue(r.categoria_general);
+                                const archBusy = busyId === `arch-${r.id}`;
+                                const delBusy = busyId === `del-${r.id}`;
                                 return (
                                     <tr key={r.id} className="border-t hover:bg-emerald-50/40 transition">
                                         <Td className="whitespace-nowrap">{formatDate(r.ultima_fecha)}</Td>
@@ -284,24 +324,42 @@ export default function Propuestas() {
                                             {firstOr(r.titulo_propuesta, "—")}
                                         </Td>
                                         <Td><ToneChip tone={r.tono_detectado} /></Td>
-                                        <Td><CanalBadge canal={r.canal} /></Td> {/* NUEVO */}
+                                        <Td><CanalBadge canal={r.canal} /></Td>
                                         <Td className="whitespace-nowrap">{r.project_location || "—"}</Td>
                                         <Td><EstadoBadge estado={r.estado || "nuevo"} /></Td>
                                         <Td>{r.contact_collected ? "Sí" : "No"}</Td>
                                         <Td>
-                                            <button
-                                                onClick={() => setSel(r.id)}
-                                                className="px-3 py-1 rounded-lg text-white bg-gradient-to-r from-emerald-600 to-sky-600 hover:opacity-90 shadow"
-                                            >
-                                                Ver
-                                            </button>
+                                            <div className="flex items-center gap-2">
+                                                <button
+                                                    onClick={() => setSel(r.id)}
+                                                    className="px-3 py-1 rounded-lg text-white bg-gradient-to-r from-emerald-600 to-sky-600 hover:opacity-90 shadow"
+                                                >
+                                                    Ver
+                                                </button>
+                                                <button
+                                                    onClick={() => handleArchive(r.id)}
+                                                    disabled={archBusy || delBusy}
+                                                    className="px-3 py-1 rounded-lg border border-amber-300 text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                                                    title="Archivar"
+                                                >
+                                                    Archivar
+                                                </button>
+                                                <button
+                                                    onClick={() => handleDelete(r.id)}
+                                                    disabled={archBusy || delBusy}
+                                                    className="px-3 py-1 rounded-lg border border-rose-300 text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                                                    title="Eliminar"
+                                                >
+                                                    Eliminar
+                                                </button>
+                                            </div>
                                         </Td>
                                     </tr>
                                 );
                             })
                         ) : (
                             <tr>
-                                <td colSpan={9} className="p-4 text-center text-gray-500">
+                                <td colSpan={10} className="p-4 text-center text-gray-500">
                                     Sin resultados
                                 </td>
                             </tr>
@@ -404,8 +462,11 @@ function CanalBadge({ canal }) {
 }
 
 /* ---------- Card para móvil ---------- */
-function RowCard({ r, onVer }) {
+function RowCard({ r, onVer, onArchivar, onEliminar, busyId }) {
     const categoria = normalizeCategoriaDocValue(r.categoria_general);
+    const archBusy = busyId === `arch-${r.id}`;
+    const delBusy = busyId === `del-${r.id}`;
+
     return (
         <article className="rounded-xl border border-emerald-200/60 bg-white p-3 shadow-sm">
             <div className="flex items-start justify-between gap-2">
@@ -422,17 +483,31 @@ function RowCard({ r, onVer }) {
                     {categoria}
                 </span>
                 <ToneChip tone={r.tono_detectado} />
-                <CanalBadge canal={r.canal} /> {/* NUEVO en móvil */}
+                <CanalBadge canal={r.canal} />
                 <span className="text-xs text-slate-600">{r.project_location || "—"}</span>
                 <span className="text-xs">{r.contact_collected ? "📞 Con contacto" : "Sin contacto"}</span>
             </div>
 
-            <div className="mt-3 flex justify-end">
+            <div className="mt-3 flex justify-end gap-2">
                 <button
                     onClick={onVer}
                     className="px-3 py-1 rounded-lg text-white bg-gradient-to-r from-emerald-600 to-sky-600 hover:opacity-90"
                 >
                     Ver
+                </button>
+                <button
+                    onClick={onArchivar}
+                    disabled={archBusy || delBusy}
+                    className="px-3 py-1 rounded-lg border border-amber-300 text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                >
+                    Archivar
+                </button>
+                <button
+                    onClick={onEliminar}
+                    disabled={archBusy || delBusy}
+                    className="px-3 py-1 rounded-lg border border-rose-300 text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                >
+                    Eliminar
                 </button>
             </div>
         </article>
