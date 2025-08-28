@@ -428,6 +428,28 @@ def craft_ack_continue(topic_hint: str, found: Dict[str,str]) -> str:
     ask = " ¿Podrías contarme un poco más sobre tu idea o necesidad?"
     return (" ".join(parts) + topic_txt + ask).strip()
 
+
+# --- POV corto (1 frase de apoyo según el tema) ---
+def short_supportive_pov(topic_text: str) -> str:
+    t = _normalize_text(topic_text or "")
+    rules = [
+        (("alumbr","luz","ilumin"), "Mejorar el alumbrado público refuerza la seguridad y la vida en comunidad."),
+        (("via","vial","hueco","bache","paviment"), "Arreglar las vías mejora la movilidad y reduce accidentes."),
+        (("parque","zona verde","jardin"), "Cuidar los parques crea espacios seguros para la convivencia y el deporte."),
+        (("colegio","escuela","educacion","educación"), "Fortalecer la educación abre oportunidades para las familias."),
+        (("salud","hospital","eps","centro de salud"), "Una mejor atención en salud protege el bienestar de todos."),
+        (("seguridad","atraco","hurto"), "Fortalecer la seguridad permite vivir y trabajar tranquilos."),
+        (("basura","residuo","aseo","limpieza"), "Una buena gestión de residuos cuida el ambiente y la salud."),
+        (("agua","acueducto","alcantarill","fuga"), "Garantizar agua y saneamiento es esencial para la salud."),
+        (("transporte","bus","ruta","movilidad"), "Un transporte eficiente conecta oportunidades y ahorra tiempo."),
+        (("empleo","trabajo","emprend"), "Impulsar empleo y emprendimiento dinamiza la economía local."),
+    ]
+    for keys, phrase in rules:
+        if any(k in t for k in keys):
+            return phrase
+    return "Trabajar en este tema puede mejorar la calidad de vida de la comunidad."
+
+
 # =========================================================
 #  Pequeñas “LLM tools”
 # =========================================================
@@ -519,10 +541,12 @@ PRIVACY_REPLY = (
 )
 
 def craft_argument_question(name: Optional[str], project_location: Optional[str], topic_hint: Optional[str] = None) -> str:
-    saludo = f"Hola, {name}." if name else "Gracias por contarlo."
-    lugar = f" en el barrio {project_location}" if project_location else ""
-    tema = f" Sobre {topic_hint.lower()}," if topic_hint else ""
-    return f"{saludo}{lugar}.{tema} ¿Podrías contarme por qué es importante y qué impacto tendría?".strip()
+    # sin re-saludar; agradece y da POV breve
+    saludo = f"Gracias, {name}." if name else "Gracias por contarlo."
+    lugar  = f" En el barrio {project_location}." if project_location else ""
+    pov    = " " + short_supportive_pov(topic_hint or "")
+    return f"{saludo}{lugar}{pov} ¿Podrías contarme por qué es importante y qué impacto tendría?".strip()
+
 
 # Detectar frases de solicitud de contacto (muy amplio)
 CONTACT_PATTERNS = re.compile(
