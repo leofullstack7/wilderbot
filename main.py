@@ -263,6 +263,38 @@ def has_argument_text(t: str) -> bool:
     ]
     return any(k in t for k in keys)
 
+def has_argument_text(t: str) -> bool:
+    """
+    Heurística para detectar 'argumento/razón'.
+    Más estricta: NO dispara por 'para' suelto (evita falsos positivos como 'para los niños').
+    """
+    t = _normalize_text(t)
+    keys = [
+        "porque", "ya que", "debido", "por que", "porqué",
+        "afecta", "impacta", "riesgo", "peligro",
+        "falta", "no hay", "urge", "es necesario", "contamina",
+        "seguridad", "salud", "empleo", "movilidad", "ambiental"
+    ]
+    return any(k in t for k in keys)
+
+# === NUEVO: heurística fuerte para detectar intención de propuesta/sugerencia ===
+def is_proposal_intent(text: str) -> bool:
+    t = _normalize_text(text)
+    kw = [
+        "propongo", "propuesta", "sugerencia", "sugerir", "sugiero",
+        "mi idea", "mi propuesta", "quiero proponer", "quisiera proponer",
+        "me gustaria proponer", "me gustaria que", "planteo", "plantear",
+        "propongo que", "propuse", "propone"
+    ]
+    return any(k in t for k in kw)
+
+# === NUEVO: recortar a N oraciones (para contener respuestas del LLM) ===
+def limit_sentences(text: str, max_sentences: int = 3) -> str:
+    parts = re.split(r'(?<=[\.\?!])\s+', text.strip())
+    out = " ".join([p for p in parts if p][:max_sentences]).strip()
+    return out or text
+
+
 # =========================================================
 #  Extracciones específicas
 # =========================================================
@@ -429,6 +461,8 @@ PRIVACY_REPLY = (
 
 # --- NUEVO: helpers para propuesta/argumento/limpieza de pedidos de contacto
 
+# --- NUEVO: helpers para propuesta/argumento/limpieza de pedidos de contacto
+
 def craft_argument_question(name: Optional[str], project_location: Optional[str] = None) -> str:
     """
     Pregunta genérica para argumentar, con un saludo corto si hay nombre.
@@ -447,8 +481,7 @@ def positive_ack_and_request_argument(name: Optional[str]) -> str:
     saludo = f"Gracias, {name}. " if name else "¡Gracias! "
     return (
         f"{saludo}Tu propuesta suena valiosa para la comunidad. "
-        "Para poder moverla, ¿podrías argumentarla brevemente? "
-        "Cuéntame el motivo, a quién impacta y la urgencia."
+        "Para poder moverla, ¿podrías argumentarla brevemente? Motivo, a quién impacta y urgencia."
     )
 
 CONTACT_PATTERNS = re.compile(
@@ -461,6 +494,7 @@ def strip_contact_requests(texto: str) -> str:
     limpio = [s for s in sent_split if not CONTACT_PATTERNS.search(s)]
     out = " ".join([s for s in limpio if s])
     return out if out else texto
+
 
 # =========================================================
 #  RAG
@@ -641,8 +675,11 @@ async def responder(data: Entrada):
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
         intent = policy.get("intent", "otro")
 
-
+        # === NUEVO: si el texto del usuario sugiere propuesta, forzamos intent='propuesta'
+        if is_proposal_intent(data.mensaje):
+            intent = "propuesta"
                 # =========================
+        # =========================
         # FLUJO DETERMINISTA: PROPUESTAS / SUGERENCIAS
         # =========================
         is_proposal_flow = (
@@ -653,7 +690,7 @@ async def responder(data: Entrada):
         )
 
         if is_proposal_flow:
-            # 1) Si es primera vez que detectamos propuesta/sugerencia -> pedir la propuesta
+            # 1) Primera vez que detectamos propuesta -> pedir la propuesta
             if not conv_data.get("proposal_requested") and not conv_data.get("proposal_collected"):
                 conv_ref.update({
                     "proposal_requested": True,
@@ -667,12 +704,12 @@ async def responder(data: Entrada):
                 ])
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-            # 2) Si ya pedimos la propuesta y aún no la hemos guardado -> tomar este turno como propuesta
+            # 2) Ya pedimos propuesta y aún no la hemos guardado -> tomar este turno como propuesta
             if conv_data.get("proposal_requested") and not conv_data.get("proposal_collected"):
                 conv_ref.update({
                     "current_proposal": data.mensaje.strip(),
                     "proposal_collected": True,
-                    "argument_requested": True,     # activamos la etapa de argumento
+                    "argument_requested": True,  # pasamos a etapa de argumento
                     "ultima_fecha": firestore.SERVER_TIMESTAMP
                 })
                 texto = positive_ack_and_request_argument(name)
@@ -682,9 +719,8 @@ async def responder(data: Entrada):
                 ])
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-            # 3) Ya tenemos propuesta y estamos en etapa de argumento
+            # 3) Ya tenemos propuesta y estamos pidiendo argumento
             if conv_data.get("proposal_collected") and not conv_data.get("argument_collected"):
-                # ¿el usuario ya argumentó? (heurística + longitud)
                 if has_argument_text(data.mensaje) or len(_normalize_text(data.mensaje)) >= 20:
                     conv_ref.update({
                         "argument_collected": True,
@@ -704,7 +740,7 @@ async def responder(data: Entrada):
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                 else:
-                    # Reforzar una sola vez la petición de argumento, sin pedir contacto todavía
+                    # Reforzar petición de argumento (corta)
                     texto = craft_argument_question(name, conv_data.get("project_location"))
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
@@ -712,14 +748,13 @@ async def responder(data: Entrada):
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-            # 4) Ya tenemos propuesta + argumento y aún falta contacto
+            # 4) Ya tenemos propuesta + argumento y falta contacto
             if conv_data.get("argument_collected") and not (conv_data.get("contact_collected") or phone):
                 info_actual = (conv_data.get("contact_info") or {})
                 missing = []
                 if not (info_actual.get("nombre") or name):        missing.append("nombre")
                 if not (info_actual.get("barrio") or user_barrio): missing.append("barrio")
                 if not (info_actual.get("telefono") or phone):     missing.append("celular")
-
                 if missing:
                     conv_ref.update({"contact_requested": True})
                     texto = build_contact_request(missing)
@@ -728,7 +763,8 @@ async def responder(data: Entrada):
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-            # Si ya llegó teléfono en este turno, el cierre amable lo maneja el POST de más abajo.
+            # Si ya llegó el celular, el cierre amable lo maneja el POST de abajo.
+
             # En cualquiera de los casos anteriores retornamos; si ya está todo completo, seguimos flujo normal.
 
         # ¿El usuario acaba de responder nuestra pregunta de argumento?
@@ -824,6 +860,7 @@ async def responder(data: Entrada):
             max_tokens=280
         )
         texto = completion.choices[0].message.content.strip()
+        texto = limit_sentences(texto, 3)
 
         # --- NUEVO: si aún NO debemos pedir contacto, limpiamos cualquier intento del LLM
         if not should_ask_now:
