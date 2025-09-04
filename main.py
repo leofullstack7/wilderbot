@@ -152,35 +152,42 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
     conv_ref = db.collection("conversaciones").document(chat_id)
     if not conv_ref.get().exists:
         conv_ref.set({
-            "usuario_id": usuario_id,
-            "faq_origen": faq_origen or None,
-            "categoria_general": [],
-            "titulo_propuesta": [],
-            "mensajes": [],
-            "fecha_inicio": firestore.SERVER_TIMESTAMP,
-            "ultima_fecha": firestore.SERVER_TIMESTAMP,
-            "tono_detectado": None,
+        "usuario_id": usuario_id,
+        "faq_origen": faq_origen or None,
+        "categoria_general": [],
+        "titulo_propuesta": [],
+        "mensajes": [],
+        "fecha_inicio": firestore.SERVER_TIMESTAMP,
+        "ultima_fecha": firestore.SERVER_TIMESTAMP,
+        "tono_detectado": None,
 
-            # Estado de conversación/tema
-            "last_topic_vec": None,
-            "last_topic_summary": None,
-            "awaiting_topic_confirm": False,
-            "candidate_new_topic_summary": None,
-            "candidate_new_topic_vec": None,
-            "topics_history": [],
+        # Estado de conversación/tema
+        "last_topic_vec": None,
+        "last_topic_summary": None,
+        "awaiting_topic_confirm": False,
+        "candidate_new_topic_summary": None,
+        "candidate_new_topic_vec": None,
+        "topics_history": [],
 
-            # === Flujo argumento + contacto ===
-            "argument_requested": False,   # hicimos la ÚNICA pregunta de argumento
-            "argument_collected": False,   # el ciudadano ya respondió
-            "contact_intent": None,        # 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
-            "contact_requested": False,
-            "contact_collected": False,    # True solo si hay teléfono
-            "contact_refused": False,      # rechazo explícito
-            "contact_info": {"nombre": None, "barrio": None, "telefono": None},
+        # === Flujo argumento + contacto (genérico) ===
+        "argument_requested": False,        # hicimos la pregunta de argumento
+        "argument_collected": False,        # el ciudadano ya respondió
 
-            # Lugar de la propuesta (no confundir con barrio de residencia)
-            "project_location": None,
-        })
+        # === NUEVO: Flujo específico de propuestas/sugerencias ===
+        "proposal_requested": False,        # ya pedimos: "¿cuál es tu propuesta?"
+        "proposal_collected": False,        # ya tenemos el texto de la propuesta
+        "current_proposal": None,           # texto de la propuesta del ciudadano
+
+        "contact_intent": None,             # 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
+        "contact_requested": False,
+        "contact_collected": False,         # True solo si hay teléfono
+        "contact_refused": False,           # rechazo explícito
+        "contact_info": {"nombre": None, "barrio": None, "telefono": None},
+
+        # Lugar de la propuesta (no confundir con barrio de residencia)
+        "project_location": None,
+    })
+
     else:
         conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
     return conv_ref
@@ -420,14 +427,28 @@ PRIVACY_REPLY = (
     "para escalar tu propuesta y ayudar a que pueda hacerse realidad."
 )
 
-# --- NUEVO: helpers para forzar pregunta de argumento y limpiar pedidos de contacto
-def craft_argument_question(name: Optional[str], project_location: Optional[str]) -> str:
-    saludo = f"Hola, {name}." if name else "¡Qué buena iniciativa!"
+# --- NUEVO: helpers para propuesta/argumento/limpieza de pedidos de contacto
+
+def craft_argument_question(name: Optional[str], project_location: Optional[str] = None) -> str:
+    """
+    Pregunta genérica para argumentar, con un saludo corto si hay nombre.
+    """
+    saludo = f"Hola, {name}. " if name else ""
     lugar = f" en el barrio {project_location}" if project_location else ""
-    # 1 sola pregunta, sin pedir datos
     return (
-        f"{saludo} La idea de construir un parque{lugar} suena excelente para fomentar espacios de recreación. "
-        "¿Por qué crees que deba hacerse en ese sector?"
+        f"{saludo}Gracias por compartir tu idea{lugar}. "
+        "¿Nos cuentas en pocas palabras por qué es importante, a quién beneficiaría y qué problema ayuda a resolver?"
+    )
+
+def positive_ack_and_request_argument(name: Optional[str]) -> str:
+    """
+    Elogio breve + pedido de argumento (segunda etapa del flujo de propuesta).
+    """
+    saludo = f"Gracias, {name}. " if name else "¡Gracias! "
+    return (
+        f"{saludo}Tu propuesta suena valiosa para la comunidad. "
+        "Para poder moverla, ¿podrías argumentarla brevemente? "
+        "Cuéntame el motivo, a quién impacta y la urgencia."
     )
 
 CONTACT_PATTERNS = re.compile(
@@ -436,7 +457,6 @@ CONTACT_PATTERNS = re.compile(
 
 def strip_contact_requests(texto: str) -> str:
     # Elimina frases que pidan datos de contacto si aún no corresponde
-    # Dividimos por oraciones simples para remover selectivamente
     sent_split = re.split(r'(?<=[\.\?!])\s+', texto.strip())
     limpio = [s for s in sent_split if not CONTACT_PATTERNS.search(s)]
     out = " ".join([s for s in limpio if s])
@@ -620,6 +640,96 @@ async def responder(data: Entrada):
         # === Política argumento + contacto ===
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
         intent = policy.get("intent", "otro")
+
+
+                # =========================
+        # FLUJO DETERMINISTA: PROPUESTAS / SUGERENCIAS
+        # =========================
+        is_proposal_flow = (
+            intent == "propuesta"
+            or conv_data.get("contact_intent") == "propuesta"
+            or bool(conv_data.get("proposal_requested"))
+            or bool(conv_data.get("proposal_collected"))
+        )
+
+        if is_proposal_flow:
+            # 1) Si es primera vez que detectamos propuesta/sugerencia -> pedir la propuesta
+            if not conv_data.get("proposal_requested") and not conv_data.get("proposal_collected"):
+                conv_ref.update({
+                    "proposal_requested": True,
+                    "contact_intent": "propuesta",
+                    "ultima_fecha": firestore.SERVER_TIMESTAMP
+                })
+                texto = "¡Perfecto! ¿Cuál es tu propuesta o sugerencia? Cuéntamela en una o dos frases."
+                append_mensajes(conv_ref, [
+                    {"role": "user", "content": data.mensaje},
+                    {"role": "assistant", "content": texto}
+                ])
+                return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
+            # 2) Si ya pedimos la propuesta y aún no la hemos guardado -> tomar este turno como propuesta
+            if conv_data.get("proposal_requested") and not conv_data.get("proposal_collected"):
+                conv_ref.update({
+                    "current_proposal": data.mensaje.strip(),
+                    "proposal_collected": True,
+                    "argument_requested": True,     # activamos la etapa de argumento
+                    "ultima_fecha": firestore.SERVER_TIMESTAMP
+                })
+                texto = positive_ack_and_request_argument(name)
+                append_mensajes(conv_ref, [
+                    {"role": "user", "content": data.mensaje},
+                    {"role": "assistant", "content": texto}
+                ])
+                return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
+            # 3) Ya tenemos propuesta y estamos en etapa de argumento
+            if conv_data.get("proposal_collected") and not conv_data.get("argument_collected"):
+                # ¿el usuario ya argumentó? (heurística + longitud)
+                if has_argument_text(data.mensaje) or len(_normalize_text(data.mensaje)) >= 20:
+                    conv_ref.update({
+                        "argument_collected": True,
+                        "ultima_fecha": firestore.SERVER_TIMESTAMP
+                    })
+                    # Pide contacto (nombre, barrio, celular)
+                    info_actual = (conv_data.get("contact_info") or {})
+                    faltan = []
+                    if not info_actual.get("nombre"):   faltan.append("nombre")
+                    if not info_actual.get("barrio"):   faltan.append("barrio")
+                    if not info_actual.get("telefono"): faltan.append("celular")
+                    conv_ref.update({"contact_requested": True})
+                    texto = build_contact_request(faltan or ["nombre", "barrio", "celular"])
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                else:
+                    # Reforzar una sola vez la petición de argumento, sin pedir contacto todavía
+                    texto = craft_argument_question(name, conv_data.get("project_location"))
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
+            # 4) Ya tenemos propuesta + argumento y aún falta contacto
+            if conv_data.get("argument_collected") and not (conv_data.get("contact_collected") or phone):
+                info_actual = (conv_data.get("contact_info") or {})
+                missing = []
+                if not (info_actual.get("nombre") or name):        missing.append("nombre")
+                if not (info_actual.get("barrio") or user_barrio): missing.append("barrio")
+                if not (info_actual.get("telefono") or phone):     missing.append("celular")
+
+                if missing:
+                    conv_ref.update({"contact_requested": True})
+                    texto = build_contact_request(missing)
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+            # Si ya llegó teléfono en este turno, el cierre amable lo maneja el POST de más abajo.
+            # En cualquiera de los casos anteriores retornamos; si ya está todo completo, seguimos flujo normal.
 
         # ¿El usuario acaba de responder nuestra pregunta de argumento?
         last_role = historial_for_decider[-1]["role"] if historial_for_decider else None

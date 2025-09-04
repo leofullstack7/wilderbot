@@ -42,14 +42,10 @@ export default function App() {
           <Route element={<AdminLayout />}>
             <Route index element={<Dashboard />} />
             <Route path="propuestas" element={<Propuestas />} />
+            {/* 👇 AQUI ADENTRO: */}
+            <Route path="conocimiento" element={<Conocimiento />} />
           </Route>
         </Route>
-
-        <Route path="/admin/conocimiento" element={
-          <AdminLayout><Conocimiento /></AdminLayout>
-        } />
-
-        
 
         {/* 404 simple */}
         <Route path="*" element={<div className="p-6">Página no encontrada</div>} />
