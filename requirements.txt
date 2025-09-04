@@ -1,8 +1,25 @@
-fastapi
-uvicorn
-python-dotenv
-firebase-admin
-google-cloud-firestore
+# --- Web API ---
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# --- OpenAI + Pinecone ---
 openai>=1.30.0
-pinecone>=6.0.0
-httpx
+pinecone-client>=5.0.0
+
+# --- Google Firestore/Admin ---
+firebase-admin>=6.5.0
+google-cloud-firestore>=2.16.0
+google-api-core>=2.19.0
+grpcio>=1.62.0
+
+# --- Utilidades ---
+python-dotenv>=1.0.1
+pydantic>=2.7.1
+typing-extensions>=4.12.2
+
+# --- Ingesta de archivos (NUEVO) ---
+python-docx==1.1.2         # <- esto instala el módulo "docx"
+pdfplumber==0.11.4
+pdfminer.six==20231228      # dependencia de pdfplumber (explícita por seguridad)
+openpyxl==3.1.5
+pandas==2.2.2
