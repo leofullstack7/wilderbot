@@ -10,6 +10,8 @@ import AdminLayout from "./pages/AdminLayout";
 import Dashboard from "./pages/Dashboard";
 import Propuestas from "./pages/Propuestas";
 
+import Conocimiento from "./pages/Conocimiento.jsx";
+
 function ProtectedRoute() {
   const [ready, setReady] = useState(false);
   const [user, setUser] = useState(null);
@@ -42,6 +44,12 @@ export default function App() {
             <Route path="propuestas" element={<Propuestas />} />
           </Route>
         </Route>
+
+        <Route path="/admin/conocimiento" element={
+          <AdminLayout><Conocimiento /></AdminLayout>
+        } />
+
+        
 
         {/* 404 simple */}
         <Route path="*" element={<div className="p-6">Página no encontrada</div>} />
