@@ -239,6 +239,19 @@ def _normalize_text(t: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+# Palabras/frases iniciales que NO son nombre (normalizadas)
+DISCOURSE_START_WORDS = {
+    _normalize_text(w) for w in [
+        "hola", "holaa", "holaaa",
+        "buenas", "buenos días", "buen día", "saludos",
+        "gracias", "ok", "okay", "oki", "vale", "de acuerdo",
+        "listo", "listos", "bueno", "entendido", "hecho",
+        "claro", "claro que sí",
+        "sí", "si", "perfecto", "hey",
+        "dale", "de una", "genial", "súper", "super"
+    ]
+}
+
 def is_plain_greeting(text: str) -> bool:
     if not text:
         return False
@@ -304,16 +317,30 @@ def limit_sentences(text: str, max_sentences: int = 3) -> str:
 # =========================================================
 
 def extract_user_name(text: str) -> Optional[str]:
+    # 1) Formas explícitas: "soy", "me llamo", "mi nombre es"
     m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40})', text, flags=re.IGNORECASE)
     if m:
-        return m.group(1).strip()
-    # Nombre al inicio antes de coma o conectores
-    m = re.search(r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)', text)
+        nombre = m.group(1).strip(" .,")
+        return nombre if _normalize_text(nombre) not in DISCOURSE_START_WORDS else None
+
+    # 2) Nombre suelto al inicio antes de coma o conectores (más estricto)
+    m = re.search(
+        r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)',
+        text
+    )
     if m:
         posible = m.group(1).strip()
-        if posible.lower() not in {"hola","buenas","buenos dias","buenas tardes","buenas noches"}:
-            return posible
+        low = _normalize_text(posible)
+        # descarta marcadores conversacionales como "Claro,"
+        if low in DISCOURSE_START_WORDS:
+            return None
+        # evita palabras sueltas tipo "Gracias" / "Perfecto" si vienen solas
+        if len(posible.split()) == 1 and len(posible) <= 3:
+            return None
+        return posible
+
     return None
+
 
 def extract_phone(text: str) -> Optional[str]:
     m = re.search(r'(\+?\d[\d\s\-]{7,14}\d)', text)
@@ -486,10 +513,18 @@ def llm_contact_policy(summary_so_far: str, last_user: str) -> Dict[str, Any]:
 # =========================================================
 
 def build_contact_request(missing: List[str]) -> str:
-    etiquetas = {"nombre": "tu nombre", "barrio": "tu barrio", "celular": "un número de contacto"}
-    pedir = [etiquetas[m] for m in missing]
+    etiquetas = {
+        "nombre": "tu nombre",
+        "barrio": "tu barrio",
+        "celular": "un número de contacto",
+        "project_location": "el barrio del proyecto",
+    }
+    pedir = [etiquetas[m] for m in missing if m in etiquetas]
+    if not pedir:
+        return "¿Me confirmas por favor los datos pendientes?"
     frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
     return f"Para escalar y darle seguimiento, ¿me compartes {frase}? Lo usamos solo para informarte avances."
+
 
 PRIVACY_REPLY = (
     "Entiendo perfectamente que quieras proteger tu información personal. "
@@ -703,7 +738,16 @@ async def responder(data: Entrada):
 
         if partials:
             current_info = (conv_data.get("contact_info") or {})
-            new_info = {**current_info, **{k: v or current_info.get(k) for k, v in partials.items()}}
+            new_info = dict(current_info)  # copia
+
+            # no sobrescribir un nombre ya existente
+            if name and not current_info.get("nombre"):
+                new_info["nombre"] = name
+            if user_barrio:
+                new_info["barrio"] = user_barrio
+            if phone:
+                new_info["telefono"] = phone
+
             conv_ref.update({"contact_info": new_info})
             if phone:
                 conv_ref.update({"contact_collected": True})
@@ -882,6 +926,7 @@ async def responder(data: Entrada):
             if not info_actual.get("nombre"):   faltan.append("nombre")
             if not info_actual.get("barrio"):   faltan.append("barrio")
             if not info_actual.get("telefono"): faltan.append("celular")
+            if not (conv_data.get("project_location") or proj_loc): faltan.append("project_location")
             texto_directo = build_contact_request(faltan or ["celular"])
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
@@ -932,13 +977,17 @@ async def responder(data: Entrada):
 
         # --- POST: cierre conciso si llegó teléfono en este turno ---
         if phone:
-            nombre_txt = (name or (conv_data.get("contact_info") or {}).get("nombre") or "").strip()
-            cierre = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
-            cierre += "Con estos datos escalamos el caso y te contamos avances."
-            if "tel" in texto.lower() or "celu" in texto.lower() or len(texto) < 30:
-                texto = cierre
+            # si aún falta el barrio del PROYECTO, pídelo antes de cerrar
+            if not (conv_data.get("project_location") or proj_loc):
+                texto = build_contact_request(["project_location"])
             else:
-                texto += "\n\n" + cierre
+                nombre_txt = (name or (conv_data.get("contact_info") or {}).get("nombre") or "").strip()
+                cierre = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
+                cierre += "Con estos datos escalamos el caso y te contamos avances."
+                if "tel" in texto.lower() or "celu" in texto.lower() or len(texto) < 30:
+                    texto = cierre
+                else:
+                    texto += "\n\n" + cierre
 
         # --- POST: si falta algo y ya toca pedir contacto -> pide lo que falte (sin repetir lo ya dado) ---
         elif should_ask_now:
@@ -947,6 +996,7 @@ async def responder(data: Entrada):
             if not (info_actual.get("nombre") or name):        missing.append("nombre")
             if not (info_actual.get("barrio") or user_barrio): missing.append("barrio")
             if not (info_actual.get("telefono") or phone):     missing.append("celular")
+            if not (conv_data.get("project_location") or proj_loc): missing.append("project_location")
             if missing:
                 texto = build_contact_request(missing)
 
