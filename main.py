@@ -152,45 +152,48 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
     conv_ref = db.collection("conversaciones").document(chat_id)
     if not conv_ref.get().exists:
         conv_ref.set({
-        "usuario_id": usuario_id,
-        "faq_origen": faq_origen or None,
-        "canal": canal or "web",  
-        "categoria_general": [],
-        "titulo_propuesta": [],
-        "mensajes": [],
-        "fecha_inicio": firestore.SERVER_TIMESTAMP,
-        "ultima_fecha": firestore.SERVER_TIMESTAMP,
-        "tono_detectado": None,
+            "usuario_id": usuario_id,
+            "faq_origen": faq_origen or None,
+            "canal": canal or "web",
+            "categoria_general": [],
+            "titulo_propuesta": [],
+            "mensajes": [],
+            "fecha_inicio": firestore.SERVER_TIMESTAMP,
+            "ultima_fecha": firestore.SERVER_TIMESTAMP,
+            "tono_detectado": None,
 
-        # Estado de conversación/tema
-        "last_topic_vec": None,
-        "last_topic_summary": None,
-        "awaiting_topic_confirm": False,
-        "candidate_new_topic_summary": None,
-        "candidate_new_topic_vec": None,
-        "topics_history": [],
+            # Estado de conversación/tema
+            "last_topic_vec": None,
+            "last_topic_summary": None,
+            "awaiting_topic_confirm": False,
+            "candidate_new_topic_summary": None,
+            "candidate_new_topic_vec": None,
+            "topics_history": [],
 
-        # === Flujo argumento + contacto (genérico) ===
-        "argument_requested": False,        # hicimos la pregunta de argumento
-        "argument_collected": False,        # el ciudadano ya respondió
+            # Flujo argumento + contacto
+            "argument_requested": False,
+            "argument_collected": False,
 
-        # === NUEVO: Flujo específico de propuestas/sugerencias ===
-        "proposal_requested": False,        # ya pedimos: "¿cuál es tu propuesta?"
-        "proposal_collected": False,        # ya tenemos el texto de la propuesta
-        "current_proposal": None,           # texto de la propuesta del ciudadano
+            # Flujo específico de propuestas/sugerencias
+            "proposal_requested": False,
+            "proposal_collected": False,
+            "current_proposal": None,
 
-        "contact_intent": None,             # 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
-        "contact_requested": False,
-        "contact_collected": False,         # True solo si hay teléfono
-        "contact_refused": False,           # rechazo explícito
-        "contact_info": {"nombre": None, "barrio": None, "telefono": None},
+            "contact_intent": None,   # 'propuesta' | 'problema' | 'reconocimiento' | 'otro'
+            "contact_requested": False,
+            "contact_collected": False,
+            "contact_refused": False,
+            "contact_info": {"nombre": None, "barrio": None, "telefono": None},
 
-        # Lugar de la propuesta (no confundir con barrio de residencia)
-        "project_location": None,
-    })
-
+            # Lugar de la propuesta (no confundir con barrio de residencia)
+            "project_location": None,
+        })
     else:
-        conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP,"canal": canal or firestore.DELETE_FIELD })
+        # Solo tocamos 'canal' si viene; si no, no borres el existente
+        if canal:
+            conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP, "canal": canal})
+        else:
+            conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
     return conv_ref
 
 
@@ -362,6 +365,29 @@ def extract_project_location(text: str) -> Optional[str]:
             return _clean_barrio_fragment(m.group(1))
     return None
 
+def extract_proposal_text(text: str) -> str:
+    """Extrae la propuesta desde el mensaje del ciudadano, limpiando frases iniciales típicas."""
+    t = text.strip()
+
+    # Quita una posible auto-presentación inicial
+    t = re.sub(
+        r'^\s*(?:soy|me llamo|mi nombre es)\s+[A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40}[,:\-–—]?\s*',
+        '',
+        t, flags=re.IGNORECASE
+    )
+
+    # Quita 'me gustaría proponer', 'quiero proponer', 'propongo que', etc.
+    t = re.sub(
+        r'^\s*(?:me\s+gustar[íi]a\s+(?:proponer|que)\s+|quisiera\s+(?:proponer|que)\s+|'
+        r'quiero\s+proponer\s+|propongo\s+que\s+|propongo\s+)',
+        '',
+        t, flags=re.IGNORECASE
+    )
+
+    t = re.sub(r'\s+', ' ', t).strip()
+    return limit_sentences(t, 2)
+
+
 def detect_contact_refusal(text: str) -> bool:
     t = _normalize_text(text)
     patterns = [
@@ -487,14 +513,13 @@ def craft_argument_question(name: Optional[str], project_location: Optional[str]
         "¿Nos cuentas en pocas palabras por qué es importante, a quién beneficiaría y qué problema ayuda a resolver?"
     )
 
-def positive_ack_and_request_argument(name: Optional[str]) -> str:
-    """
-    Elogio breve + pedido de argumento (segunda etapa del flujo de propuesta).
-    """
-    saludo = f"Gracias, {name}. " if name else "¡Gracias! "
+def positive_ack_and_request_argument(name: Optional[str], project_location: Optional[str] = None) -> str:
+    saludo = f"Gracias, {name}. " if name else "¡Gracias por contarme tu idea! "
+    lugar = f" para el barrio {project_location}" if project_location else ""
     return (
-        f"{saludo}Tu propuesta suena valiosa para la comunidad. "
-        "Para poder moverla, ¿podrías argumentarla brevemente? Motivo, a quién impacta y urgencia."
+        f"{saludo}Tu propuesta{lugar} suena muy valiosa para la comunidad. "
+        "Para avanzar, ¿podrías contar en pocas palabras por qué sería importante, "
+        "a quién beneficiaría y qué problema ayudaría a resolver?"
     )
 
 CONTACT_PATTERNS = re.compile(
@@ -705,8 +730,30 @@ async def responder(data: Entrada):
         )
 
         if is_proposal_flow:
-            # 1) Primera vez que detectamos propuesta -> pedir la propuesta
-            if not conv_data.get("proposal_requested") and not conv_data.get("proposal_collected"):
+            # 1) ¿Este turno YA trae la propuesta? -> capturar y pasar a argumento
+            if not conv_data.get("proposal_collected"):
+                # Si el texto ya contiene una propuesta (o al menos una frase concreta), la guardamos ya
+                if is_proposal_intent(data.mensaje) or len(_normalize_text(data.mensaje)) >= 20:
+                    proposal_text = extract_proposal_text(data.mensaje)
+                    conv_ref.update({
+                        "current_proposal": proposal_text,
+                        "proposal_requested": True,     # iniciamos el flujo
+                        "proposal_collected": True,     # y ya la tenemos
+                        "argument_requested": True,     # pasamos a pedir argumento
+                        "contact_intent": "propuesta",
+                        "ultima_fecha": firestore.SERVER_TIMESTAMP
+                    })
+                    texto = positive_ack_and_request_argument(
+                        name,
+                        conv_data.get("project_location") or proj_loc
+                    )
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
+                # Si llegó con intención pero sin contenido concreto, pedir la propuesta
                 conv_ref.update({
                     "proposal_requested": True,
                     "contact_intent": "propuesta",
@@ -722,17 +769,21 @@ async def responder(data: Entrada):
             # 2) Ya pedimos propuesta y aún no la hemos guardado -> tomar este turno como propuesta
             if conv_data.get("proposal_requested") and not conv_data.get("proposal_collected"):
                 conv_ref.update({
-                    "current_proposal": data.mensaje.strip(),
+                    "current_proposal": extract_proposal_text(data.mensaje),
                     "proposal_collected": True,
                     "argument_requested": True,  # pasamos a etapa de argumento
                     "ultima_fecha": firestore.SERVER_TIMESTAMP
                 })
-                texto = positive_ack_and_request_argument(name)
+                texto = positive_ack_and_request_argument(
+                    name,
+                    conv_data.get("project_location") or proj_loc
+                )
                 append_mensajes(conv_ref, [
                     {"role": "user", "content": data.mensaje},
                     {"role": "assistant", "content": texto}
                 ])
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
 
             # 3) Ya tenemos propuesta y estamos pidiendo argumento
             if conv_data.get("proposal_collected") and not conv_data.get("argument_collected"):
@@ -1050,15 +1101,6 @@ async def clasificar(body: ClasificarIn):
         updates["categoria_general"] = [categoria] if categoria else []
         updates["titulo_propuesta"] = [titulo] if titulo else []
 
-        if permitir_append and (conv_data.get("contact_intent") == "propuesta"):
-            conv_ref.set({
-                "topics_history": firestore.ArrayUnion([{
-                    "categoria": categoria,
-                    "titulo": titulo,
-                    "tono": tono,
-                    "fecha": firestore.SERVER_TIMESTAMP
-                }])
-            }, merge=True)
 
         hist_last = (conv_data.get("topics_history") or [])
         last_item = hist_last[-1] if hist_last else {}
