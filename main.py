@@ -695,8 +695,6 @@ async def responder(data: Entrada):
         if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
             conv_ref.update({"project_location": proj_loc})
 
-        if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
-            conv_ref.update({"project_location": proj_loc})
 
         partials = {}
         if name:   partials["nombre"] = name
@@ -1006,6 +1004,24 @@ def build_messages_for_classify(prompt_base: str, texto_base: str, ultima_respue
     user_msg = f"Propuesta del ciudadano:\n{texto_base}\n\nÚltima respuesta del bot:\n{ultima_respuesta_bot}\n\nDevuelve el JSON ahora."
     return [{"role":"system","content":system_msg},{"role":"user","content":user_msg}]
 
+def fallback_category_and_title(texto: str, location: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    t = _normalize_text(texto or "")
+    loc = _titlecase(location) if location else None
+
+    # --- Infraestructura / espacio público ---
+    if any(k in t for k in ["parque", "juegos", "infantil", "polideportivo", "cancha"]):
+        cat = "Infraestructura Urbana"
+        tit = f"Construcción de parque infantil en {loc}" if loc else "Construcción de parque infantil"
+        return cat, tit
+
+    if any(k in t for k in ["alumbrado", "ilumin", "poste", "luminaria"]):
+        cat = "Infraestructura Urbana"
+        tit = f"Mejora del alumbrado público en {loc}" if loc else "Mejora del alumbrado público"
+        return cat, tit
+
+    # Puedes agregar más reglas si lo necesitas (vías, residuos, seguridad, etc.)
+    return None, None
+
 def update_panel_resumen(categoria: str, tono: str, titulo: str, usuario_id: str):
     panel_ref = db.collection("panel_resumen").document("global")
     panel_ref.set({
@@ -1066,6 +1082,32 @@ async def clasificar(body: ClasificarIn):
         tono      = data.get("tono_detectado") or "neutral"
         palabras  = data.get("palabras_clave", [])
 
+        # Fallback si el LLM devolvió algo genérico/vacío
+        loc_proy = (conv_data.get("project_location")
+                    or (conv_data.get("contact_info") or {}).get("barrio"))
+
+        titulo_generico = (not titulo or len(titulo.strip()) < 6 or
+                        _normalize_text(titulo) in {
+                            "propuesta ciudadana",
+                            "interaccion inicial",
+                            "interacción inicial",
+                            "solicitud de propuesta",
+                            "sin titulo",
+                            "—"
+                        })
+
+        categoria_generica = _normalize_text(categoria) in {
+            "general", "otras", "sin clasificar", "otro"
+        }
+
+        if titulo_generico or categoria_generica:
+            fb_cat, fb_tit = fallback_category_and_title(
+                (conv_data.get("current_proposal") or ultimo_u or "").strip(),
+                loc_proy
+            )
+            if fb_cat: categoria = fb_cat
+            if fb_tit: titulo = fb_tit
+
         awaiting = bool(conv_data.get("awaiting_topic_confirm"))
         ya_contado = bool(conv_data.get("panel_contabilizado"))
 
@@ -1100,6 +1142,8 @@ async def clasificar(body: ClasificarIn):
         permitir_append = (not awaiting) or (body.contabilizar is True)
         updates["categoria_general"] = [categoria] if categoria else []
         updates["titulo_propuesta"] = [titulo] if titulo else []
+
+        conv_ref.set(updates, merge=True)   # <-- ¡Esto escribe categoría y título!
 
 
         hist_last = (conv_data.get("topics_history") or [])
