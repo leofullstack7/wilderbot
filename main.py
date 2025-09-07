@@ -323,7 +323,7 @@ def extract_user_name(text: str) -> Optional[str]:
         nombre = m.group(1).strip(" .,")
         return nombre if _normalize_text(nombre) not in DISCOURSE_START_WORDS else None
 
-    # 2) Nombre suelto al inicio antes de coma o conectores (más estricto)
+    # 2) Nombre suelto al inicio antes de coma o conectores
     m = re.search(
         r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)',
         text
@@ -331,13 +331,31 @@ def extract_user_name(text: str) -> Optional[str]:
     if m:
         posible = m.group(1).strip()
         low = _normalize_text(posible)
-        # descarta marcadores conversacionales como "Claro,"
         if low in DISCOURSE_START_WORDS:
             return None
-        # evita palabras sueltas tipo "Gracias" / "Perfecto" si vienen solas
         if len(posible.split()) == 1 and len(posible) <= 3:
             return None
         return posible
+
+    # 3) NUEVO: Nombre después de un marcador conversacional + coma,
+    #     seguido de "vivo/resido/mi número/teléfono/celular/soy ..."
+    m = re.search(
+        r'(?:^|[,;]\s*)(?:[A-Za-zÁÉÍÓÚÑáéíóúñ ]{0,20})?(?:claro(?:\s+que\s+s[ií])?|gracias|vale|ok|okay|perfecto|listo|de acuerdo)\s*,\s*'
+        r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*,\s*'
+        r'(?:vivo|resido|mi\s+(?:n[uú]mero|tel[eé]fono|celular)|soy)\b',
+        text, flags=re.IGNORECASE
+    )
+    if m:
+        return m.group(1).strip(" .,")
+
+    # 4) Fallback: cualquier secuencia Nombre Apellido seguida de ", vivo/…"
+    m = re.search(
+        r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*,\s*(?:vivo|resido|mi\s+(?:n[uú]mero|tel[eé]fono|celular)|soy)\b',
+        text, flags=re.IGNORECASE
+    )
+    if m:
+        posible = m.group(1).strip(" .,")
+        return posible if _normalize_text(posible) not in DISCOURSE_START_WORDS else None
 
     return None
 
@@ -374,23 +392,33 @@ def _clean_barrio_fragment(s: str) -> str:
     return _titlecase(s)
 
 def extract_project_location(text: str) -> Optional[str]:
-    # patrón con lookahead que se detiene antes de conectores o puntuación
+    # 1) "en el barrio X"  (igual)
     m = re.search(
-        r'\ben el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=(?:\s+(?:para|por|que|donde|con)\b|[,.;]|$))',
+        r'\b(?:en\s+el\s+|en\s+)barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=(?:\s+(?:para|por|que|donde|con|cerca|y)\b|[,.;]|$))',
         text, flags=re.IGNORECASE
     )
     if m:
         return _clean_barrio_fragment(m.group(1))
 
-    # casos como "construir/instalar ... en el barrio X ..."
-    if re.search(r'\b(construir|hacer|instalar|crear|mejorar)\b', text, flags=re.IGNORECASE):
+    # 2) NUEVO: "del barrio X" / "de el barrio X"
+    m = re.search(
+        r'\b(?:del\s+|de\s+el\s+)barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=(?:\s+(?:cerca|para|por|que|donde|con|y)\b|[,.;]|$))',
+        text, flags=re.IGNORECASE
+    )
+    if m:
+        return _clean_barrio_fragment(m.group(1))
+
+    # 3) NUEVO: si hay verbo de acción, acepta "barrio X" a secas
+    if re.search(r'\b(construir|hacer|instalar|crear|mejorar|arreglar|reparar|pintar|adecuar|señalizar)\b', text, flags=re.IGNORECASE):
         m = re.search(
-            r'\ben el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=(?:\s+(?:para|por|que|donde|con)\b|[,.;]|$))',
+            r'\bbarrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=(?:\s+(?:cerca|para|por|que|donde|con|y)\b|[,.;]|$))',
             text, flags=re.IGNORECASE
         )
         if m:
             return _clean_barrio_fragment(m.group(1))
+
     return None
+
 
 def extract_proposal_text(text: str) -> str:
     """Extrae la propuesta desde el mensaje del ciudadano, limpiando frases iniciales típicas."""
@@ -525,6 +553,13 @@ def build_contact_request(missing: List[str]) -> str:
     frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
     return f"Para escalar y darle seguimiento, ¿me compartes {frase}? Lo usamos solo para informarte avances."
 
+
+# NUEVO: pedir SOLO el barrio del proyecto con un tono distinto al de contacto
+def build_project_location_request() -> str:
+    return (
+        "Para ubicar el caso en el mapa: ¿en qué barrio sería exactamente el proyecto? "
+        "Si ya lo mencionaste, recuérdamelo por favor."
+    )
 
 PRIVACY_REPLY = (
     "Entiendo perfectamente que quieras proteger tu información personal. "
@@ -927,7 +962,11 @@ async def responder(data: Entrada):
             if not info_actual.get("barrio"):   faltan.append("barrio")
             if not info_actual.get("telefono"): faltan.append("celular")
             if not (conv_data.get("project_location") or proj_loc): faltan.append("project_location")
-            texto_directo = build_contact_request(faltan or ["celular"])
+
+            if faltan == ["project_location"]:
+                texto_directo = build_project_location_request()
+            else:
+                texto_directo = build_contact_request(faltan or ["celular"])
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto_directo}
@@ -977,9 +1016,8 @@ async def responder(data: Entrada):
 
         # --- POST: cierre conciso si llegó teléfono en este turno ---
         if phone:
-            # si aún falta el barrio del PROYECTO, pídelo antes de cerrar
             if not (conv_data.get("project_location") or proj_loc):
-                texto = build_contact_request(["project_location"])
+                texto = build_project_location_request()
             else:
                 nombre_txt = (name or (conv_data.get("contact_info") or {}).get("nombre") or "").strip()
                 cierre = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
@@ -998,7 +1036,9 @@ async def responder(data: Entrada):
             if not (info_actual.get("telefono") or phone):     missing.append("celular")
             if not (conv_data.get("project_location") or proj_loc): missing.append("project_location")
             if missing:
-                texto = build_contact_request(missing)
+                texto = (build_project_location_request()
+                        if missing == ["project_location"]
+                        else build_contact_request(missing))
 
         # 6) Guardar turnos
         append_mensajes(conv_ref, [
