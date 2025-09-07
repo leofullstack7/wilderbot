@@ -109,7 +109,9 @@ export default function Propuestas() {
             const catHas = String(catRaw || "").trim();
             const tit = String(titRaw || "").trim();
 
-            if (!catHas || !tit) return false;
+            if (!catHas && !tit) {
+                if (fCategoria || fTitulo) return false;
+            }
 
             const catNorm = normalizeCategoriaDocValue(r.categoria_general);
 
@@ -305,66 +307,69 @@ export default function Propuestas() {
                         </tr>
                     </thead>
                     <tbody>
-                        {loading ? (
+                        {loading && (
                             <tr>
                                 <td colSpan={10} className="p-4 text-center text-gray-500">
                                     Cargando…
                                 </td>
                             </tr>
-                        ) : pageRows.length ? (
-                            pageRows.map((r) => {
-                                const categoria = normalizeCategoriaDocValue(r.categoria_general);
-                                const archBusy = busyId === `arch-${r.id}`;
-                                const delBusy = busyId === `del-${r.id}`;
-                                return (
-                                    <tr key={r.id} className="border-t hover:bg-emerald-50/40 transition">
-                                        <Td className="whitespace-nowrap">{formatDate(r.ultima_fecha)}</Td>
-                                        <Td className="font-medium">{categoria}</Td>
-                                        <Td title={firstOr(r.titulo_propuesta, "—")} className="truncate">
-                                            {firstOr(r.titulo_propuesta, "—")}
-                                        </Td>
-                                        <Td><ToneChip tone={r.tono_detectado} /></Td>
-                                        <Td><CanalBadge canal={r.canal} /></Td>
-                                        <Td className="whitespace-nowrap">{r.project_location || "—"}</Td>
-                                        <Td><EstadoBadge estado={r.estado || "nuevo"} /></Td>
-                                        <Td>{r.contact_collected ? "Sí" : "No"}</Td>
-                                        <Td>
-                                            <div className="flex items-center gap-2">
-                                                <button
-                                                    onClick={() => setSel(r.id)}
-                                                    className="px-3 py-1 rounded-lg text-white bg-gradient-to-r from-emerald-600 to-sky-600 hover:opacity-90 shadow"
-                                                >
-                                                    Ver
-                                                </button>
-                                                <button
-                                                    onClick={() => handleArchive(r.id)}
-                                                    disabled={archBusy || delBusy}
-                                                    className="px-3 py-1 rounded-lg border border-amber-300 text-amber-700 hover:bg-amber-50 disabled:opacity-50"
-                                                    title="Archivar"
-                                                >
-                                                    Archivar
-                                                </button>
-                                                <button
-                                                    onClick={() => handleDelete(r.id)}
-                                                    disabled={archBusy || delBusy}
-                                                    className="px-3 py-1 rounded-lg border border-rose-300 text-rose-700 hover:bg-rose-50 disabled:opacity-50"
-                                                    title="Eliminar"
-                                                >
-                                                    Eliminar
-                                                </button>
-                                            </div>
-                                        </Td>
-                                    </tr>
-                                );
-                            })
-                        ) : (
+                        )}
+
+                        {!loading && pageRows.length === 0 && (
                             <tr>
                                 <td colSpan={10} className="p-4 text-center text-gray-500">
                                     Sin resultados
                                 </td>
                             </tr>
                         )}
+
+                        {!loading && pageRows.length > 0 && pageRows.map((r) => {
+                            const categoria = normalizeCategoriaDocValue(r.categoria_general);
+                            const archBusy = busyId === `arch-${r.id}`;
+                            const delBusy = busyId === `del-${r.id}`;
+                            return (
+                                <tr key={r.id} className="border-t hover:bg-emerald-50/40 transition">
+                                    <Td className="whitespace-nowrap">{formatDate(r.ultima_fecha || r.fecha_inicio)}</Td>
+                                    <Td className="font-medium">{categoria}</Td>
+                                    <Td title={firstOr(r.titulo_propuesta, "—")} className="truncate">
+                                        {firstOr(r.titulo_propuesta, "—")}
+                                    </Td>
+                                    <Td><ToneChip tone={r.tono_detectado} /></Td>
+                                    <Td><CanalBadge canal={r.canal} /></Td>
+                                    <Td className="whitespace-nowrap">{r.project_location || "—"}</Td>
+                                    <Td><EstadoBadge estado={r.estado || "nuevo"} /></Td>
+                                    <Td>{r.contact_collected ? "Sí" : "No"}</Td>
+                                    <Td>
+                                        <div className="flex items-center gap-2">
+                                            <button
+                                                onClick={() => setSel(r.id)}
+                                                className="px-3 py-1 rounded-lg text-white bg-gradient-to-r from-emerald-600 to-sky-600 hover:opacity-90 shadow"
+                                            >
+                                                Ver
+                                            </button>
+                                            <button
+                                                onClick={() => handleArchive(r.id)}
+                                                disabled={archBusy || delBusy}
+                                                className="px-3 py-1 rounded-lg border border-amber-300 text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                                                title="Archivar"
+                                            >
+                                                Archivar
+                                            </button>
+                                            <button
+                                                onClick={() => handleDelete(r.id)}
+                                                disabled={archBusy || delBusy}
+                                                className="px-3 py-1 rounded-lg border border-rose-300 text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                                                title="Eliminar"
+                                            >
+                                                Eliminar
+                                            </button>
+                                        </div>
+                                    </Td>
+                                </tr>
+                            );
+                        })}
                     </tbody>
+
                 </table>
             </div>
 
@@ -470,7 +475,7 @@ function RowCard({ r, onVer, onArchivar, onEliminar, busyId }) {
     return (
         <article className="rounded-xl border border-emerald-200/60 bg-white p-3 shadow-sm">
             <div className="flex items-start justify-between gap-2">
-                <div className="text-xs text-slate-500">{formatDate(r.ultima_fecha)}</div>
+                <div className="text-xs text-slate-500">{formatDate(r.ultima_fecha || r.fecha_inicio)}</div>
                 <EstadoBadge estado={r.estado || "nuevo"} />
             </div>
 

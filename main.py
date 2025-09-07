@@ -145,7 +145,7 @@ def upsert_usuario_o_anon(chat_id: str, nombre: Optional[str], telefono: Optiona
     return usuario_id
 
 
-def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]):
+def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str], canal: Optional[str]):
     """
     Crea conversaciones/{chat_id} si no existe y añade campos de contacto + flags de argumento.
     """
@@ -154,6 +154,7 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
         conv_ref.set({
         "usuario_id": usuario_id,
         "faq_origen": faq_origen or None,
+        "canal": canal or "web",  
         "categoria_general": [],
         "titulo_propuesta": [],
         "mensajes": [],
@@ -189,7 +190,7 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
     })
 
     else:
-        conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
+        conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP,"canal": canal or firestore.DELETE_FIELD })
     return conv_ref
 
 
@@ -334,19 +335,31 @@ def extract_user_barrio(text: str) -> Optional[str]:
             return m.group(1).strip(" .,")
     return None
 
+def _titlecase(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip()).title()
+
+def _clean_barrio_fragment(s: str) -> str:
+    # corta en conectores típicos: para/por/que/donde/con/coma/punto/fin
+    s = re.split(r"\s+(?:para|por|que|donde|con)\b|[,.;]|$", s, maxsplit=1, flags=re.IGNORECASE)[0]
+    return _titlecase(s)
+
 def extract_project_location(text: str) -> Optional[str]:
-    """
-    Detecta ubicación de la propuesta (p.ej., 'parque en el barrio Colinas').
-    No se guarda como contacto.
-    """
-    m = re.search(r'(?:parque|colegio|cancha|centro|obra|hospital|biblioteca|sendero|paradero|jardin)\s+(?:en|para)\s+el\s+barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+    # patrón con lookahead que se detiene antes de conectores o puntuación
+    m = re.search(
+        r'\ben el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=(?:\s+(?:para|por|que|donde|con)\b|[,.;]|$))',
+        text, flags=re.IGNORECASE
+    )
     if m:
-        return m.group(1).strip(" .,")
-    # fallback genérico 'en el barrio X' si el mensaje habla de 'construir'/'hacer'
+        return _clean_barrio_fragment(m.group(1))
+
+    # casos como "construir/instalar ... en el barrio X ..."
     if re.search(r'\b(construir|hacer|instalar|crear|mejorar)\b', text, flags=re.IGNORECASE):
-        m = re.search(r'\ben el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+        m = re.search(
+            r'\ben el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=(?:\s+(?:para|por|que|donde|con)\b|[,.;]|$))',
+            text, flags=re.IGNORECASE
+        )
         if m:
-            return m.group(1).strip(" .,")
+            return _clean_barrio_fragment(m.group(1))
     return None
 
 def detect_contact_refusal(text: str) -> bool:
@@ -572,7 +585,7 @@ async def responder(data: Entrada):
     try:
         chat_id = data.chat_id or f"web_{os.urandom(4).hex()}"
         usuario_id = upsert_usuario_o_anon(chat_id, data.nombre or data.usuario, data.celular, data.canal)
-        conv_ref = ensure_conversacion(chat_id, usuario_id, data.faq_origen)
+        conv_ref = ensure_conversacion(chat_id, usuario_id, data.faq_origen, data.canal)
 
         conv_data = (conv_ref.get().to_dict() or {})
         prev_vec = conv_data.get("last_topic_vec")
@@ -653,7 +666,9 @@ async def responder(data: Entrada):
         name = extract_user_name(data.mensaje)
         phone = extract_phone(data.mensaje)
         user_barrio = extract_user_barrio(data.mensaje)  # residencia
-        proj_loc = extract_project_location(data.mensaje)  # ubicación propuesta
+        proj_loc = extract_project_location(data.mensaje)
+        if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
+            conv_ref.update({"project_location": proj_loc})
 
         if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
             conv_ref.update({"project_location": proj_loc})
@@ -927,14 +942,17 @@ def read_last_user_and_bot(chat_id: str) -> Tuple[str, str, dict]:
             break
     return ultimo_usuario, ultima_respuesta, data
 
-def build_messages_for_classify(prompt_base: str, u: str, a: str):
+def build_messages_for_classify(prompt_base: str, texto_base: str, ultima_respuesta_bot: str):
     system_msg = (
         f"{prompt_base}\n\n"
-        "TAREA: Clasifica la propuesta y devuelve SOLO JSON:\n"
+        "TAREA: Clasifica la PROPUESTA del ciudadano y devuelve SOLO JSON:\n"
         '{"categoria_general":"...", "titulo_propuesta":"...", "tono_detectado":"positivo|crítico|preocupación|propositivo", "palabras_clave":["..."]}\n'
-        "Reglas: título ≤ 70 caracteres."
+        "Reglas:\n"
+        "- Ignora saludos, preguntas personales o charla que no sea propuesta.\n"
+        "- El TÍTULO resume la propuesta principal en ≤ 70 caracteres.\n"
+        "- No inventes ni uses frases genéricas como 'Interacción inicial'."
     )
-    user_msg = f"Último mensaje del ciudadano:\n{u}\n\nÚltima respuesta del bot:\n{a}\n\nDevuelve el JSON ahora."
+    user_msg = f"Propuesta del ciudadano:\n{texto_base}\n\nÚltima respuesta del bot:\n{ultima_respuesta_bot}\n\nDevuelve el JSON ahora."
     return [{"role":"system","content":system_msg},{"role":"user","content":user_msg}]
 
 def update_panel_resumen(categoria: str, tono: str, titulo: str, usuario_id: str):
@@ -960,6 +978,15 @@ async def clasificar(body: ClasificarIn):
         ultimo_u, ultima_a, conv_data = read_last_user_and_bot(chat_id)
         if not ultimo_u:
             return {"ok": False, "mensaje": "No hay mensajes para clasificar."}
+        
+        # Solo clasificamos propuestas/sugerencias reales
+        if not conv_data.get("proposal_collected"):
+            return {"ok": True, "skipped": True, "reason": "sin_propuesta"}
+
+        # (opcional, aún más estricto)
+        if (conv_data.get("contact_intent") or "") != "propuesta":
+            return {"ok": True, "skipped": True, "reason": "intencion_no_es_propuesta"}
+
 
         decision_cls = llm_decide_turn(
             last_topic_summary=(conv_data.get("last_topic_summary") or ""),
@@ -971,7 +998,8 @@ async def clasificar(body: ClasificarIn):
             return {"ok": True, "skipped": True, "reason": "saludo_o_meta_detectado_por_llm"}
 
         prompt_base = get_prompt_base()
-        msgs = build_messages_for_classify(prompt_base, ultimo_u, ultima_a)
+        texto_base = (conv_data.get("current_proposal") or ultimo_u or "").strip()
+        msgs = build_messages_for_classify(prompt_base, texto_base, ultima_a)
 
         model_cls = os.getenv("OPENAI_MODEL_CLASSIFY", OPENAI_MODEL)
         out = client.chat.completions.create(
@@ -980,7 +1008,7 @@ async def clasificar(body: ClasificarIn):
             temperature=0.2,
             max_tokens=300
         ).choices[0].message.content.strip()
-
+        
         data = json.loads(out)
         categoria = data.get("categoria_general") or data.get("categoria") or "General"
         titulo    = data.get("titulo_propuesta") or data.get("titulo") or "Propuesta ciudadana"
@@ -1019,13 +1047,18 @@ async def clasificar(body: ClasificarIn):
             updates["tono_detectado"] = tono
 
         permitir_append = (not awaiting) or (body.contabilizar is True)
-        if permitir_append:
-            if not cat_in_arr and categoria:
-                updates["categoria_general"] = firestore.ArrayUnion([categoria])
-            if not tit_in_arr and titulo:
-                updates["titulo_propuesta"] = firestore.ArrayUnion([titulo])
+        updates["categoria_general"] = [categoria] if categoria else []
+        updates["titulo_propuesta"] = [titulo] if titulo else []
 
-        conv_ref.set(updates, merge=True)
+        if permitir_append and (conv_data.get("contact_intent") == "propuesta"):
+            conv_ref.set({
+                "topics_history": firestore.ArrayUnion([{
+                    "categoria": categoria,
+                    "titulo": titulo,
+                    "tono": tono,
+                    "fecha": firestore.SERVER_TIMESTAMP
+                }])
+            }, merge=True)
 
         hist_last = (conv_data.get("topics_history") or [])
         last_item = hist_last[-1] if hist_last else {}
