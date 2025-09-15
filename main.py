@@ -1131,6 +1131,19 @@ def read_last_user_and_bot(chat_id: str) -> Tuple[str, str, dict]:
             break
     return ultimo_usuario, ultima_respuesta, data
 
+def last_meaningful_user_from_conv(conv_data: dict) -> str:
+    """
+    Devuelve el último mensaje de rol 'user' que no sea un saludo/ack trivial
+    y tenga al menos 5 caracteres normalizados.
+    """
+    msgs = (conv_data or {}).get("mensajes", [])
+    for m in reversed(msgs):
+        if (m.get("role") == "user"):
+            txt = (m.get("content") or "").strip()
+            if txt and not is_plain_greeting(txt) and len(_normalize_text(txt)) >= 5:
+                return txt
+    return ""
+
 def build_messages_for_classify(prompt_base: str, texto_base: str, ultima_respuesta_bot: str):
     system_msg = (
         f"{prompt_base}\n\n"
@@ -1183,6 +1196,12 @@ async def clasificar(body: ClasificarIn):
     try:
         chat_id = body.chat_id
         ultimo_u, ultima_a, conv_data = read_last_user_and_bot(chat_id)
+        # Fallback: si el "último usuario" es saludo/ trivial o vacío,
+        # toma el último mensaje de usuario con contenido real.
+        if (not ultimo_u) or is_plain_greeting(ultimo_u) or len(_normalize_text(ultimo_u)) < 5:
+            alt_u = last_meaningful_user_from_conv(conv_data)
+            if alt_u:
+                ultimo_u = alt_u
         if not ultimo_u:
             return {"ok": False, "mensaje": "No hay mensajes para clasificar."}
         
@@ -1198,7 +1217,13 @@ async def clasificar(body: ClasificarIn):
                 last_two_turns=[{"role":"user","content": ultimo_u},{"role":"assistant","content": ultima_a}],
                 current_text=ultimo_u
             )
-            if decision_cls.get("action") in ("greeting_smalltalk", "meta"):
+            
+        if decision_cls.get("action") in ("greeting_smalltalk", "meta"):
+            # Reintenta con el último usuario significativo antes de abandonar
+            alt_u = last_meaningful_user_from_conv(conv_data)
+            if alt_u and alt_u != ultimo_u:
+                ultimo_u = alt_u
+            else:
                 return {"ok": True, "skipped": True, "reason": "saludo_o_meta_detectado_por_llm"}
 
             # Clasificador de CONSULTA
