@@ -2,6 +2,7 @@
 
 // Lista canónica (ordenada de forma general). Añade/quita según tu contexto.
 export const CATEGORIAS_CANON = [
+  "Consulta",
   "Infraestructura y urbanismo",
   "Movilidad y transporte",
   "Seguridad ciudadana",

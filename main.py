@@ -59,6 +59,12 @@ BOT_INTRO_TEXT = os.getenv(
     "problemas, propuestas o reconocimientos. ¿Qué te gustaría contarme hoy?"
 )
 
+# ---- CONSULTAS: títulos permitidos ----
+CONSULTA_TITULOS = [
+    "Vida Personal Wilder", "General", "Leyes", "Movilidad",
+    "Educación", "Salud", "Seguridad", "Vivienda", "Empleo"
+]
+
 # === Clientes ===
 client = OpenAI(api_key=OPENAI_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -535,6 +541,50 @@ def llm_contact_policy(summary_so_far: str, last_user: str) -> Dict[str, Any]:
     data.setdefault("intent", "otro")
     data.setdefault("reason", "")
     return data
+
+
+def llm_consulta_classifier(ultimo_usuario: str, historial_breve: List[Dict[str, str]] | None = None) -> Dict[str, Any]:
+    """
+    Decide si el turno (o la conversación inmediata) es una CONSULTA (pregunta al bot)
+    y si lo es, asigna un título dentro de CONSULTA_TITULOS.
+    Responde: {"is_consulta": bool, "titulo": str, "reason": str}
+    """
+    historia = ""
+    if historial_breve:
+        # Tomamos 1-2 pares previos para contexto muy corto
+        historia = "\n".join([f"{m['role']}: {m['content']}" for m in historial_breve[-4:]])
+
+    sys = (
+        "Eres un clasificador muy estricto para distinguir CONSULTA (pregunta/información) vs no-consulta.\n"
+        "Si el texto pide que el bot explique, informe, aclare o responda '¿qué/cómo/cuándo/dónde/por qué?', "
+        "y NO sugiere una acción concreta para ejecutar (no dice 'propongo', 'me gustaría proponer', 'deberían hacer', etc.), "
+        "entonces es CONSULTA.\n"
+        "Si sugiere una acción a realizar (instalar, construir, arreglar, proponer...), NO es consulta (es propuesta/problema).\n"
+        f"El título DEBE ser uno de: {CONSULTA_TITULOS}.\n"
+        "Devuelve SOLO JSON con claves: is_consulta(bool), titulo(str o \"\"), reason(str)."
+    )
+    usr = (
+        f"Historial breve (opcional):\n{historia}\n\n"
+        f"Mensaje actual del ciudadano:\n{ultimo_usuario}\n\n"
+        "JSON ahora."
+    )
+    out = OpenAI(api_key=OPENAI_API_KEY).chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
+        temperature=0.0,
+        max_tokens=160
+    ).choices[0].message.content
+
+    try:
+        data = json.loads(out)
+    except Exception:
+        data = {"is_consulta": False, "titulo": "", "reason": "fallback"}
+
+    # Sanitiza título
+    titulo = (data.get("titulo") or "").strip()
+    if titulo not in CONSULTA_TITULOS:
+        titulo = "General" if data.get("is_consulta") else ""
+    return {"is_consulta": bool(data.get("is_consulta")), "titulo": titulo, "reason": data.get("reason", "")}
 
 # =========================================================
 #  Contact helpers y control de flujo
@@ -1136,13 +1186,82 @@ async def clasificar(body: ClasificarIn):
         if not ultimo_u:
             return {"ok": False, "mensaje": "No hay mensajes para clasificar."}
         
-        # Solo clasificamos propuestas/sugerencias reales
-        if not conv_data.get("proposal_collected"):
-            return {"ok": True, "skipped": True, "reason": "sin_propuesta"}
+        # 1) ¿Hay propuesta ya? -> Usamos el flujo de propuesta (más abajo).
+        hay_propuesta = bool(conv_data.get("proposal_collected"))
 
-        # (opcional, aún más estricto)
-        if (conv_data.get("contact_intent") or "") != "propuesta":
-            return {"ok": True, "skipped": True, "reason": "intencion_no_es_propuesta"}
+        # 2) Si NO hay propuesta, intentamos clasificar como CONSULTA.
+        if not hay_propuesta:
+            # Evita clasificar saludos/ack triviales
+            decision_cls = llm_decide_turn(
+                last_topic_summary=(conv_data.get("last_topic_summary") or ""),
+                awaiting_confirm=bool(conv_data.get("awaiting_topic_confirm")),
+                last_two_turns=[{"role":"user","content": ultimo_u},{"role":"assistant","content": ultima_a}],
+                current_text=ultimo_u
+            )
+            if decision_cls.get("action") in ("greeting_smalltalk", "meta"):
+                return {"ok": True, "skipped": True, "reason": "saludo_o_meta_detectado_por_llm"}
+
+            # Clasificador de CONSULTA
+            consulta = llm_consulta_classifier(ultimo_u, [{"role":"user","content": ultimo_u},{"role":"assistant","content": ultima_a}])
+            if consulta.get("is_consulta"):
+                categoria = "Consulta"
+                titulo = consulta.get("titulo") or "General"
+                tono = "neutral"
+                palabras = []
+
+                conv_ref = db.collection("conversaciones").document(chat_id)
+
+                updates = {
+                    "ultima_fecha": firestore.SERVER_TIMESTAMP,
+                    "categoria_general": [categoria],
+                    "titulo_propuesta": [titulo],
+                }
+                # No tocamos tono si ya existe
+                if not conv_data.get("tono_detectado"):
+                    updates["tono_detectado"] = tono
+
+                conv_ref.set(updates, merge=True)
+
+                # Historial temático
+                hist_last = (conv_data.get("topics_history") or [])
+                last_item = hist_last[-1] if hist_last else {}
+                if (not last_item or last_item.get("categoria") != categoria or last_item.get("titulo") != titulo):
+                    conv_ref.set({
+                        "topics_history": firestore.ArrayUnion([{
+                            "categoria": categoria,
+                            "titulo": titulo,
+                            "tono": tono,
+                            "fecha": firestore.SERVER_TIMESTAMP
+                        }])
+                    }, merge=True)
+
+                # Catálogo de categorías
+                db.collection("categorias_tematicas").document(categoria).set({"nombre": categoria}, merge=True)
+
+                # Contabilización en panel (si así lo quieres; mantenemos tu lógica actual)
+                awaiting = bool(conv_data.get("awaiting_topic_confirm"))
+                ya_contado = bool(conv_data.get("panel_contabilizado"))
+                if body.contabilizar is None:
+                    debe_contar = (not awaiting) and (not ya_contado)
+                else:
+                    debe_contar = bool(body.contabilizar)
+
+                usuario_id = conv_data.get("usuario_id", chat_id)
+                if debe_contar:
+                    update_panel_resumen(categoria, tono, titulo, usuario_id)
+                    conv_ref.set({"panel_contabilizado": True}, merge=True)
+
+                return {"ok": True, "clasificacion": {
+                    "categoria_general": categoria,
+                    "titulo_propuesta": titulo,
+                    "tono_detectado": tono,
+                    "palabras_clave": palabras,
+                    "contabilizado_en_panel": bool(debe_contar)
+                }}
+
+            # Si NO es consulta y NO hay propuesta -> no clasificamos (mantén como “skipped”)
+            return {"ok": True, "skipped": True, "reason": "no_consulta_y_sin_propuesta"}
+
 
 
         decision_cls = llm_decide_turn(
