@@ -219,8 +219,15 @@ async def health():
 #  Helpers de BD
 # =========================================================
 
-def upsert_usuario_o_anon(chat_id: str, nombre: Optional[str], telefono: Optional[str], canal: Optional[str]) -> str:
-    usuario_id = chat_id
+def upsert_usuario_o_anon(
+    chat_id: str,
+    nombre: Optional[str],
+    telefono: Optional[str],
+    canal: Optional[str],
+    barrio: Optional[str] = None
+) -> str:
+    usuario_id = upsert_usuario_o_anon(chat_id, data.nombre or data.usuario, data.celular, data.canal, None)
+
     if telefono:
         ref = db.collection("usuarios").document(usuario_id)
         doc = ref.get()
@@ -228,17 +235,19 @@ def upsert_usuario_o_anon(chat_id: str, nombre: Optional[str], telefono: Optiona
             ref.set({
                 "nombre": nombre or "",
                 "telefono": telefono,
-                "barrio": None,
+                "barrio": barrio or None,                    # <-- guarda barrio
                 "fecha_registro": firestore.SERVER_TIMESTAMP,
                 "chats": [chat_id],
                 "canal": canal or "web",
             })
         else:
+            prev = doc.to_dict() or {}
             ref.update({
-                "nombre": nombre or doc.to_dict().get("nombre", ""),
+                "nombre": nombre or prev.get("nombre", ""),
                 "telefono": telefono,
+                "barrio": barrio or prev.get("barrio"),       # <-- actualiza barrio si viene
                 "chats": firestore.ArrayUnion([chat_id]),
-                "canal": canal or doc.to_dict().get("canal", "web"),
+                "canal": canal or prev.get("canal", "web"),
             })
     else:
         ref = db.collection("anonimos").document(usuario_id)
@@ -251,12 +260,14 @@ def upsert_usuario_o_anon(chat_id: str, nombre: Optional[str], telefono: Optiona
                 "canal": canal or "web",
             })
         else:
+            prev = doc.to_dict() or {}
             ref.update({
-                "nombre": nombre or doc.to_dict().get("nombre", None),
+                "nombre": nombre or prev.get("nombre", None),
                 "chats": firestore.ArrayUnion([chat_id]),
-                "canal": canal or doc.to_dict().get("canal", "web"),
+                "canal": canal or prev.get("canal", "web"),
             })
     return usuario_id
+
 
 
 def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str], canal: Optional[str]):
@@ -431,13 +442,13 @@ def limit_sentences(text: str, max_sentences: int = 3) -> str:
 # =========================================================
 
 def extract_user_name(text: str) -> Optional[str]:
-    # 1) Formas explícitas: "soy", "me llamo", "mi nombre es"
+    # 1) Formas explícitas
     m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40})', text, flags=re.IGNORECASE)
     if m:
         nombre = m.group(1).strip(" .,")
         return nombre if _normalize_text(nombre) not in DISCOURSE_START_WORDS else None
 
-    # 2) Nombre suelto al inicio antes de coma o conectores
+    # 2) Nombre suelto al inicio
     m = re.search(
         r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)',
         text
@@ -451,20 +462,19 @@ def extract_user_name(text: str) -> Optional[str]:
             return None
         return posible
 
-    # 3) NUEVO: Nombre después de un marcador conversacional + coma,
-    #     seguido de "vivo/resido/mi número/teléfono/celular/soy ..."
+    # 3) Conectores tipo “Claro/Gracias/Ok … [Nombre] … vivo/soy/mi número…”
     m = re.search(
-        r'(?:^|[,;]\s*)(?:[A-Za-zÁÉÍÓÚÑáéíóúñ ]{0,20})?(?:claro(?:\s+que\s+s[ií])?|gracias|vale|ok|okay|perfecto|listo|de acuerdo)\s*,\s*'
-        r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*,\s*'
+        r'(?:^|[,;]\s*)(?:[A-Za-zÁÉÍÓÚÑáéíóúñ ]{0,20})?(?:claro(?:\s+que\s+s[ií])?|gracias|vale|ok|okay|perfecto|listo|de acuerdo)\s*,?\s*'
+        r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*,?\s*'
         r'(?:vivo|resido|mi\s+(?:n[uú]mero|tel[eé]fono|celular)|soy)\b',
         text, flags=re.IGNORECASE
     )
     if m:
         return m.group(1).strip(" .,")
 
-    # 4) Fallback: cualquier secuencia Nombre Apellido seguida de ", vivo/…"
+    # 4) Fallback: “Nombre Apellido, vivo/resido/mi número/soy…”
     m = re.search(
-        r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*,\s*(?:vivo|resido|mi\s+(?:n[uú]mero|tel[eé]fono|celular)|soy)\b',
+        r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*,?\s*(?:vivo|resido|mi\s+(?:n[uú]mero|tel[eé]fono|celular)|soy)\b',
         text, flags=re.IGNORECASE
     )
     if m:
@@ -472,6 +482,7 @@ def extract_user_name(text: str) -> Optional[str]:
         return posible if _normalize_text(posible) not in DISCOURSE_START_WORDS else None
 
     return None
+
 
 
 def extract_phone(text: str) -> Optional[str]:
@@ -483,19 +494,35 @@ def extract_phone(text: str) -> Optional[str]:
 
 def extract_user_barrio(text: str) -> Optional[str]:
     """
-    Solo tomamos barrio de RESIDENCIA con patrones explícitos (para no confundir con el del proyecto).
+    Extrae barrio de RESIDENCIA. Acepta:
+      - "vivo en Aranjuez ..."
+      - "vivo en el barrio Aranjuez ..."
+      - "resido en Aranjuez ..."
+      - "soy del barrio Aranjuez ..."
+      - "mi barrio es Aranjuez"
     """
-    patterns = [
-        r'\bvivo en el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})',
-        r'\bresido en el barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})',
-        r'\bsoy del barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})',
-        r'\bmi barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})',
-    ]
-    for p in patterns:
-        m = re.search(p, text, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).strip(" .,")
+    # 1) "vivo/resido en (el barrio)? X"
+    m = re.search(
+        r'\b(?:vivo|resido)\s+en\s+(?:el\s+)?(?:barrio\s+)?'
+        r'([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{1,49}?)'
+        r'(?=(?:\s+(?:y|mi|n[uú]mero|tel[eé]fono|celular|desde|de|del|con|para|por)\b|[,.;]|$))',
+        text, flags=re.IGNORECASE
+    )
+    if m:
+        return _clean_barrio_fragment(m.group(1))
+
+    # 2) "soy del barrio X"
+    m = re.search(r'\bsoy\s+del\s+barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+    if m:
+        return _clean_barrio_fragment(m.group(1))
+
+    # 3) "mi barrio es X"  o "mi barrio X"
+    m = re.search(r'\bmi\s+barrio\s+(?:es\s+)?([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+    if m:
+        return _clean_barrio_fragment(m.group(1))
+
     return None
+
 
 def _titlecase(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip()).title()
@@ -963,7 +990,13 @@ async def responder(data: Entrada):
             conv_ref.update({"contact_info": new_info})
             if phone:
                 conv_ref.update({"contact_collected": True})
-                upsert_usuario_o_anon(chat_id, new_info.get("nombre") or data.nombre or data.usuario, phone, data.canal)
+                upsert_usuario_o_anon(
+                    chat_id,
+                    new_info.get("nombre") or data.nombre or data.usuario,
+                    phone,
+                    data.canal,
+                    new_info.get("barrio") or user_barrio       # <-- barrio a usuarios
+                )
 
         # === Política argumento + contacto ===
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
