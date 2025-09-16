@@ -226,7 +226,7 @@ def upsert_usuario_o_anon(
     canal: Optional[str],
     barrio: Optional[str] = None
 ) -> str:
-    usuario_id = upsert_usuario_o_anon(chat_id, data.nombre or data.usuario, data.celular, data.canal, None)
+    usuario_id = chat_id
 
     if telefono:
         ref = db.collection("usuarios").document(usuario_id)
@@ -996,7 +996,7 @@ async def responder(data: Entrada):
                     phone,
                     data.canal,
                     new_info.get("barrio") or user_barrio       # <-- barrio a usuarios
-                )
+            )
 
         # === Política argumento + contacto ===
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
