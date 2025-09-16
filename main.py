@@ -65,6 +65,79 @@ CONSULTA_TITULOS = [
     "Educación", "Salud", "Seguridad", "Vivienda", "Empleo"
 ]
 
+# ---- CONSULTAS: heurística rápida y título por palabras clave ----
+CONSULTA_KWS = {
+    "Leyes": [
+        "ley", "proyecto de ley", "norma", "codigo penal", "congreso",
+        "apoya", "impulsa", "vota", "tramite", "regimen", "sancion", "delito"
+    ],
+    "Salud": [
+        "salud", "hospital", "puesto de salud", "eps", "ambulancia",
+        "adulto mayor", "covid", "medicina", "vacuna"
+    ],
+    "Movilidad": [
+        "movilidad", "transporte", "bus", "metro", "via", "vía", "trancón",
+        "trafico", "tráfico", "semaforo", "bici", "peatonal"
+    ],
+    "Seguridad": [
+        "seguridad", "policia", "policía", "atraco", "hurto", "homicidio",
+        "violencia", "microtrafico", "drogas"
+    ],
+    "Educación": [
+        "educacion", "educación", "colegio", "escuela", "universidad",
+        "beca", "icetex", "cupos"
+    ],
+    "Vivienda": [
+        "vivienda", "casa", "mejoramiento", "titular", "titulación",
+        "arriendo", "subsidio", "invasion", "invasión"
+    ],
+    "Empleo": [
+        "empleo", "trabajo", "formalizacion", "formalización",
+        "emprendimiento", "empresa"
+    ],
+    "Vida Personal Wilder": [
+        "wilder", "escobar", "biografia", "biografía", "vida personal",
+        "quien es wilder", "quién es wilder", "familia de wilder"
+    ],
+}
+
+INTERROGATIVOS = [
+    "que", "qué", "como", "cómo", "cuando", "cuándo", "donde", "dónde",
+    "por que", "por qué", "cual", "cuál", "quien", "quién",
+    "me gustaria saber", "quisiera saber", "podria decirme",
+    "puedes explicarme", "informacion", "información"
+]
+
+def heuristic_consulta_title(text: str) -> Optional[str]:
+    """
+    Devuelve un título de CONSULTA (de tu lista) si el texto parece pregunta;
+    None si no parece consulta.
+    """
+    t = _normalize_text(text)
+
+    # Debe parecer pregunta/consulta
+    looks_question = (
+        ("?" in text) or
+        any(p in t for p in INTERROGATIVOS) or
+        t.startswith("me gustaria saber") or
+        "saber si" in t
+    )
+    if not looks_question:
+        return None
+
+    # No debe ser propuesta
+    if is_proposal_intent(text):
+        return None
+
+    # Buscar la categoría más evidente por keywords
+    for titulo, kws in CONSULTA_KWS.items():
+        for kw in kws:
+            if _normalize_text(kw) in t:
+                return titulo
+
+    # Si es pregunta pero no calza en ninguna lista, va a "General"
+    return "General"
+
 # === Clientes ===
 client = OpenAI(api_key=OPENAI_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -545,13 +618,17 @@ def llm_contact_policy(summary_so_far: str, last_user: str) -> Dict[str, Any]:
 
 def llm_consulta_classifier(ultimo_usuario: str, historial_breve: List[Dict[str, str]] | None = None) -> Dict[str, Any]:
     """
-    Decide si el turno (o la conversación inmediata) es una CONSULTA (pregunta al bot)
-    y si lo es, asigna un título dentro de CONSULTA_TITULOS.
-    Responde: {"is_consulta": bool, "titulo": str, "reason": str}
+    Decide si es CONSULTA y asigna un título de CONSULTA_TITULOS.
+    Primero intentamos una heurística determinista; si no alcanza, caemos al LLM.
     """
+    # 1) Heurística determinista primero (barata y robusta)
+    h_title = heuristic_consulta_title(ultimo_usuario)
+    if h_title:
+        return {"is_consulta": True, "titulo": h_title, "reason": "heuristic"}
+
+    # 2) Si la heurística no decide, pedimos al LLM (respaldo)
     historia = ""
     if historial_breve:
-        # Tomamos 1-2 pares previos para contexto muy corto
         historia = "\n".join([f"{m['role']}: {m['content']}" for m in historial_breve[-4:]])
 
     sys = (
@@ -559,7 +636,6 @@ def llm_consulta_classifier(ultimo_usuario: str, historial_breve: List[Dict[str,
         "Si el texto pide que el bot explique, informe, aclare o responda '¿qué/cómo/cuándo/dónde/por qué?', "
         "y NO sugiere una acción concreta para ejecutar (no dice 'propongo', 'me gustaría proponer', 'deberían hacer', etc.), "
         "entonces es CONSULTA.\n"
-        "Si sugiere una acción a realizar (instalar, construir, arreglar, proponer...), NO es consulta (es propuesta/problema).\n"
         f"El título DEBE ser uno de: {CONSULTA_TITULOS}.\n"
         "Devuelve SOLO JSON con claves: is_consulta(bool), titulo(str o \"\"), reason(str)."
     )
@@ -582,9 +658,18 @@ def llm_consulta_classifier(ultimo_usuario: str, historial_breve: List[Dict[str,
 
     # Sanitiza título
     titulo = (data.get("titulo") or "").strip()
-    if titulo not in CONSULTA_TITULOS:
-        titulo = "General" if data.get("is_consulta") else ""
-    return {"is_consulta": bool(data.get("is_consulta")), "titulo": titulo, "reason": data.get("reason", "")}
+    if data.get("is_consulta"):
+        if titulo not in CONSULTA_TITULOS:
+            titulo = "General"
+        return {"is_consulta": True, "titulo": titulo, "reason": data.get("reason", "llm")}
+
+    # 3) Último salvavidas: si el LLM dijo que no, reintenta con heurística “suave”
+    soft_title = heuristic_consulta_title(ultimo_usuario)
+    if soft_title:
+        return {"is_consulta": True, "titulo": soft_title, "reason": "heuristic-soft"}
+
+    return {"is_consulta": False, "titulo": "", "reason": data.get("reason", "llm_no")}
+
 
 # =========================================================
 #  Contact helpers y control de flujo
@@ -1217,7 +1302,7 @@ async def clasificar(body: ClasificarIn):
                 last_two_turns=[{"role":"user","content": ultimo_u},{"role":"assistant","content": ultima_a}],
                 current_text=ultimo_u
             )
-            
+
         if decision_cls.get("action") in ("greeting_smalltalk", "meta"):
             # Reintenta con el último usuario significativo antes de abandonar
             alt_u = last_meaningful_user_from_conv(conv_data)
