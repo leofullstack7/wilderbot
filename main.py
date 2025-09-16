@@ -942,24 +942,24 @@ async def responder(data: Entrada):
                     "candidate_new_topic_vec": None,
                     "ultima_fecha": firestore.SERVER_TIMESTAMP
                 })
-        elif action == "continue_topic":
-            update_payload = {
-                "last_topic_summary": curr_sum,
-                "awaiting_topic_confirm": False,
-                "ultima_fecha": firestore.SERVER_TIMESTAMP
-            }
-            if prev_vec is None and curr_vec is not None:
-                update_payload["last_topic_vec"] = curr_vec
-            conv_ref.update(update_payload)
-        elif action == "reject_new_topic":
-            conv_ref.update({
-                "awaiting_topic_confirm": False,
-                "candidate_new_topic_summary": None,
-                "candidate_new_topic_vec": None,
-                "ultima_fecha": firestore.SERVER_TIMESTAMP
-            })
-        else:
-            conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
+            elif action == "continue_topic":
+                update_payload = {
+                    "last_topic_summary": curr_sum,
+                    "awaiting_topic_confirm": False,
+                    "ultima_fecha": firestore.SERVER_TIMESTAMP
+                }
+                if prev_vec is None and curr_vec is not None:
+                    update_payload["last_topic_vec"] = curr_vec
+                conv_ref.update(update_payload)
+            elif action == "reject_new_topic":
+                conv_ref.update({
+                    "awaiting_topic_confirm": False,
+                    "candidate_new_topic_summary": None,
+                    "candidate_new_topic_vec": None,
+                    "ultima_fecha": firestore.SERVER_TIMESTAMP
+                })
+            else:
+                conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
         # === EXTRAER datos sueltos del texto ===
         name = extract_user_name(data.mensaje)
