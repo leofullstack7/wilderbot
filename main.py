@@ -951,15 +951,15 @@ async def responder(data: Entrada):
                 if prev_vec is None and curr_vec is not None:
                     update_payload["last_topic_vec"] = curr_vec
                 conv_ref.update(update_payload)
-            elif action == "reject_new_topic":
-                conv_ref.update({
-                    "awaiting_topic_confirm": False,
-                    "candidate_new_topic_summary": None,
-                    "candidate_new_topic_vec": None,
-                    "ultima_fecha": firestore.SERVER_TIMESTAMP
-                })
-            else:
-                conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
+        elif action == "reject_new_topic":
+            conv_ref.update({
+                "awaiting_topic_confirm": False,
+                "candidate_new_topic_summary": None,
+                "candidate_new_topic_vec": None,
+                "ultima_fecha": firestore.SERVER_TIMESTAMP
+            })
+        else:
+            conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
         # === EXTRAER datos sueltos del texto ===
         name = extract_user_name(data.mensaje)
@@ -1018,15 +1018,27 @@ async def responder(data: Entrada):
 
         if is_proposal_flow:
             # 1) ¿Este turno YA trae la propuesta? -> capturar y pasar a argumento
+
             if not conv_data.get("proposal_collected"):
-                # Si el texto ya contiene una propuesta (o al menos una frase concreta), la guardamos ya
-                if is_proposal_intent(data.mensaje) or len(_normalize_text(data.mensaje)) >= 20:
-                    proposal_text = extract_proposal_text(data.mensaje)
+                proposal_text = extract_proposal_text(data.mensaje)         # quita “me gustaría proponer…”
+                proposal_clean = _normalize_text(proposal_text)
+
+                # mensajes genéricos que NO son propuesta todavía
+                generic_only = proposal_clean in {"", "algo", "una idea", "una propuesta", "un tema", "varias cosas"}
+
+                # heurística: contenido mínimo o verbo de acción típico
+                has_action = bool(re.search(
+                    r"\b(arregl|mejor|constru|instal|crear|paviment|ilumin|señaliz|ampli|dotar|regular|prohib|mult|beca|subsid)\w*",
+                    proposal_clean
+                ))
+                has_concrete = (len(proposal_clean) >= 15 and not generic_only) or has_action
+
+                if has_concrete:
                     conv_ref.update({
                         "current_proposal": proposal_text,
-                        "proposal_requested": True,     # iniciamos el flujo
-                        "proposal_collected": True,     # y ya la tenemos
-                        "argument_requested": True,     # pasamos a pedir argumento
+                        "proposal_requested": True,
+                        "proposal_collected": True,
+                        "argument_requested": True,
                         "contact_intent": "propuesta",
                         "ultima_fecha": firestore.SERVER_TIMESTAMP
                     })
@@ -1040,7 +1052,7 @@ async def responder(data: Entrada):
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-                # Si llegó con intención pero sin contenido concreto, pedir la propuesta
+                # Solo intención -> primero pide la propuesta
                 conv_ref.update({
                     "proposal_requested": True,
                     "contact_intent": "propuesta",
@@ -1052,6 +1064,7 @@ async def responder(data: Entrada):
                     {"role": "assistant", "content": texto}
                 ])
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
 
             # 2) Ya pedimos propuesta y aún no la hemos guardado -> tomar este turno como propuesta
             if conv_data.get("proposal_requested") and not conv_data.get("proposal_collected"):
@@ -1133,8 +1146,9 @@ async def responder(data: Entrada):
 
         # ¿Debemos pedir argumento (UNA sola vez)?
         need_argument_now = (intent in ("propuesta", "problema")
-                             and not conv_data.get("argument_requested")
-                             and not conv_data.get("argument_collected"))
+                            and bool(conv_data.get("proposal_collected"))   # <-- añade esto
+                            and not conv_data.get("argument_requested")
+                            and not conv_data.get("argument_collected"))
         if need_argument_now:
             conv_ref.update({"argument_requested": True})
 
