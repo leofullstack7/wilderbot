@@ -77,11 +77,19 @@ export default function ChatWidget({ open, onClose, initialMessage, initialFaqOr
             // Clasificar sin bloquear la UI
             const usedChatId = data?.chat_id || chatId;
             if (usedChatId) {
-                fetch(`${API_URL}/clasificar`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ chat_id: usedChatId }),
-                }).catch(() => { });
+                (async () => {
+                    try {
+                        const r = await fetch(`${API_URL}/clasificar`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ chat_id: usedChatId }),
+                        });
+                        const j = await r.json().catch(() => ({}));
+                        console.debug("CLASIFICAR >", r.status, j);
+                    } catch (e) {
+                        console.warn("CLASIFICAR falló", e);
+                    }
+                })();
             }
         } catch (err) {
             setMessages((prev) => [

@@ -190,10 +190,9 @@ export function inferCategoriaDesdeTexto(texto = "") {
 
 // Normaliza una categoría que venga como array o string (como en tus docs)
 export function normalizeCategoriaDocValue(value) {
-
   const v = Array.isArray(value) ? (value[0] || "") : (value || "");
   const s = String(v).trim();
   if (!s) return "Otras";
   if (s.toLowerCase() === "consulta") return "Consulta";
-  return normalizeCategoria(raw);
+  return normalizeCategoria(s); // 👈 antes decía "raw" (variable inexistente)
 }

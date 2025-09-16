@@ -65,6 +65,41 @@ CONSULTA_TITULOS = [
     "Educación", "Salud", "Seguridad", "Vivienda", "Empleo"
 ]
 
+# --- Heurística mínima para detectar "consulta" ---
+def _is_consulta_heuristic(t: str) -> bool:
+    tx = _normalize_text(t)
+    if is_proposal_intent(tx):
+        return False
+    if "?" in t or "¿" in t:
+        return True
+    q_words = (
+        "me gustaria saber", "quisiera saber", "hay alguna ley", "que ley", "qué ley",
+        "que normas", "cual es la ley", "cuando", "cuándo", "donde", "dónde",
+        "por que", "por qué", "wilder apoya"
+    )
+    return any(k in tx for k in q_words)
+
+def _pick_consulta_title(t: str) -> str:
+    tx = _normalize_text(t)
+    if any(k in tx for k in ("ley", "norma", "congreso", "proyecto de ley", "codigo penal", "delito", "embriaguez", "homicidio")):
+        return "Leyes"
+    if any(k in tx for k in ("salud", "eps", "hospital", "puesto de salud", "adulto mayor", "adulta mayor")):
+        return "Salud"
+    if any(k in tx for k in ("seguridad", "atraco", "robo", "delincuencia")):
+        return "Seguridad"
+    if any(k in tx for k in ("movilidad", "transito", "tránsito", "trafico", "tráfico", "bus", "ruta", "via", "semaforo", "semáforo")):
+        return "Movilidad"
+    if any(k in tx for k in ("vivienda", "arriendo", "subsidio de vivienda", "habitat", "hábitat")):
+        return "Vivienda"
+    if any(k in tx for k in ("empleo", "trabajo", "oferta laboral", "empleabilidad")):
+        return "Empleo"
+    if any(k in tx for k in ("colegio", "escuela", "educacion", "educación", "universidad", "beca", "icetex")):
+        return "Educación"
+    if any(k in tx for k in ("wilder", "familia de wilder", "hijo de wilder", "esposa de wilder")):
+        return "Vida Personal Wilder"
+    return "General"
+
+
 # ---- CONSULTAS: heurística rápida y título por palabras clave ----
 CONSULTA_KWS = {
     "Leyes": [
@@ -667,6 +702,13 @@ def llm_consulta_classifier(ultimo_usuario: str, historial_breve: List[Dict[str,
     soft_title = heuristic_consulta_title(ultimo_usuario)
     if soft_title:
         return {"is_consulta": True, "titulo": soft_title, "reason": "heuristic-soft"}
+    
+     # --- Fallback si el LLM falla o dice que no es consulta y la heurística lo ve como consulta ---
+    if not bool(data.get("is_consulta")) and _is_consulta_heuristic(ultimo_usuario):
+        titulo_fb = _pick_consulta_title(ultimo_usuario)
+        return {"is_consulta": True, "titulo": titulo_fb, "reason": "heuristic_fallback"}
+
+    # Sanitiza título (ya existente)
 
     return {"is_consulta": False, "titulo": "", "reason": data.get("reason", "llm_no")}
 
@@ -1313,6 +1355,16 @@ async def clasificar(body: ClasificarIn):
 
             # Clasificador de CONSULTA
             consulta = llm_consulta_classifier(ultimo_u, [{"role":"user","content": ultimo_u},{"role":"assistant","content": ultima_a}])
+            
+            # DEBUG: guarda última decisión de clasificación
+            db.collection("conversaciones").document(chat_id).set({
+                "debug_last_classify": {
+                    "ts": firestore.SERVER_TIMESTAMP,
+                    "ultimo_u": ultimo_u,
+                    "consulta_raw": consulta,
+                }
+            }, merge=True)
+
             if consulta.get("is_consulta"):
                 categoria = "Consulta"
                 titulo = consulta.get("titulo") or "General"
