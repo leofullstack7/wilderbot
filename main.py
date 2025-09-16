@@ -1337,7 +1337,7 @@ async def clasificar(body: ClasificarIn):
 
         # 2) Si NO hay propuesta, intentamos clasificar como CONSULTA.
         if not hay_propuesta:
-            # Evita clasificar saludos/ack triviales
+            # 2.1 rol conversacional (para evitar clasificar saludos/acks)
             decision_cls = llm_decide_turn(
                 last_topic_summary=(conv_data.get("last_topic_summary") or ""),
                 awaiting_confirm=bool(conv_data.get("awaiting_topic_confirm")),
@@ -1345,18 +1345,21 @@ async def clasificar(body: ClasificarIn):
                 current_text=ultimo_u
             )
 
-        if decision_cls.get("action") in ("greeting_smalltalk", "meta"):
-            # Reintenta con el último usuario significativo antes de abandonar
-            alt_u = last_meaningful_user_from_conv(conv_data)
-            if alt_u and alt_u != ultimo_u:
-                ultimo_u = alt_u
-            else:
-                return {"ok": True, "skipped": True, "reason": "saludo_o_meta_detectado_por_llm"}
+            if decision_cls.get("action") in ("greeting_smalltalk", "meta"):
+                # intenta rescatar el último mensaje significativo; si no hay, sal
+                alt_u = last_meaningful_user_from_conv(conv_data)
+                if alt_u and alt_u != ultimo_u:
+                    ultimo_u = alt_u
+                else:
+                    return {"ok": True, "skipped": True, "reason": "saludo_o_meta_detectado_por_llm"}
 
-            # Clasificador de CONSULTA
-            consulta = llm_consulta_classifier(ultimo_u, [{"role":"user","content": ultimo_u},{"role":"assistant","content": ultima_a}])
-            
-            # DEBUG: guarda última decisión de clasificación
+            # 2.2 aquí SIEMPRE corremos el clasificador de CONSULTA
+            consulta = llm_consulta_classifier(
+                ultimo_u,
+                [{"role":"user","content": ultimo_u},{"role":"assistant","content": ultima_a}]
+            )
+
+            # DEBUG (útil): guarda qué decidió
             db.collection("conversaciones").document(chat_id).set({
                 "debug_last_classify": {
                     "ts": firestore.SERVER_TIMESTAMP,
@@ -1372,24 +1375,21 @@ async def clasificar(body: ClasificarIn):
                 palabras = []
 
                 conv_ref = db.collection("conversaciones").document(chat_id)
-
                 updates = {
                     "ultima_fecha": firestore.SERVER_TIMESTAMP,
                     "categoria_general": [categoria],
                     "titulo_propuesta": [titulo],
                 }
-                # No tocamos tono si ya existe
                 if not conv_data.get("tono_detectado"):
                     updates["tono_detectado"] = tono
-
                 conv_ref.set(updates, merge=True)
 
-                # Historial temático
+                # historial temático
                 hist_last = (conv_data.get("topics_history") or [])
                 last_item = hist_last[-1] if hist_last else {}
                 if (not last_item or last_item.get("categoria") != categoria or last_item.get("titulo") != titulo):
                     conv_ref.set({
-                        "topics_history": firestore.ArrayUnion([{
+                        "topics_history": firestore.SERVER_TIMESTAMP and firestore.ArrayUnion([{
                             "categoria": categoria,
                             "titulo": titulo,
                             "tono": tono,
@@ -1397,16 +1397,11 @@ async def clasificar(body: ClasificarIn):
                         }])
                     }, merge=True)
 
-                # Catálogo de categorías
                 db.collection("categorias_tematicas").document(categoria).set({"nombre": categoria}, merge=True)
 
-                # Contabilización en panel (si así lo quieres; mantenemos tu lógica actual)
                 awaiting = bool(conv_data.get("awaiting_topic_confirm"))
                 ya_contado = bool(conv_data.get("panel_contabilizado"))
-                if body.contabilizar is None:
-                    debe_contar = (not awaiting) and (not ya_contado)
-                else:
-                    debe_contar = bool(body.contabilizar)
+                debe_contar = (not awaiting) and (not ya_contado) if body.contabilizar is None else bool(body.contabilizar)
 
                 usuario_id = conv_data.get("usuario_id", chat_id)
                 if debe_contar:
@@ -1421,8 +1416,9 @@ async def clasificar(body: ClasificarIn):
                     "contabilizado_en_panel": bool(debe_contar)
                 }}
 
-            # Si NO es consulta y NO hay propuesta -> no clasificamos (mantén como “skipped”)
+            # No pasó como consulta y tampoco hay propuesta -> no clasificar
             return {"ok": True, "skipped": True, "reason": "no_consulta_y_sin_propuesta"}
+
 
 
 
