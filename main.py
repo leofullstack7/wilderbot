@@ -312,6 +312,9 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
 
             # Lugar de la propuesta (no confundir con barrio de residencia)
             "project_location": None,
+
+            # <<< PUNTO 17: flag para no repetir la nota >>>
+            "location_note_sent": False,
         })
     else:
         # Solo tocamos 'canal' si viene; si no, no borres el existente
@@ -382,12 +385,12 @@ def is_plain_greeting(text: str) -> bool:
         return False
     t = _normalize_text(text)
     kws = ("hola","holaa","holaaa","buenas","buenos dias","buenas tardes","buenas noches","como estas","que mas","q mas","saludos")
-    short = len(t) <= 30
+    short = len(t) <= 40
     has_kw = any(k in t for k in kws)
     topicish = any(w in t for w in (
-        "arregl","propuesta","proponer","daño","danada","hueco",
-        "parque","colegio","via","salud","seguridad",
-        "ayuda","necesito","quiero","repar","denuncia","idea"
+        "arregl","propuesta","proponer","daño","danada","hueco","parque","colegio","via",
+        "salud","seguridad","ayuda","necesito","quiero","repar","denuncia","idea",
+        "queja","reclamo","peticion","petición","tramite","trámite"
     ))
     return short and has_kw and not topicish
 
@@ -398,7 +401,7 @@ def has_argument_text(t: str) -> bool:
     """
     t = _normalize_text(t)
     keys = [
-        "porque", "ya que", "debido", "por que", "porqué",
+        "porque","xq","pq", "ya que", "debido", "por que", "porqué",
         "afecta", "impacta", "riesgo", "peligro",
         "falta", "no hay", "urge", "es necesario", "contamina",
         "seguridad", "salud", "empleo", "movilidad", "ambiental"
@@ -422,10 +425,15 @@ def has_argument_text(t: str) -> bool:
 # === NUEVO: heurística fuerte para detectar intención de propuesta/sugerencia ===
 def is_proposal_intent(text: str) -> bool:
     t = _normalize_text(text)
+
+    # Si es "me gustaría que me dijeran/explicaran/informaran", NO es propuesta (suele ser consulta)
+    if "me gustaria que" in t and re.search(r"\b(me\s+dig[ae]n|me\s+expliquen?|me\s+informen?)\b", t):
+        return False
+
     kw = [
         "propongo", "propuesta", "sugerencia", "sugerir", "sugiero",
         "mi idea", "mi propuesta", "quiero proponer", "quisiera proponer",
-        "me gustaria proponer", "me gustaria que", "planteo", "plantear",
+        "me gustaria proponer", "planteo", "plantear",
         "propongo que", "propuse", "propone"
     ]
     return any(k in t for k in kw)
@@ -486,10 +494,16 @@ def extract_user_name(text: str) -> Optional[str]:
 
 
 def extract_phone(text: str) -> Optional[str]:
-    m = re.search(r'(\+?\d[\d\s\-]{7,14}\d)', text)
+    # permite capturar con prefijos largos
+    m = re.search(r'(\+?\d[\d\s\-]{7,16}\d)', text)
     if not m:
         return None
     tel = re.sub(r'\D', '', m.group(1))
+
+    # Normaliza prefijos de Colombia (57) con o sin 00/+
+    # quita 0057 o 57 al inicio si eso deja un número razonable (8–12 dígitos)
+    tel = re.sub(r'^(?:00)?57', '', tel)
+
     return tel if 8 <= len(tel) <= 12 else None
 
 def extract_user_barrio(text: str) -> Optional[str]:
@@ -533,15 +547,20 @@ def _clean_barrio_fragment(s: str) -> str:
     return _titlecase(s)
 
 def extract_project_location(text: str) -> Optional[str]:
-    # 1) "en el barrio X"  (igual)
+    # 1) "en el barrio X" (evita residencia)
     m = re.search(
         r'\b(?:en\s+el\s+|en\s+)barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=(?:\s+(?:para|por|que|donde|con|cerca|y)\b|[,.;]|$))',
         text, flags=re.IGNORECASE
     )
     if m:
-        return _clean_barrio_fragment(m.group(1))
+        left = text[:m.start()].lower()
+        # si viene de "vivo/resido en el barrio", NO es ubicación del proyecto
+        if re.search(r'(vivo|resido)\s+en\s*$', left[-25:]):
+            pass
+        else:
+            return _clean_barrio_fragment(m.group(1))
 
-    # 2) NUEVO: "del barrio X" / "de el barrio X"
+    # 2) "del barrio X" / "de el barrio X"
     m = re.search(
         r'\b(?:del\s+|de\s+el\s+)barrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=(?:\s+(?:cerca|para|por|que|donde|con|y)\b|[,.;]|$))',
         text, flags=re.IGNORECASE
@@ -549,7 +568,7 @@ def extract_project_location(text: str) -> Optional[str]:
     if m:
         return _clean_barrio_fragment(m.group(1))
 
-    # 3) NUEVO: si hay verbo de acción, acepta "barrio X" a secas
+    # 3) si hay verbo de acción, acepta "barrio X" a secas
     if re.search(r'\b(construir|hacer|instalar|crear|mejorar|arreglar|reparar|pintar|adecuar|señalizar)\b', text, flags=re.IGNORECASE):
         m = re.search(
             r'\bbarrio\s+([A-Za-zÁÉÍÓÚÑáéíóúñ0-9 \-]{2,50}?)(?=(?:\s+(?:cerca|para|por|que|donde|con|y)\b|[,.;]|$))',
@@ -891,13 +910,31 @@ async def responder(data: Entrada):
         prev_sum = (conv_data.get("last_topic_summary") or "").strip()
         awaiting_confirm = bool(conv_data.get("awaiting_topic_confirm"))
 
-        # Saludo directo
-        if not prev_sum and not awaiting_confirm and is_plain_greeting(data.mensaje):
+        # Saludo simple: override incondicional (aunque haya estado previo)
+        if is_plain_greeting(data.mensaje):
+            # (opcional) soft reset de flags que podrían forzar flujo de propuesta/contacto
+            conv_ref.update({
+                "awaiting_topic_confirm": False,
+                "candidate_new_topic_summary": None,
+                "candidate_new_topic_vec": None,
+                # limpia solo flags de flujo, NO datos duros
+                "proposal_requested": False,
+                "proposal_collected": False,
+                "current_proposal": None,
+                "argument_requested": False,
+                "argument_collected": False,
+                "contact_intent": None,
+                "contact_requested": False,
+                "contact_refused": False,
+                "ultima_fecha": firestore.SERVER_TIMESTAMP
+            })
+
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": BOT_INTRO_TEXT}
             ])
             return {"respuesta": BOT_INTRO_TEXT, "fuentes": [], "chat_id": chat_id}
+
 
         historial_for_decider = load_historial_para_prompt(conv_ref)
 
@@ -909,7 +946,7 @@ async def responder(data: Entrada):
         )
         action = decision.get("action")
         curr_sum = (decision.get("current_summary") or data.mensaje[:120]).strip()
-        intro_hint = (action in ("greeting_smalltalk", "meta")) and (not prev_sum) and (not awaiting_confirm)
+        intro_hint = (action in ("greeting_smalltalk","meta")) and (not awaiting_confirm) and (not prev_sum)
 
         if intro_hint:
             append_mensajes(conv_ref, [
@@ -931,6 +968,13 @@ async def responder(data: Entrada):
                     "candidate_new_topic_vec": curr_vec,
                     "ultima_fecha": firestore.SERVER_TIMESTAMP
                 })
+                # <<< NUEVO: preguntar ya mismo y salir >>>
+                q = f'¿Seguimos con "{(prev_sum or "el tema anterior")}" o pasamos a "{curr_sum}"?'
+                append_mensajes(conv_ref, [
+                    {"role":"user","content": data.mensaje},
+                    {"role":"assistant","content": q}
+                ])
+                return {"respuesta": q, "fuentes": [], "chat_id": chat_id}
             elif action == "confirm_new_topic":
                 cand_vec = conv_data.get("candidate_new_topic_vec") or curr_vec
                 cand_sum = conv_data.get("candidate_new_topic_summary") or curr_sum
@@ -969,6 +1013,23 @@ async def responder(data: Entrada):
         if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
             conv_ref.update({"project_location": proj_loc})
 
+               # PUNTO 17: preparar nota si residencia ≠ ubicación proyecto
+        # ---------------------------------------------------------
+        location_note = ""
+        # Usa el barrio de residencia que venga en este turno o el guardado previamente
+        residence = user_barrio or ((conv_data.get("contact_info") or {}).get("barrio"))
+        if residence and proj_loc and residence.strip().lower() != proj_loc.strip().lower():
+            if not bool(conv_data.get("location_note_sent")):
+                location_note = f"Entendido: vives en {residence} y la propuesta es para {proj_loc}, ¿cierto?"
+
+        # Helper para anteponer la nota (solo una vez)
+        def add_location_note_if_needed(texto: str) -> str:
+            nonlocal location_note  # solo lectura; si tu editor se queja, elimina esta línea
+            if location_note:
+                conv_ref.update({"location_note_sent": True})
+                return (location_note + " " + texto).strip()
+            return texto
+        
 
         partials = {}
         if name:   partials["nombre"] = name
@@ -998,6 +1059,24 @@ async def responder(data: Entrada):
                     new_info.get("barrio") or user_barrio       # <-- barrio a usuarios
             )
 
+
+                # --- AUTO-CIERRE si ya teníamos pedido de contacto y ahora se completó tel + ubicación ---
+        info_actual_now = (conv_data.get("contact_info") or {})
+        # si en este turno actualizamos nombre/barrio/teléfono, refléjalo:
+        if partials:
+            info_actual_now = {**info_actual_now, **partials}
+        tel_ok = bool(info_actual_now.get("telefono") or phone)
+        loc_ok = bool((conv_data.get("project_location") or None) or proj_loc)
+        if conv_data.get("contact_requested") and tel_ok and loc_ok:
+            nombre_txt = (info_actual_now.get("nombre") or "").strip()
+            texto = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ") + \
+                    "Con estos datos escalamos el caso y te contamos avances."
+            append_mensajes(conv_ref, [
+                {"role":"user","content": data.mensaje},
+                {"role":"assistant","content": texto}
+            ])
+            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
         # === Política argumento + contacto ===
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
         intent = policy.get("intent", "otro")
@@ -1010,10 +1089,12 @@ async def responder(data: Entrada):
         # FLUJO DETERMINISTA: PROPUESTAS / SUGERENCIAS
         # =========================
         is_proposal_flow = (
-            intent == "propuesta"
-            or conv_data.get("contact_intent") == "propuesta"
-            or bool(conv_data.get("proposal_requested"))
-            or bool(conv_data.get("proposal_collected"))
+            not is_plain_greeting(data.mensaje) and (
+                intent == "propuesta"
+                or conv_data.get("contact_intent") == "propuesta"
+                or bool(conv_data.get("proposal_requested"))
+                or bool(conv_data.get("proposal_collected"))
+            )
         )
 
         if is_proposal_flow:
@@ -1028,10 +1109,18 @@ async def responder(data: Entrada):
 
                 # heurística: contenido mínimo o verbo de acción típico
                 has_action = bool(re.search(
-                    r"\b(arregl|mejor|constru|instal|crear|paviment|ilumin|señaliz|ampli|dotar|regular|prohib|mult|beca|subsid)\w*",
+                    r"\b(arregl|mejor|constru|instal|crear|paviment|ilumin|señaliz|ampli|dotar|regular(?!idad|mente)\b|prohib|mult|beca|subsid)\w*",
                     proposal_clean
                 ))
-                has_concrete = (len(proposal_clean) >= 15 and not generic_only) or has_action
+                 # sustantivos típicos de infraestructura + presencia de ubicación (residencia o proyecto)
+                has_infra_noun = bool(re.search(
+                    r'\b(parque|and[eé]n|andenes|sema[fF]or[oa]s?|luminarias?|alumbrado|cancha|juegos|polideportivo)\b',
+                    proposal_clean
+                ))
+                has_location_ctx = bool(proj_loc or user_barrio or re.search(r'\bbarrio\b', proposal_clean))
+
+                has_concrete = ((len(proposal_clean) >= 15 and not generic_only) or has_action
+                                or (has_infra_noun and has_location_ctx))
 
                 if has_concrete:
                     conv_ref.update({
@@ -1046,6 +1135,9 @@ async def responder(data: Entrada):
                         name,
                         conv_data.get("project_location") or proj_loc
                     )
+                    # <<< PUNTO 17 >>>
+                    texto = add_location_note_if_needed(texto)
+
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
@@ -1059,6 +1151,9 @@ async def responder(data: Entrada):
                     "ultima_fecha": firestore.SERVER_TIMESTAMP
                 })
                 texto = "¡Perfecto! ¿Cuál es tu propuesta o sugerencia? Cuéntamela en una o dos frases."
+                # <<< PUNTO 17 >>>
+                texto = add_location_note_if_needed(texto)
+
                 append_mensajes(conv_ref, [
                     {"role": "user", "content": data.mensaje},
                     {"role": "assistant", "content": texto}
@@ -1108,6 +1203,9 @@ async def responder(data: Entrada):
                 else:
                     # Reforzar petición de argumento (corta)
                     texto = craft_argument_question(name, conv_data.get("project_location"))
+                    # <<< PUNTO 17 >>>
+                    texto = add_location_note_if_needed(texto)
+
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
@@ -1163,11 +1261,18 @@ async def responder(data: Entrada):
 
         # ¿El usuario rechazó dar datos?
         if detect_contact_refusal(data.mensaje):
-            conv_ref.update({"contact_refused": True, "contact_requested": True})
+            if phone:
+                # llegó teléfono en el mismo turno: no marcamos rechazo
+                conv_ref.update({"contact_refused": False})
+            else:
+                conv_ref.update({"contact_refused": True, "contact_requested": True})
 
         # ¿Debemos pedir contacto ahora? -> SOLO después de tener argumento (no en 1er turno)
         already_req = bool(conv_data.get("contact_requested"))
-        already_col = bool(conv_data.get("contact_collected")) or bool(phone)
+        info_actual = (conv_data.get("contact_info") or {})
+        already_col = bool(conv_data.get("contact_collected")) \
+                    or bool(phone) \
+                    or bool(info_actual.get("telefono"))
         contact_refused = bool(conv_data.get("contact_refused"))
         should_ask_now = (policy.get("should_request")
                           and intent in ("propuesta", "problema")
@@ -1191,6 +1296,9 @@ async def responder(data: Entrada):
                 texto_directo = build_project_location_request()
             else:
                 texto_directo = build_contact_request(faltan or ["celular"])
+            # <<< PUNTO 17 >>>
+            texto_directo = add_location_note_if_needed(texto_directo)
+
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto_directo}
@@ -1263,6 +1371,7 @@ async def responder(data: Entrada):
                 texto = (build_project_location_request()
                         if missing == ["project_location"]
                         else build_contact_request(missing))
+        texto = add_location_note_if_needed(texto)
 
         # 6) Guardar turnos
         append_mensajes(conv_ref, [
