@@ -62,15 +62,16 @@ export default function ConversacionDetalle({ id, onClose }) {
                 ) : (
                     <div className="space-y-4">
                         {/* Resumen */}
-                        <section className="rounded-xl border bg-white p-4">
-                            <h3 className="text-sm text-gray-500">Resumen</h3>
-                            <div className="mt-1 text-gray-800">
-                                {doc.last_topic_summary || "—"}
-                            </div>
-                            <div className="mt-2 text-xs text-gray-500">
-                                Última actualización: {formatDate(doc.ultima_fecha)}
-                            </div>
-                        </section>
+                            <section className="rounded-xl border bg-white p-4">
+                                <h3 className="text-sm text-gray-500">Resumen</h3>
+                                <div className="mt-1 text-gray-800">
+                                    {(doc?.resumen && String(doc.resumen).trim())
+                                        || (doc?.last_topic_summary ? String(doc.last_topic_summary).slice(0, 100) : "—")}
+                                </div>
+                                <div className="mt-2 text-xs text-gray-500">
+                                    Última actualización: {formatDate(doc.resumen_updated_at || doc.ultima_fecha)}
+                                </div>
+                            </section>
 
                         {/* Info principal */}
                         <section className="grid md:grid-cols-2 gap-3">

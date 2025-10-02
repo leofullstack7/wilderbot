@@ -52,6 +52,8 @@ EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX   = os.getenv("PINECONE_INDEX", "wilder-frases")
 GOOGLE_CREDS     = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "/etc/secrets/firebase.json"
+OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o-mini")
+
 
 BOT_INTRO_TEXT = os.getenv(
     "BOT_INTRO_TEXT",
@@ -332,6 +334,14 @@ def append_mensajes(conv_ref, nuevos: List[Dict[str, Any]]):
     arr.extend(nuevos)
     conv_ref.update({"mensajes": arr, "ultima_fecha": firestore.SERVER_TIMESTAMP})
 
+    # --- Recalcular y guardar resumen corto (≤100 chars) ---
+    try:
+        resumen = summarize_conversation_brief(arr, max_chars=100)
+        conv_ref.update({"resumen": resumen, "resumen_updated_at": firestore.SERVER_TIMESTAMP})
+    except Exception:
+        # no rompas el flujo si el resumen falla
+        pass
+
 
 def load_historial_para_prompt(conv_ref) -> List[Dict[str, str]]:
     snap = conv_ref.get()
@@ -443,6 +453,51 @@ def limit_sentences(text: str, max_sentences: int = 3) -> str:
     parts = re.split(r'(?<=[\.\?!])\s+', text.strip())
     out = " ".join([p for p in parts if p][:max_sentences]).strip()
     return out or text
+
+
+def _clamp_summary(s: str, limit: int = 100) -> str:
+    s = re.sub(r"\s+", " ", (s or "").strip())
+    return s if len(s) <= limit else s[:limit].rstrip()
+
+def summarize_conversation_brief(mensajes: List[Dict[str, str]], max_chars: int = 100) -> str:
+    """
+    Resume TODA la conversación (usuario/bot) en ≤100 caracteres (incluyendo espacios).
+    Sin datos personales. Enfocado en la petición/tema y, si aplica, el barrio.
+    """
+    # Construye una transcripción compacta (hasta 40 turnos más recientes para no gastar tokens de más)
+    parts = []
+    for m in mensajes[-40:]:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        # Oculta números de teléfono u otros números largos
+        content = re.sub(r"\+?\d[\d\s\-]{6,}", "[número]", content)
+        tag = "C" if role == "user" else "B" if role == "assistant" else role
+        parts.append(f"{tag}: {content}")
+    transcript = "\n".join(parts) if parts else "(sin mensajes)"
+
+    sys = (
+        "Eres un asistente que resume conversaciones cívicas.\n"
+        "Devuelve SOLO un resumen en español de MÁXIMO 100 caracteres (contando espacios).\n"
+        "No incluyas nombres, teléfonos ni datos personales.\n"
+        "Enfócate en la petición/tema principal y el lugar si existe.\n"
+        "No uses comillas."
+    )
+    usr = f"Transcripción:\n{transcript}\n\nEscribe el resumen breve (≤100):"
+
+    try:
+        out = client.chat.completions.create(
+            model=OPENAI_MODEL_SUMMARY,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
+            temperature=0.2,
+            max_tokens=60,
+        ).choices[0].message.content
+    except Exception:
+        # Fallback ultra simple si hubiera un error con el LLM
+        out = (mensajes[0].get("content") if mensajes else "")[:max_chars]
+
+    return _clamp_summary(out, max_chars)
 
 
 # =========================================================
