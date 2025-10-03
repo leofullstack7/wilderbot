@@ -1503,7 +1503,7 @@ async def responder(data: Entrada):
 
         
         # Si el usuario rechazó dar datos y ya se los habíamos pedido -> envia mensaje de tranquilidad
-        if contact_refused and already_req and not already_col:
+        if contact_refused_any and already_req and not already_col:
             texto = PRIVACY_REPLY
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
