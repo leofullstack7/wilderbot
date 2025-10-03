@@ -1407,8 +1407,8 @@ async def responder(data: Entrada):
 
             # 3) Ya tenemos propuesta y estamos pidiendo argumento
             if conv_data.get("proposal_collected") and not conv_data.get("argument_collected"):
-                # Solo marcar argumento si:
-                #   a) lo pedimos en el turno anterior y el usuario respondió algo (≥5 chars), o
+                # Solo dar por válido el argumento si:
+                #   a) lo pedimos en el turno anterior (argument_requested=True y el último fue assistant) y el usuario respondió algo (≥5 chars), o
                 #   b) hay señales causales claras (porque/ya que/debido…)
                 last_role = historial_for_decider[-1]["role"] if historial_for_decider else None
                 just_asked_arg = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
@@ -1418,6 +1418,7 @@ async def responder(data: Entrada):
                         "argument_collected": True,
                         "ultima_fecha": firestore.SERVER_TIMESTAMP
                     })
+                    # Pide contacto (nombre, barrio, celular)
                     info_actual = (conv_data.get("contact_info") or {})
                     faltan = []
                     if not info_actual.get("nombre"):   faltan.append("nombre")
@@ -1433,7 +1434,9 @@ async def responder(data: Entrada):
                 else:
                     # Reforzar petición de argumento (corta)
                     texto = craft_argument_question(name, conv_data.get("project_location"))
+                    # <<< PUNTO 17 >>>
                     texto = add_location_note_if_needed(texto)
+
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
@@ -1471,33 +1474,31 @@ async def responder(data: Entrada):
 
             # En cualquiera de los casos anteriores retornamos; si ya está todo completo, seguimos flujo normal.
 
-        # ¿El usuario acaba de responder nuestra pregunta de argumento?
-        last_role = historial_for_decider[-1]["role"] if historial_for_decider else None
-        just_asked_argument = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
-        user_replied_after_arg_q = just_asked_argument and (len(_normalize_text(data.mensaje)) >= 5)
+            # ¿El usuario acaba de responder nuestra pregunta de argumento?
+            last_role = historial_for_decider[-1]["role"] if historial_for_decider else None
+            just_asked_argument = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
+            user_replied_after_arg_q = just_asked_argument and (len(_normalize_text(data.mensaje)) >= 5)
 
-        # Consideramos argumento listo SOLO si respondió a nuestra pregunta
-        # o si hay señales fuertes (porque/ya que/debido…).
-        argument_ready = user_replied_after_arg_q or has_argument_text(data.mensaje)
-        if argument_ready and not conv_data.get("argument_collected"):
-            conv_ref.update({"argument_collected": True})
+            # Consideramos argumento listo SOLO si respondió a nuestra pregunta
+            # o si hay señales fuertes (porque/ya que/debido…).
+            argument_ready = user_replied_after_arg_q or has_argument_text(data.mensaje)
+            if argument_ready and not conv_data.get("argument_collected"):
+                conv_ref.update({"argument_collected": True})
 
-        # ¿Debemos pedir argumento (UNA sola vez)?
-        need_argument_now = (intent in ("propuesta", "problema")
-                            and bool(conv_data.get("proposal_collected"))   # <-- añade esto
-                            and not conv_data.get("argument_requested")
-                            and not conv_data.get("argument_collected"))
-        if need_argument_now:
-            conv_ref.update({"argument_requested": True})
+            # ¿Debemos pedir argumento (UNA sola vez)?
+            need_argument_now = (intent in ("propuesta", "problema")
+                                and bool(conv_data.get("proposal_collected"))
+                                and not conv_data.get("argument_requested")
+                                and not conv_data.get("argument_collected"))
+            if need_argument_now:
+                conv_ref.update({"argument_requested": True})
+                texto = craft_argument_question(name, proj_loc)
+                append_mensajes(conv_ref, [
+                    {"role": "user", "content": data.mensaje},
+                    {"role": "assistant", "content": texto}
+                ])
+                return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-        # --- NUEVO: si toca pedir argumento, no usamos LLM; respondemos con UNA sola pregunta
-        if need_argument_now:
-            texto = craft_argument_question(name, proj_loc)
-            append_mensajes(conv_ref, [
-                {"role": "user", "content": data.mensaje},
-                {"role": "assistant", "content": texto}
-            ])
-            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
         # Reusar flags ya calculados arriba
         should_ask_now = (policy.get("should_request")
