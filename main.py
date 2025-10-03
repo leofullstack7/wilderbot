@@ -1790,8 +1790,9 @@ async def clasificar(body: ClasificarIn):
         ).choices[0].message.content.strip()
         
         data = json.loads(out)
-        categoria = data.get("categoria_general") or data.get("categoria") or "General"
-        titulo    = data.get("titulo_propuesta") or data.get("titulo") or "Propuesta ciudadana"
+        # No usar defaults genéricos: si vienen vacíos, mantenlos en None
+        categoria = data.get("categoria_general") or data.get("categoria") or None
+        titulo    = data.get("titulo_propuesta") or data.get("titulo") or None
         tono      = data.get("tono_detectado") or "neutral"
         palabras  = data.get("palabras_clave", [])
 
@@ -1820,6 +1821,25 @@ async def clasificar(body: ClasificarIn):
             )
             if fb_cat: categoria = fb_cat
             if fb_tit: titulo = fb_tit
+        
+        # --- NUEVO: no persistir categorías/títulos genéricos o vacíos ---
+        GENERIC_CATS = {"general", "otras", "sin clasificar", "otro"}
+        GENERIC_TITLES = {
+            "propuesta ciudadana", "propuesta no especificada",
+            "interaccion inicial", "interacción inicial",
+            "solicitud de propuesta", "sin titulo", "sin título", "—"
+        }
+
+        cat_norm = _normalize_text(categoria or "")
+        tit_norm = _normalize_text(titulo or "")
+
+        is_generic_cat = (not categoria) or (cat_norm in GENERIC_CATS)
+        is_generic_tit = (not titulo) or (len(titulo.strip()) < 6) or (tit_norm in GENERIC_TITLES)
+
+        if is_generic_cat or is_generic_tit:
+            # No escribas nada en categoria/titulo, no toques panel ni historial temático
+            return {"ok": True, "skipped": True, "reason": "irrelevante_sin_categoria_titulo"}
+
 
         awaiting = bool(conv_data.get("awaiting_topic_confirm"))
         ya_contado = bool(conv_data.get("panel_contabilizado"))
