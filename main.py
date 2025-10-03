@@ -405,19 +405,6 @@ def is_plain_greeting(text: str) -> bool:
     ))
     return short and has_kw and not topicish
 
-def has_argument_text(t: str) -> bool:
-    """
-    Heurística para detectar 'argumento/razón'.
-    Más estricta: NO dispara por 'para' suelto (evita falsos positivos como 'para los niños').
-    """
-    t = _normalize_text(t)
-    keys = [
-        "porque","xq","pq", "ya que", "debido", "por que", "porqué",
-        "afecta", "impacta", "riesgo", "peligro",
-        "falta", "no hay", "urge", "es necesario", "contamina",
-        "seguridad", "salud", "empleo", "movilidad", "ambiental"
-    ]
-    return any(k in t for k in keys)
 
 def has_argument_text(t: str) -> bool:
     """
@@ -432,6 +419,7 @@ def has_argument_text(t: str) -> bool:
         "seguridad", "salud", "empleo", "movilidad", "ambiental"
     ]
     return any(k in t for k in keys)
+
     
 
 # === NUEVO: heurística fuerte para detectar intención de propuesta/sugerencia ===
@@ -476,6 +464,7 @@ def looks_like_proposal_content(text: str) -> bool:
         return True
     if re.search(r'\b(arregl|mejor|constru|instal|crear|paviment|ilumin|señaliz|ampli|dotar|regular(?!idad|mente)|prohib|mult|beca|subsid|limpi|recog|camar)\w*', t):
         return True
+
     if re.search(r'\b(parque|anden|and[eé]n|semaforo|luminaria|cancha|juegos|polideportivo|colegio|hospital|bus|ruta|acera)\b', t):
         return True
     return False
@@ -669,26 +658,36 @@ def extract_project_location(text: str) -> Optional[str]:
 
 
 def extract_proposal_text(text: str) -> str:
-    """Extrae la propuesta desde el mensaje del ciudadano, limpiando frases iniciales típicas."""
+    """
+    Extrae la parte 'sustantiva' de la propuesta aunque venga precedida
+    por saludos o muletillas, y aunque el trigger no esté al inicio.
+    """
     t = text.strip()
 
-    # Quita una posible auto-presentación inicial
+    # 1) Limpia saludos/muletillas al frente (opcionales)
     t = re.sub(
-        r'^\s*(?:soy|me llamo|mi nombre es)\s+[A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40}[,:\-–—]?\s*',
-        '',
-        t, flags=re.IGNORECASE
+        r'^\s*(?:hola|holaa+|buenas(?:\s+(?:tardes|noches|dias))?|buen(?:\s*dia)?|hey|que tal|qué tal|saludos)[,!\s\-–—]*',
+        '', t, flags=re.IGNORECASE
     )
 
-    # Quita 'me gustaría proponer', 'quiero proponer', 'propongo que', etc.
-    t = re.sub(
-        r'^\s*(?:me\s+gustar[íi]a\s+(?:proponer|que)\s+|quisiera\s+(?:proponer|que)\s+|'
-        r'quiero\s+proponer\s+|propongo\s+que\s+|propongo\s+)',
-        '',
+    # 2) Si hay un trigger de propuesta en cualquier parte, corta desde ahí
+    m = re.search(
+        r'(?:me\s+gustar[íi]a\s+(?:proponer|que)|quisiera\s+(?:proponer|que)|'
+        r'quiero\s+proponer|propongo\s+que|propongo|mi\s+(?:idea|propuesta)\s+(?:es|ser[ií]a))\s*(.*)',
         t, flags=re.IGNORECASE
     )
+    if m:
+        t = m.group(1).strip()
+    else:
+        # Fallback: si dice “propuesta/idea” sin verbo, intenta después de “es/sería”
+        m2 = re.search(r'(?:propuesta|idea)\s+(?:es|ser[ií]a)\s*[:\-–—]?\s*(.*)', t, flags=re.IGNORECASE)
+        if m2:
+            t = m2.group(1).strip()
 
+    # 3) Normaliza espacios y limita a 2 oraciones
     t = re.sub(r'\s+', ' ', t).strip()
     return limit_sentences(t, 2)
+
 
 
 def detect_contact_refusal(text: str) -> bool:
@@ -1055,12 +1054,17 @@ async def responder(data: Entrada):
         curr_sum = (decision.get("current_summary") or data.mensaje[:120]).strip()
         intro_hint = (action in ("greeting_smalltalk","meta")) and (not awaiting_confirm) and (not prev_sum)
 
+        # --- NUEVO: si huele a propuesta, NO uses el saludo introductorio
+        if intro_hint and (is_proposal_intent(data.mensaje) or looks_like_proposal_content(data.mensaje)):
+            intro_hint = False
+
         if intro_hint:
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": BOT_INTRO_TEXT}
             ])
             return {"respuesta": BOT_INTRO_TEXT, "fuentes": [], "chat_id": chat_id}
+
 
         topic_change_suspect = False
         curr_vec = None
@@ -1206,9 +1210,20 @@ async def responder(data: Entrada):
 
         if is_proposal_flow:
             # 1) ¿Este turno YA trae la propuesta? -> capturar y pasar a argumento
-
             if not conv_data.get("proposal_collected"):
-                proposal_text = extract_proposal_text(data.mensaje)         # quita “me gustaría proponer…”
+                # --- extracción robusta: si el trigger no está al inicio, corta desde ahí ---
+                proposal_text = extract_proposal_text(data.mensaje)
+                m_any = re.search(
+                    r'(?:me\s+gustar[íi]a\s+(?:proponer|que)|quisiera\s+(?:proponer|que)|'
+                    r'quiero\s+proponer|propongo(?:\s+que)?|mi\s+(?:idea|propuesta)\s+(?:es|ser[ií]a))\s*(.*)',
+                    data.mensaje,
+                    flags=re.IGNORECASE
+                )
+                if m_any:
+                    tail = (m_any.group(1) or "").strip()
+                    if tail:
+                        proposal_text = limit_sentences(re.sub(r'\s+', ' ', tail), 2)
+
                 proposal_clean = _normalize_text(proposal_text)
 
                 # mensajes genéricos que NO son propuesta todavía
@@ -1216,10 +1231,10 @@ async def responder(data: Entrada):
 
                 # heurística: contenido mínimo o verbo de acción típico
                 has_action = bool(re.search(
-                    r"\b(arregl|mejor|constru|instal|crear|paviment|ilumin|señaliz|ampli|dotar|regular(?!idad|mente)\b|prohib|mult|beca|subsid)\w*",
+                    r"\b(arregl|mejor|constru|instal|crear|paviment|ilumin|señaliz|ampli|dotar|regular(?!idad|mente)|prohib|mult|beca|subsid)\w*",
                     proposal_clean
                 ))
-                 # sustantivos típicos de infraestructura + presencia de ubicación (residencia o proyecto)
+                # sustantivos típicos de infraestructura + presencia de ubicación (residencia o proyecto)
                 has_infra_noun = bool(re.search(
                     r'\b(parque|and[eé]n|andenes|sema[fF]or[oa]s?|luminarias?|alumbrado|cancha|juegos|polideportivo)\b',
                     proposal_clean
@@ -1267,8 +1282,6 @@ async def responder(data: Entrada):
                 ])
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-
-            # 2) Ya pedimos propuesta y aún no la hemos guardado -> tomar este turno como propuesta
             # 2) Ya pedimos propuesta y aún no la hemos guardado -> validar este turno
             if conv_data.get("proposal_requested") and not conv_data.get("proposal_collected"):
                 # contador suave de intentos (nudge)
@@ -1290,8 +1303,8 @@ async def responder(data: Entrada):
                     })
                     texto = "Perfecto, sin problema. Cuando la tengas, cuéntamela en 1–2 frases y el barrio del proyecto."
                     append_mensajes(conv_ref, [
-                        {"role":"user","content": data.mensaje},
-                        {"role":"assistant","content": texto}
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
@@ -1309,8 +1322,8 @@ async def responder(data: Entrada):
                         conv_data.get("project_location") or proj_loc
                     )
                     append_mensajes(conv_ref, [
-                        {"role":"user","content": data.mensaje},
-                        {"role":"assistant","content": texto}
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
@@ -1325,8 +1338,8 @@ async def responder(data: Entrada):
                     })
                     texto = "¿Prefieres que te responda esa pregunta ahora o seguimos con tu propuesta? Si es propuesta, cuéntamela en 1–2 frases."
                     append_mensajes(conv_ref, [
-                        {"role":"user","content": data.mensaje},
-                        {"role":"assistant","content": texto}
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
@@ -1350,8 +1363,6 @@ async def responder(data: Entrada):
                     {"role":"assistant","content": texto}
                 ])
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-
-
 
             # 3) Ya tenemos propuesta y estamos pidiendo argumento
             if conv_data.get("proposal_collected") and not conv_data.get("argument_collected"):
@@ -1401,6 +1412,7 @@ async def responder(data: Entrada):
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
             # Si ya llegó el celular, el cierre amable lo maneja el POST de abajo.
+
 
             # En cualquiera de los casos anteriores retornamos; si ya está todo completo, seguimos flujo normal.
 
@@ -1723,7 +1735,7 @@ async def clasificar(body: ClasificarIn):
                 last_item = hist_last[-1] if hist_last else {}
                 if (not last_item or last_item.get("categoria") != categoria or last_item.get("titulo") != titulo):
                     conv_ref.set({
-                        "topics_history": firestore.SERVER_TIMESTAMP and firestore.ArrayUnion([{
+                        "topics_history": firestore.ArrayUnion([{
                             "categoria": categoria,
                             "titulo": titulo,
                             "tono": tono,
