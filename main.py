@@ -29,6 +29,8 @@ from api.ingest import router as ingest_router
 
 from fastapi.middleware.cors import CORSMiddleware
 
+from services.pine import index as index 
+
 # =========================================================
 #  Config
 # =========================================================
@@ -177,8 +179,15 @@ def heuristic_consulta_title(text: str) -> Optional[str]:
 
 # === Clientes ===
 client = OpenAI(api_key=OPENAI_API_KEY)
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(PINECONE_INDEX)
+
+# Usa exactamente el mismo índice/config que usa el ingest
+from services.pine import index as index  # <- mismo objeto Index que upsert_chunks
+try:
+    from services.pine import EMBEDDING_MODEL as PC_EMBEDDING_MODEL
+    EMBEDDING_MODEL = PC_EMBEDDING_MODEL     # alinea embeddings con el ingest
+except Exception:
+    pass  # si no existe en services.pine, sigue usando tu EMBEDDING_MODEL del .env
+
 
 # === Firestore Admin ===
 import firebase_admin
