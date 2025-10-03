@@ -116,21 +116,47 @@ export async function deleteConversation(id) {
 /* ====================== Conocimiento (listar / eliminar) ====================== */
 export function listenKnowledgeDocs(callback) {
   const col = collection(db, "knowledge_docs");
-  const q = query(col, orderBy("fecha", "desc"));
-  // Suscripción en tiempo real
-  const unsub = onSnapshot(
-    q,
-    (snap) => {
-      const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
-      callback(rows);
-    },
-    (err) => {
-      console.error("[listenKnowledgeDocs] onSnapshot error:", err);
-      callback([]);
-    }
-  );
-  return () => unsub();
+
+  // Intento 1: ordenar por fecha desc (si hay null puede fallar según reglas)
+  let triedTitle = false;
+  let triedPlain = false;
+
+  const attach = (q) =>
+    onSnapshot(
+      q,
+      (snap) => {
+        const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+        callback(rows);
+      },
+      (err) => {
+        console.warn("[listenKnowledgeDocs] order attempt failed:", err?.message || err);
+        if (!triedTitle) {
+          triedTitle = true;
+          // Intento 2: ordenar por título asc
+          unsub = attach(query(col, orderBy("titulo", "asc")));
+        } else if (!triedPlain) {
+          triedPlain = true;
+          // Intento 3: sin orderBy
+          unsub = attach(col);
+        } else {
+          // Último recurso: one-shot
+          getDocs(col)
+            .then((snap) => {
+              const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+              callback(rows);
+            })
+            .catch((e) => {
+              console.error("[listenKnowledgeDocs] getDocs failed:", e);
+              callback([]);
+            });
+        }
+      }
+    );
+
+  let unsub = attach(query(col, orderBy("fecha", "desc")));
+  return () => unsub && unsub();
 }
+
 
 export async function deleteKnowledgeDoc(docId) {
   const ref = doc(db, "knowledge_docs", docId);

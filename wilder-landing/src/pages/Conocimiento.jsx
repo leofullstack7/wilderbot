@@ -1,6 +1,5 @@
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useRef, useState, useEffect } from "react";
 // Listado de documentos
-import { useEffect } from "react";
 import { listenKnowledgeDocs, deleteKnowledgeDoc } from "../lib/firestoreQueries";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:10000";
@@ -15,8 +14,9 @@ export default function Conocimiento() {
     const [docs, setDocs] = useState([]);
     useEffect(() => {
         const off = listenKnowledgeDocs(setDocs);
-        return () => off();
+        return () => off && off();
     }, []);
+
 
     // File form
     const [file, setFile] = useState(null);
