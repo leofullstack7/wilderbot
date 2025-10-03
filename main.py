@@ -457,17 +457,33 @@ def is_proposal_denial(text: str) -> bool:
 def looks_like_proposal_content(text: str) -> bool:
     if is_proposal_denial(text):
         return False
+
+    raw = _normalize_text(text)
+    # Intención pura sin contenido (ej.: "quisiera/quiero/me gustaría (hacer) una propuesta/idea")
+    if re.match(
+        r'^(?:hola|holaa|buenas|buenos dias|buenas tardes|buenas noches|como estas|que mas|q mas|saludos)?\s*'
+        r'(?:quiero|quisiera|me gustar(?:ia|ía))\s+(?:hacer\s+)?(?:una\s+)?(?:propuesta|idea|sugerencia)\s*[.!]?\s*$',
+        raw
+    ):
+        return False
+
     t = _normalize_text(extract_proposal_text(text))
     if not t or t in {"algo","una idea","una propuesta","un tema","varias cosas"}:
         return False
-    if len(t) >= 15:
-        return True
-    if re.search(r'\b(arregl|mejor|constru|instal|crear|paviment|ilumin|señaliz|ampli|dotar|regular(?!idad|mente)|prohib|mult|beca|subsid|limpi|recog|camar)\w*', t):
-        return True
 
+    # "quiero/quisiera proponer" sin complemento
+    if re.match(r'^(?:quiero|quisiera|me gustar(?:ia|ía))\s+proponer\.?$', t):
+        return False
+
+    # Señales de contenido real (verbos/nombres típicos)
+    if re.search(r'\b(arregl|mejor|constru|instal|crear|paviment|ilumin|señaliz|ampli|dotar|regular(?!idad|mente)|prohib|mult|beca|subsid|limpi|recog|camar|pint|adecu)\w*', t):
+        return True
     if re.search(r'\b(parque|anden|and[eé]n|semaforo|luminaria|cancha|juegos|polideportivo|colegio|hospital|bus|ruta|acera)\b', t):
         return True
-    return False
+
+    # Último recurso: acepta longitud solo si NO es una frase de intención
+    return len(t) >= 20 and not re.match(r'^(?:como estas\s+)?(?:quiero|quisiera|me gustar(?:ia|ía))\b', t)
+
 
 
 # === NUEVO: recortar a N oraciones (para contener respuestas del LLM) ===
@@ -672,8 +688,12 @@ def extract_proposal_text(text: str) -> str:
 
     # 2) Si hay un trigger de propuesta en cualquier parte, corta desde ahí
     m = re.search(
-        r'(?:me\s+gustar[íi]a\s+(?:proponer|que)|quisiera\s+(?:proponer|que)|'
-        r'quiero\s+proponer|propongo\s+que|propongo|mi\s+(?:idea|propuesta)\s+(?:es|ser[ií]a))\s*(.*)',
+        r'(?:me\s+gustar[íi]a\s+(?:proponer|que|hacer\s+una\s+propuesta)|'
+        r'quisiera\s+(?:proponer|que|hacer\s+una\s+propuesta)|'
+        r'quiero\s+(?:proponer|hacer\s+una\s+propuesta)|'
+        r'tengo\s+una\s+(?:propuesta|idea)|'
+        r'propongo\s+que|propongo|'
+        r'mi\s+(?:idea|propuesta)\s+(?:es|ser[ií]a))\s*[:\-–—]?\s*(.*)',
         t, flags=re.IGNORECASE
     )
     if m:
@@ -1241,8 +1261,7 @@ async def responder(data: Entrada):
                 ))
                 has_location_ctx = bool(proj_loc or user_barrio or re.search(r'\bbarrio\b', proposal_clean))
 
-                has_concrete = ((len(proposal_clean) >= 15 and not generic_only) or has_action
-                                or (has_infra_noun and has_location_ctx))
+                has_concrete = looks_like_proposal_content(data.mensaje)
 
                 if has_concrete:
                     conv_ref.update({
