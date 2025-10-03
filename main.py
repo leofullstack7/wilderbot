@@ -390,6 +390,7 @@ DISCOURSE_START_WORDS = {
     ]
 }
 
+
 def is_plain_greeting(text: str) -> bool:
     if not text:
         return False
@@ -431,6 +432,7 @@ def has_argument_text(t: str) -> bool:
         "seguridad", "salud", "empleo", "movilidad", "ambiental"
     ]
     return any(k in t for k in keys)
+    
 
 # === NUEVO: heurística fuerte para detectar intención de propuesta/sugerencia ===
 def is_proposal_intent(text: str) -> bool:
@@ -447,6 +449,37 @@ def is_proposal_intent(text: str) -> bool:
         "propongo que", "propuse", "propone"
     ]
     return any(k in t for k in kw)
+
+def is_question_like(text: str) -> bool:
+    t = _normalize_text(text)
+    return (("?" in text) or any(k in t for k in INTERROGATIVOS)) and not is_proposal_intent(text)
+
+def is_proposal_denial(text: str) -> bool:
+    t = _normalize_text(text)
+    pats = [
+        r'\b(aun|aún|todavia|todavía)\s+no\b.*\b(propuest|idea|sugerenc)',
+        r'\b(no\s+tengo|no\s+he\s+hecho|no\s+te\s+he\s+hecho)\b.*\b(propuest|idea|sugerenc)',
+        r'\b(no\s+es)\s+una\s+(propuesta|idea|sugerencia)\b',
+        r'\b(olvidalo|olvídalo|mejor\s+no|ya\s+no|mas\s+tarde|más\s+tarde)\b'
+    ]
+    if any(re.search(p, t) for p in pats):
+        return True
+    return False  # barato y suficiente para el parche
+
+def looks_like_proposal_content(text: str) -> bool:
+    if is_proposal_denial(text):
+        return False
+    t = _normalize_text(extract_proposal_text(text))
+    if not t or t in {"algo","una idea","una propuesta","un tema","varias cosas"}:
+        return False
+    if len(t) >= 15:
+        return True
+    if re.search(r'\b(arregl|mejor|constru|instal|crear|paviment|ilumin|señaliz|ampli|dotar|regular(?!idad|mente)|prohib|mult|beca|subsid|limpi|recog|camar)\w*', t):
+        return True
+    if re.search(r'\b(parque|anden|and[eé]n|semaforo|luminaria|cancha|juegos|polideportivo|colegio|hospital|bus|ruta|acera)\b', t):
+        return True
+    return False
+
 
 # === NUEVO: recortar a N oraciones (para contener respuestas del LLM) ===
 def limit_sentences(text: str, max_sentences: int = 3) -> str:
@@ -961,6 +994,25 @@ async def responder(data: Entrada):
         conv_ref = ensure_conversacion(chat_id, usuario_id, data.faq_origen, data.canal)
 
         conv_data = (conv_ref.get().to_dict() or {})
+        # --- NEGACIÓN explícita de propuesta: resetea subflujo y no pidas nada más ---
+        if is_proposal_denial(data.mensaje):
+            conv_ref.update({
+                "proposal_requested": False,
+                "proposal_collected": False,
+                "current_proposal": None,
+                "argument_requested": False,
+                "argument_collected": False,
+                "contact_intent": None,
+                "contact_requested": False,
+                "contact_refused": False,
+                "ultima_fecha": firestore.SERVER_TIMESTAMP
+            })
+            texto = "Perfecto, sin problema. Cuando la tengas, cuéntamela en 1–2 frases y el barrio del proyecto."
+            append_mensajes(conv_ref, [
+                {"role":"user","content": data.mensaje},
+                {"role":"assistant","content": texto}
+            ])
+            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
         prev_vec = conv_data.get("last_topic_vec")
         prev_sum = (conv_data.get("last_topic_summary") or "").strip()
         awaiting_confirm = bool(conv_data.get("awaiting_topic_confirm"))
@@ -1217,22 +1269,88 @@ async def responder(data: Entrada):
 
 
             # 2) Ya pedimos propuesta y aún no la hemos guardado -> tomar este turno como propuesta
+            # 2) Ya pedimos propuesta y aún no la hemos guardado -> validar este turno
             if conv_data.get("proposal_requested") and not conv_data.get("proposal_collected"):
-                conv_ref.update({
-                    "current_proposal": extract_proposal_text(data.mensaje),
-                    "proposal_collected": True,
-                    "argument_requested": True,  # pasamos a etapa de argumento
-                    "ultima_fecha": firestore.SERVER_TIMESTAMP
-                })
-                texto = positive_ack_and_request_argument(
-                    name,
-                    conv_data.get("project_location") or proj_loc
-                )
+                # contador suave de intentos (nudge)
+                nudges = int(conv_data.get("proposal_nudge_count") or 0)
+
+                # a) NEGACIÓN explícita / “más tarde”
+                if is_proposal_denial(data.mensaje):
+                    conv_ref.update({
+                        "proposal_requested": False,
+                        "proposal_collected": False,
+                        "current_proposal": None,
+                        "argument_requested": False,
+                        "argument_collected": False,
+                        "contact_intent": None,
+                        "contact_requested": False,
+                        "contact_refused": False,
+                        "proposal_nudge_count": 0,
+                        "ultima_fecha": firestore.SERVER_TIMESTAMP
+                    })
+                    texto = "Perfecto, sin problema. Cuando la tengas, cuéntamela en 1–2 frases y el barrio del proyecto."
+                    append_mensajes(conv_ref, [
+                        {"role":"user","content": data.mensaje},
+                        {"role":"assistant","content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
+                # b) ¿Trae CONTENIDO real de propuesta?
+                if looks_like_proposal_content(data.mensaje):
+                    conv_ref.update({
+                        "current_proposal": extract_proposal_text(data.mensaje),
+                        "proposal_collected": True,
+                        "argument_requested": True,
+                        "proposal_nudge_count": 0,
+                        "ultima_fecha": firestore.SERVER_TIMESTAMP
+                    })
+                    texto = positive_ack_and_request_argument(
+                        name,
+                        conv_data.get("project_location") or proj_loc
+                    )
+                    append_mensajes(conv_ref, [
+                        {"role":"user","content": data.mensaje},
+                        {"role":"assistant","content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
+                # c) El usuario trajo una PREGUNTA en lugar de la propuesta
+                if is_question_like(data.mensaje):
+                    # quitamos el “modo propuesta” para no forzar el flujo
+                    conv_ref.update({
+                        "proposal_requested": False,
+                        "contact_intent": None,
+                        "proposal_nudge_count": 0,
+                        "ultima_fecha": firestore.SERVER_TIMESTAMP
+                    })
+                    texto = "¿Prefieres que te responda esa pregunta ahora o seguimos con tu propuesta? Si es propuesta, cuéntamela en 1–2 frases."
+                    append_mensajes(conv_ref, [
+                        {"role":"user","content": data.mensaje},
+                        {"role":"assistant","content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
+                # d) No hay contenido aún → NUDGE con escalado suave
+                nudges += 1
+                conv_ref.update({"proposal_nudge_count": nudges, "ultima_fecha": firestore.SERVER_TIMESTAMP})
+                if nudges == 1:
+                    texto = "Claro. ¿Cuál es tu propuesta? Dímela en 1–2 frases y el barrio del proyecto."
+                elif nudges == 2:
+                    texto = "Para ayudarte mejor, escribe la propuesta en 1–2 frases (ej.: “Arreglar luminarias del parque de San José”)."
+                else:
+                    # salir del modo propuesta para no quedar pegados
+                    conv_ref.update({
+                        "proposal_requested": False,
+                        "contact_intent": None,
+                        "proposal_nudge_count": 0
+                    })
+                    texto = "Todo bien, salgo del modo propuesta. Si prefieres, dime tu pregunta o tema y te ayudo de una."
                 append_mensajes(conv_ref, [
-                    {"role": "user", "content": data.mensaje},
-                    {"role": "assistant", "content": texto}
+                    {"role":"user","content": data.mensaje},
+                    {"role":"assistant","content": texto}
                 ])
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
 
 
             # 3) Ya tenemos propuesta y estamos pidiendo argumento
@@ -1334,6 +1452,11 @@ async def responder(data: Entrada):
                           and bool(conv_data.get("argument_collected"))   # <-- clave: ya tenemos argumento
                           and not already_col
                           and not contact_refused)
+
+        # nunca pedir contacto sin propuesta + argumento
+        if not bool(conv_data.get("proposal_collected")) or not bool(conv_data.get("argument_collected")):
+            policy = {"should_request": False, "intent": intent, "reason": "gated_by_phase"}
+
 
         if should_ask_now and not already_req:
             conv_ref.update({"contact_intent": intent, "contact_requested": True})
