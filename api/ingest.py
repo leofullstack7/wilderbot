@@ -8,9 +8,9 @@ from services.chunkers.xlsx_chunker import parse_xlsx
 from services.chunkers.pdf_chunker import parse_pdf
 from services.chunkers.text_chunker import parse_text_note
 from utils.ids import new_doc_id, chunk_id
+from typing import Optional
 
-from services.pine import upsert_chunks  # ya existe
-from services.pine import get_index 
+
 
 router = APIRouter(tags=["ingest"])
 
@@ -123,7 +123,7 @@ async def ingest_delete(doc_id: str, namespace: Optional[str] = None):
     Elimina el documento de Firestore y purga sus chunks en Pinecone por metadata.doc_id
     """
     try:
-        # 1) Pinecone: borrar por filtro (por doc_id)
+        # 1) Pinecone
         try:
             pine_stat = delete_by_doc_id(doc_id, namespace=namespace)
             pine_err = None
@@ -131,7 +131,7 @@ async def ingest_delete(doc_id: str, namespace: Optional[str] = None):
             pine_stat = None
             pine_err = str(e)
 
-        # 2) Firestore: borra el documento maestro
+        # 2) Firestore
         try:
             db.collection("knowledge_docs").document(doc_id).delete()
         except Exception as e:
