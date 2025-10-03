@@ -936,13 +936,11 @@ def strip_contact_requests(texto: str) -> str:
         out = " ".join([s for s in limpio if s]).strip()
         return out if out else texto
 
-    # Fallback: si todas las oraciones tenían pedido de contacto,
-    # elimina solo la parte "de contacto" dentro de la oración original.
+    # Fallback: si TODA la respuesta era un pedido de contacto, quita esa parte
     cleaned = CONTACT_PATTERNS.sub("", texto).strip()
-    # Si quedaste con algo muy corto/roto, devuelve una petición de argumento corta.
-    return cleaned if len(_normalize_text(cleaned)) >= 5 else "¿Nos cuentas brevemente por qué sería importante y a quién beneficiaría?"
-
-
+    # Si queda muy corto/roto, devolvemos una pregunta de argumento breve
+    return cleaned if len(_normalize_text(cleaned)) >= 5 else \
+        "¿Nos cuentas brevemente por qué sería importante y a quién beneficiaría?"
 
 # =========================================================
 #  RAG
@@ -1252,7 +1250,7 @@ async def responder(data: Entrada):
         is_proposal_flow = (
             not is_plain_greeting(data.mensaje) and (
                 intent == "propuesta"
-                or looks_like_proposal_content(data.mensaje)  # <--- NUEVO
+                or looks_like_proposal_content(data.mensaje)
                 or conv_data.get("contact_intent") == "propuesta"
                 or bool(conv_data.get("proposal_requested"))
                 or bool(conv_data.get("proposal_collected"))
@@ -1320,10 +1318,15 @@ async def responder(data: Entrada):
                 # Solo intención -> primero pide la propuesta
                 conv_ref.update({
                     "proposal_requested": True,
+                    "proposal_collected": False,
+                    "argument_requested": False,
+                    "argument_collected": False,
                     "contact_intent": "propuesta",
+                    "contact_requested": False,
                     "ultima_fecha": firestore.SERVER_TIMESTAMP
                 })
                 texto = "¡Perfecto! ¿Cuál es tu propuesta o sugerencia? Cuéntamela en una o dos frases."
+
                 # <<< PUNTO 17 >>>
                 texto = add_location_note_if_needed(texto)
 
@@ -1510,15 +1513,6 @@ async def responder(data: Entrada):
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
 
-        # Reusar flags ya calculados arriba
-        should_ask_now = (policy.get("should_request")
-                        and intent in ("propuesta", "problema")
-                        and bool(conv_data.get("argument_collected"))
-                        and bool(conv_data.get("argument_requested"))   # <-- NUEVO GATE
-                        and not already_col
-                        and not contact_refused_any
-                        and not already_req)
-
         
         # Si el usuario rechazó dar datos y ya se los habíamos pedido -> envia mensaje de tranquilidad
         if contact_refused_any and already_req and not already_col:
@@ -1534,6 +1528,14 @@ async def responder(data: Entrada):
         if not bool(conv_data.get("proposal_collected")) or not bool(conv_data.get("argument_collected")):
             policy = {"should_request": False, "intent": intent, "reason": "gated_by_phase"}
 
+        # Reusar flags ya calculados arriba
+        should_ask_now = (policy.get("should_request")
+                        and intent in ("propuesta", "problema")
+                        and bool(conv_data.get("argument_collected"))
+                        and bool(conv_data.get("argument_requested"))   # <-- NUEVO GATE
+                        and not already_col
+                        and not contact_refused_any
+                        and not already_req)
 
         if should_ask_now and not already_req:
             conv_ref.update({"contact_intent": intent, "contact_requested": True})
