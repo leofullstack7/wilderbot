@@ -1464,25 +1464,38 @@ async def responder(data: Entrada):
             return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
         # ¿El usuario rechazó dar datos?
-        if detect_contact_refusal(data.mensaje):
+        refused_now = detect_contact_refusal(data.mensaje)
+        if refused_now:
             if phone:
-                # llegó teléfono en el mismo turno: no marcamos rechazo
                 conv_ref.update({"contact_refused": False})
             else:
                 conv_ref.update({"contact_refused": True, "contact_requested": True})
 
         # ¿Debemos pedir contacto ahora? -> SOLO después de tener argumento (no en 1er turno)
-        already_req = bool(conv_data.get("contact_requested"))
         info_actual = (conv_data.get("contact_info") or {})
-        already_col = bool(conv_data.get("contact_collected")) \
-                    or bool(phone) \
-                    or bool(info_actual.get("telefono"))
-        contact_refused = bool(conv_data.get("contact_refused"))
+        already_col = bool(conv_data.get("contact_collected")) or bool(phone) or bool(info_actual.get("telefono"))
+
+        # Toma en cuenta lo que ACABA de pasar en este turno
+        already_req = bool(conv_data.get("contact_requested")) or refused_now
+        contact_refused = bool(conv_data.get("contact_refused")) or refused_now
+
+        # Evita insistir si ya se pidió o si hubo rechazo
         should_ask_now = (policy.get("should_request")
-                          and intent in ("propuesta", "problema")
-                          and bool(conv_data.get("argument_collected"))   # <-- clave: ya tenemos argumento
-                          and not already_col
-                          and not contact_refused)
+                        and intent in ("propuesta", "problema")
+                        and bool(conv_data.get("argument_collected"))
+                        and not already_col
+                        and not contact_refused
+                        and not already_req)
+        
+        # Si el usuario rechazó dar datos y ya se los habíamos pedido -> envia mensaje de tranquilidad
+        if contact_refused and already_req and not already_col:
+            texto = PRIVACY_REPLY
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": texto}
+            ])
+            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
 
         # nunca pedir contacto sin propuesta + argumento
         if not bool(conv_data.get("proposal_collected")) or not bool(conv_data.get("argument_collected")):
@@ -1493,7 +1506,7 @@ async def responder(data: Entrada):
             conv_ref.update({"contact_intent": intent, "contact_requested": True})
 
         # Si toca pedir contacto y el usuario no dio nada aún -> atajo directo
-        if should_ask_now and not (name or phone or user_barrio):
+        if should_ask_now and not already_req and not (name or phone or user_barrio):
             info_actual = (conv_data.get("contact_info") or {})
             faltan = []
             if not info_actual.get("nombre"):   faltan.append("nombre")
@@ -1514,14 +1527,7 @@ async def responder(data: Entrada):
             ])
             return {"respuesta": texto_directo, "fuentes": [], "chat_id": chat_id}
 
-        # Si el usuario rechazó dar datos y ya se los habíamos pedido -> envia mensaje de tranquilidad
-        if contact_refused and already_req and not already_col:
-            texto = PRIVACY_REPLY
-            append_mensajes(conv_ref, [
-                {"role": "user", "content": data.mensaje},
-                {"role": "assistant", "content": texto}
-            ])
-            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
 
         # 4) RAG + prompt final
         hits = rag_search(data.mensaje, top_k=5)

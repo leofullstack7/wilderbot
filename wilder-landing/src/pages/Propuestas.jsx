@@ -106,12 +106,14 @@ export default function Propuestas() {
 
             const catRaw = firstOr(r.categoria_general, "");
             const titRaw = firstOr(r.titulo_propuesta, "");
-            const catHas = String(catRaw || "").trim();
-            const tit = String(titRaw || "").trim();
+            const hasCat = !!String(catRaw || "").trim();
+            const hasTit = !!String(titRaw || "").trim();
 
-            if (!catHas && !tit) {
-                if (fCategoria || fTitulo) return false;
-            }
+            // SIEMPRE ocultar conversaciones sin categoría NI título
+            if (!hasCat && !hasTit) return false;
+
+            // (opcional) si tampoco quieres listar “Consulta”:
+            // if (String(catRaw).toLowerCase() === "consulta") return false;
 
             const catNorm = normalizeCategoriaDocValue(r.categoria_general);
 
