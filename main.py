@@ -929,11 +929,19 @@ CONTACT_PATTERNS = re.compile(
 )
 
 def strip_contact_requests(texto: str) -> str:
-    # Elimina frases que pidan datos de contacto si aún no corresponde
+    # Elimina oraciones completas que pidan contacto
     sent_split = re.split(r'(?<=[\.\?!])\s+', texto.strip())
     limpio = [s for s in sent_split if not CONTACT_PATTERNS.search(s)]
-    out = " ".join([s for s in limpio if s])
-    return out if out else texto
+    if limpio:
+        out = " ".join([s for s in limpio if s]).strip()
+        return out if out else texto
+
+    # Fallback: si todas las oraciones tenían pedido de contacto,
+    # elimina solo la parte "de contacto" dentro de la oración original.
+    cleaned = CONTACT_PATTERNS.sub("", texto).strip()
+    # Si quedaste con algo muy corto/roto, devuelve una petición de argumento corta.
+    return cleaned if len(_normalize_text(cleaned)) >= 5 else "¿Nos cuentas brevemente por qué sería importante y a quién beneficiaría?"
+
 
 
 # =========================================================
@@ -1214,8 +1222,8 @@ async def responder(data: Entrada):
         policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
         intent = policy.get("intent", "otro")
 
-        # === NUEVO: si el texto del usuario sugiere propuesta, forzamos intent='propuesta'
-        if is_proposal_intent(data.mensaje):
+        # NUEVO: también considera contenido concreto como propuesta
+        if is_proposal_intent(data.mensaje) or looks_like_proposal_content(data.mensaje):
             intent = "propuesta"
         
         # --- EARLY: manejar rechazo de datos ANTES del flujo de propuesta/contacto ---
@@ -1244,6 +1252,7 @@ async def responder(data: Entrada):
         is_proposal_flow = (
             not is_plain_greeting(data.mensaje) and (
                 intent == "propuesta"
+                or looks_like_proposal_content(data.mensaje)  # <--- NUEVO
                 or conv_data.get("contact_intent") == "propuesta"
                 or bool(conv_data.get("proposal_requested"))
                 or bool(conv_data.get("proposal_collected"))
@@ -1291,21 +1300,22 @@ async def responder(data: Entrada):
                         "proposal_requested": True,
                         "proposal_collected": True,
                         "argument_requested": True,
+                        "argument_collected": False,      # <--- NUEVO: reinicia argumento
                         "contact_intent": "propuesta",
+                        "contact_requested": False,       # <--- NUEVO: evita arrastrar pedido previo
                         "ultima_fecha": firestore.SERVER_TIMESTAMP
                     })
                     texto = positive_ack_and_request_argument(
                         name,
                         conv_data.get("project_location") or proj_loc
                     )
-                    # <<< PUNTO 17 >>>
                     texto = add_location_note_if_needed(texto)
-
                     append_mensajes(conv_ref, [
-                        {"role": "user", "content": data.mensaje},
-                        {"role": "assistant", "content": texto}
+                        {"role":"user","content": data.mensaje},
+                        {"role":"assistant","content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
 
                 # Solo intención -> primero pide la propuesta
                 conv_ref.update({
