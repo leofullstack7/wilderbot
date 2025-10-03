@@ -1,4 +1,7 @@
 import React, { useCallback, useRef, useState } from "react";
+// Listado de documentos
+import { useEffect } from "react";
+import { listenKnowledgeDocs, deleteKnowledgeDoc } from "../lib/firestoreQueries";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:10000";
 const CATS = ["Vida Personal Wilder","General", "Leyes","Movilidad", "Educación", "Salud", "Seguridad", "Vivienda", "Empleo"];
@@ -9,6 +12,11 @@ export default function Conocimiento() {
     const [busy, setBusy] = useState(false);
     const [msg, setMsg] = useState({ type: "info", text: "Listo para subir o pegar contenido." });
     const [lastResult, setLastResult] = useState(null);
+    const [docs, setDocs] = useState([]);
+    useEffect(() => {
+        const off = listenKnowledgeDocs(setDocs);
+        return () => off();
+    }, []);
 
     // File form
     const [file, setFile] = useState(null);
@@ -137,6 +145,43 @@ export default function Conocimiento() {
             setAlert("warn", "No se pudo copiar. Copia manualmente del mensaje.");
         }
     }, [lastResult]);
+
+
+    const handleDelete = async (d) => {
+        const ok = confirm(`¿Eliminar "${d.titulo || d.filename || d.doc_id}"? Esta acción no se puede deshacer.`);
+        if (!ok) return;
+
+        try {
+            // 1) Borra en Firestore (desaparece de la UI al instante por onSnapshot)
+            await deleteKnowledgeDoc(d.doc_id);
+
+            // 2) (Opcional) Purgar embeddings en Pinecone vía backend si el endpoint existe
+            try {
+                const res = await fetch(`${API}/ingest/delete?doc_id=${encodeURIComponent(d.doc_id)}`, { method: "DELETE" });
+                // no interrumpimos aunque falle
+                console.log("purge pinecone:", await res.json());
+            } catch (e) {
+                console.warn("No se pudo llamar a /ingest/delete, se eliminó solo en Firestore.", e);
+            }
+
+            setAlert("success", "Documento eliminado.");
+        } catch (e) {
+            console.error(e);
+            setAlert("error", "No se pudo eliminar. Revisa permisos/reglas.");
+        }
+    };
+
+
+    const fileIcon = (name, isNote) => {
+        if (isNote) return "📝";
+        const ext = (name || "").split(".").pop()?.toLowerCase();
+        if (ext === "docx") return "🟦 W";
+        if (ext === "xlsx") return "🟩 X";
+        if (ext === "pdf") return "🟥 PDF";
+        return "📄";
+    };
+    const fileBadge = (d) => (d.filename ? (d.filename.split(".").pop() || "").toUpperCase() : "NOTA");
+
 
     return (
         <div className="wk-wrap">
@@ -334,6 +379,55 @@ export default function Conocimiento() {
                     </>
                 )}
             </div>
+
+            {/* === Panel derecho: documentos subidos === */}
+            <div className="hr" />
+            <section className="card">
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                    <h3 style={{ margin: 0 }}>Documentos subidos</h3>
+                    <span className="count">{docs.length} docs</span>
+                </div>
+
+                {docs.length === 0 ? (
+                    <p className="muted" style={{ marginTop: 8 }}>Aún no hay documentos en la base de conocimiento.</p>
+                ) : (
+                    <div className="doc-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 12, marginTop: 12 }}>
+                        {docs.map((d) => {
+                            const isNote = !d.filename;
+                            return (
+                                <article key={d.doc_id} className="doc-card" style={{ position: "relative", border: "1px solid var(--border)", borderRadius: 12, padding: 12, background: "var(--card)" }}>
+                                    <button
+                                        title="Eliminar"
+                                        aria-label="Eliminar"
+                                        onClick={() => handleDelete(d)}
+                                        className="del-btn"
+                                        style={{
+                                            position: "absolute", top: 8, right: 8, width: 28, height: 28,
+                                            borderRadius: 999, border: "1px solid var(--border)",
+                                            background: "#fff", cursor: "pointer"
+                                        }}
+                                    >
+                                        ✕
+                                    </button>
+
+                                    <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                                        <div style={{ fontSize: 28, lineHeight: 1 }}>{fileIcon(d.filename, isNote)}</div>
+                                        <div style={{ minWidth: 0 }}>
+                                            <div style={{ fontWeight: 700, fontSize: ".98rem", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                                                {d.titulo || d.filename || d.doc_id}
+                                            </div>
+                                            <div className="muted" style={{ fontSize: ".85rem" }}>
+                                                {d.categoria} · {fileBadge(d)} · {d.chunks ?? 0} chunks
+                                            </div>
+                                        </div>
+                                    </div>
+                                </article>
+                            );
+                        })}
+                    </div>
+                )}
+            </section>
+
         </div>
     );
 }

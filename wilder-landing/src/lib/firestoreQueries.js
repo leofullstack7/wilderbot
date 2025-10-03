@@ -113,6 +113,31 @@ export async function deleteConversation(id) {
   await deleteDoc(ref);
 }
 
+/* ====================== Conocimiento (listar / eliminar) ====================== */
+export function listenKnowledgeDocs(callback) {
+  const col = collection(db, "knowledge_docs");
+  const q = query(col, orderBy("fecha", "desc"));
+  // Suscripción en tiempo real
+  const unsub = onSnapshot(
+    q,
+    (snap) => {
+      const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+      callback(rows);
+    },
+    (err) => {
+      console.error("[listenKnowledgeDocs] onSnapshot error:", err);
+      callback([]);
+    }
+  );
+  return () => unsub();
+}
+
+export async function deleteKnowledgeDoc(docId) {
+  const ref = doc(db, "knowledge_docs", docId);
+  await deleteDoc(ref);
+}
+
+
 /* ====================== Suscripción con fallback robusto ====================== */
 /**
  * Suscribe conversaciones por rango en 'ultima_fecha' (o 'fecha_inicio' si no hay).

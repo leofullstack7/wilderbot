@@ -30,6 +30,7 @@ export default function AdminLayout() {
                     <nav className="hidden md:flex items-center gap-2">
                         <TopLink to="/admin">Dashboard</TopLink>
                         <TopLink to="/admin/propuestas">Propuestas</TopLink>
+                        <TopLink to="/admin/conocimiento">Conocimiento</TopLink>
                         <button
                             onClick={() => signOut(auth)}
                             className="ml-2 rounded-lg px-3 py-1.5 text-sm font-medium text-white bg-gradient-to-r from-emerald-600 to-sky-600 hover:opacity-90"
@@ -69,12 +70,16 @@ export default function AdminLayout() {
                         <MobileLink to="/admin/propuestas" onClick={() => setOpen(false)}>
                             Propuestas
                         </MobileLink>
+                        <MobileLink to="/admin/conocimiento" onClick={() => setOpen(false)}>
+                            Conocimiento
+                        </MobileLink>
                         <button
                             onClick={() => { setOpen(false); signOut(auth); }}
                             className="mt-4 rounded-lg px-3 py-2 text-left text-white bg-gradient-to-r from-emerald-600 to-sky-600 hover:opacity-90"
                         >
                             Cerrar sesión
                         </button>
+
                     </aside>
                 </div>
             )}
@@ -87,6 +92,7 @@ export default function AdminLayout() {
                         <nav className="p-4 space-y-1">
                             <SideLink to="/admin">Dashboard</SideLink>
                             <SideLink to="/admin/propuestas">Propuestas</SideLink>
+                            <SideLink to="/admin/conocimiento">Conocimiento</SideLink>
                         </nav>
                         <div className="p-4 mt-auto">
                             <button

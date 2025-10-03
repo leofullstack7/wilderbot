@@ -2,12 +2,15 @@ from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from typing import Optional
 from services.clients import db
-from services.pine import upsert_chunks
+from services.pine import upsert_chunks, delete_by_doc_id
 from services.chunkers.docx_chunker import parse_docx
 from services.chunkers.xlsx_chunker import parse_xlsx
 from services.chunkers.pdf_chunker import parse_pdf
 from services.chunkers.text_chunker import parse_text_note
 from utils.ids import new_doc_id, chunk_id
+
+from services.pine import upsert_chunks  # ya existe
+from services.pine import get_index 
 
 router = APIRouter(tags=["ingest"])
 
@@ -110,5 +113,33 @@ async def ingest_status(doc_id: str):
         if not snap.exists:
             return {"ok": False, "error": "doc_id no encontrado"}
         return {"ok": True, "doc": snap.to_dict()}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    
+
+@router.delete("/ingest/delete")
+async def ingest_delete(doc_id: str, namespace: Optional[str] = None):
+    """
+    Elimina el documento de Firestore y purga sus chunks en Pinecone por metadata.doc_id
+    """
+    try:
+        # 1) Pinecone: borrar por filtro (por doc_id)
+        try:
+            pine_stat = delete_by_doc_id(doc_id, namespace=namespace)
+            pine_err = None
+        except Exception as e:
+            pine_stat = None
+            pine_err = str(e)
+
+        # 2) Firestore: borra el documento maestro
+        try:
+            db.collection("knowledge_docs").document(doc_id).delete()
+        except Exception as e:
+            return JSONResponse(
+                {"ok": False, "error": f"Firestore: {e}", "pinecone_error": pine_err},
+                status_code=500
+            )
+
+        return {"ok": True, "pinecone_error": pine_err, "pinecone": pine_stat}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
