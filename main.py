@@ -1009,6 +1009,23 @@ def build_messages(
     msgs.append({"role": "user", "content": f"{contexto_msg}\n\nMensaje del ciudadano:\n{user_text}"})
     return msgs
 
+
+# --- NUEVO: mensajes para CONSULTAS (responder con RAG, sin pedir contacto) ---
+def build_consulta_messages(user_text: str, rag_snippets: List[str], historial: List[Dict[str, str]]):
+    contexto = "\n".join([f"- {s}" for s in rag_snippets if s.strip()])
+    sys = (
+        "Responde como asistente informativo a una CONSULTA.\n"
+        "Sé claro y breve (máx. 2–3 frases). No pidas datos de contacto ni pidas propuestas.\n"
+        "Si el contexto no alcanza, dilo y sugiere el siguiente paso."
+    )
+    ctx = "Contexto recuperado:\n" + (contexto if contexto else "(sin coincidencias relevantes)")
+    msgs = [{"role": "system", "content": sys}]
+    if historial:
+        msgs.extend(historial[-6:])
+    msgs.append({"role": "user", "content": f"{ctx}\n\nPregunta:\n{user_text}"})
+    return msgs
+
+
 # =========================================================
 #  Endpoint principal
 # =========================================================
@@ -1092,6 +1109,54 @@ async def responder(data: Entrada):
                 {"role": "assistant", "content": BOT_INTRO_TEXT}
             ])
             return {"respuesta": BOT_INTRO_TEXT, "fuentes": [], "chat_id": chat_id}
+
+        # --- NUEVO: si es CONSULTA, responder ya con RAG y salir ---
+        consulta_try = llm_consulta_classifier(
+            data.mensaje,
+            historial_for_decider[-4:] if historial_for_decider else None
+        )
+        if consulta_try.get("is_consulta"):
+            # Limpia cualquier estado de propuesta para no arrastrar
+            conv_ref.update({
+                "proposal_requested": False,
+                "proposal_collected": False,
+                "argument_requested": False,
+                "argument_collected": False,
+                "contact_intent": None,
+                "awaiting_topic_confirm": False,
+                "ultima_fecha": firestore.SERVER_TIMESTAMP
+            })
+
+            # (Opcional) marcar tema como Consulta/<título>
+            titulo_cons = consulta_try.get("titulo") or "General"
+            conv_ref.set({
+                "categoria_general": ["Consulta"],
+                "titulo_propuesta": [titulo_cons]
+            }, merge=True)
+
+            # RAG y respuesta breve, SIN pedir contacto
+            hits = rag_search(data.mensaje, top_k=5)
+            historial = load_historial_para_prompt(conv_ref)
+            msgs = build_consulta_messages(
+                data.mensaje,
+                [h["texto"] for h in hits],
+                historial
+            )
+            completion = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=msgs,
+                temperature=0.2,
+                max_tokens=240
+            )
+            texto = limit_sentences(completion.choices[0].message.content.strip(), 3)
+            texto = strip_contact_requests(texto)
+
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": texto}
+            ])
+            return {"respuesta": texto, "fuentes": hits, "chat_id": chat_id}
+
 
 
         topic_change_suspect = False
