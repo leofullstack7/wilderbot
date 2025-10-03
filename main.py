@@ -1215,6 +1215,26 @@ async def responder(data: Entrada):
         # === NUEVO: si el texto del usuario sugiere propuesta, forzamos intent='propuesta'
         if is_proposal_intent(data.mensaje):
             intent = "propuesta"
+        
+        # --- EARLY: manejar rechazo de datos ANTES del flujo de propuesta/contacto ---
+        refused_now = detect_contact_refusal(data.mensaje)
+        if refused_now and not phone:
+            conv_ref.update({"contact_refused": True, "contact_requested": True})
+
+        info_actual = (conv_data.get("contact_info") or {})
+        already_col = bool(conv_data.get("contact_collected")) or bool(phone) or bool(info_actual.get("telefono"))
+        already_req = bool(conv_data.get("contact_requested"))
+        contact_refused_any = bool(conv_data.get("contact_refused")) or refused_now
+
+        # Si ya habíamos pedido datos y ahora rechaza, responde política de privacidad y corta
+        if contact_refused_any and already_req and not already_col:
+            texto = PRIVACY_REPLY
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": texto}
+            ])
+            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
                 # =========================
         # =========================
         # FLUJO DETERMINISTA: PROPUESTAS / SUGERENCIAS
@@ -1417,6 +1437,15 @@ async def responder(data: Entrada):
 
             # 4) Ya tenemos propuesta + argumento y falta contacto
             if conv_data.get("argument_collected") and not (conv_data.get("contact_collected") or phone):
+                # No insistir si el ciudadano rechazó dar datos
+                if contact_refused_any:
+                    texto = PRIVACY_REPLY
+                    append_mensajes(conv_ref, [
+                        {"role":"user","content": data.mensaje},
+                        {"role":"assistant","content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
                 info_actual = (conv_data.get("contact_info") or {})
                 missing = []
                 if not (info_actual.get("nombre") or name):        missing.append("nombre")
@@ -1430,6 +1459,7 @@ async def responder(data: Entrada):
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
             # Si ya llegó el celular, el cierre amable lo maneja el POST de abajo.
 
 
@@ -1463,29 +1493,14 @@ async def responder(data: Entrada):
             ])
             return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-        # ¿El usuario rechazó dar datos?
-        refused_now = detect_contact_refusal(data.mensaje)
-        if refused_now:
-            if phone:
-                conv_ref.update({"contact_refused": False})
-            else:
-                conv_ref.update({"contact_refused": True, "contact_requested": True})
-
-        # ¿Debemos pedir contacto ahora? -> SOLO después de tener argumento (no en 1er turno)
-        info_actual = (conv_data.get("contact_info") or {})
-        already_col = bool(conv_data.get("contact_collected")) or bool(phone) or bool(info_actual.get("telefono"))
-
-        # Toma en cuenta lo que ACABA de pasar en este turno
-        already_req = bool(conv_data.get("contact_requested")) or refused_now
-        contact_refused = bool(conv_data.get("contact_refused")) or refused_now
-
-        # Evita insistir si ya se pidió o si hubo rechazo
+        # Reusar flags ya calculados arriba
         should_ask_now = (policy.get("should_request")
                         and intent in ("propuesta", "problema")
                         and bool(conv_data.get("argument_collected"))
                         and not already_col
-                        and not contact_refused
+                        and not contact_refused_any
                         and not already_req)
+
         
         # Si el usuario rechazó dar datos y ya se los habíamos pedido -> envia mensaje de tranquilidad
         if contact_refused and already_req and not already_col:
