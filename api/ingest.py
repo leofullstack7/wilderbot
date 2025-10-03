@@ -1,6 +1,8 @@
 from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from typing import Optional
+from google.cloud import firestore
+
 from services.clients import db
 from services.pine import upsert_chunks, delete_by_doc_id
 from services.chunkers.docx_chunker import parse_docx
@@ -8,11 +10,10 @@ from services.chunkers.xlsx_chunker import parse_xlsx
 from services.chunkers.pdf_chunker import parse_pdf
 from services.chunkers.text_chunker import parse_text_note
 from utils.ids import new_doc_id, chunk_id
-from typing import Optional
-
 
 
 router = APIRouter(tags=["ingest"])
+
 
 @router.post("/ingest/upload")
 async def ingest_upload(
@@ -33,26 +34,34 @@ async def ingest_upload(
         elif ext == "pdf":
             items = parse_pdf(content, title)
         else:
-            return JSONResponse({"ok": False, "error": f"Formato no soportado: .{ext} (usa .docx, .xlsx o .pdf)"}, status_code=400)
+            return JSONResponse(
+                {"ok": False, "error": f"Formato no soportado: .{ext} (usa .docx, .xlsx o .pdf)"},
+                status_code=400
+            )
 
         if not items:
             return {"ok": False, "error": "No se encontró texto utilizable en el archivo."}
 
         doc_id = new_doc_id("doc")
-        # agrega metadatos comunes
+
+        # agrega metadatos comunes a cada chunk
         for it in items:
             md = it.get("metadata") or {}
-            md.update({"doc_id": doc_id, "categoria": categoria or "General", "publicado": bool(publicar)})
+            md.update({
+                "doc_id": doc_id,
+                "categoria": categoria or "General",
+                "publicado": bool(publicar)
+            })
             it["metadata"] = md
 
-        # IDs de chunk
+        # IDs de chunk determinísticos
         for i, it in enumerate(items):
             it["id"] = chunk_id(doc_id, i)
 
-        # upsert a pinecone (sin namespace para que /responder actual los encuentre)
+        # upsert a Pinecone (sin namespace para que /responder los encuentre)
         stat = upsert_chunks(items)
 
-        # registra maestro en firestore
+        # registra maestro en Firestore
         db.collection("knowledge_docs").document(doc_id).set({
             "doc_id": doc_id,
             "titulo": title,
@@ -60,7 +69,7 @@ async def ingest_upload(
             "categoria": categoria or "General",
             "publicado": bool(publicar),
             "chunks": stat.get("upserted", 0),
-            "fecha": db.SERVER_TIMESTAMP if hasattr(db, "SERVER_TIMESTAMP") else None
+            "fecha": firestore.SERVER_TIMESTAMP
         }, merge=True)
 
         return {"ok": True, "doc_id": doc_id, "chunks": stat.get("upserted", 0)}
@@ -82,9 +91,14 @@ async def ingest_text(
             return {"ok": False, "error": "El contenido está vacío."}
 
         doc_id = new_doc_id("note")
+
         for i, it in enumerate(items):
             md = it.get("metadata") or {}
-            md.update({"doc_id": doc_id, "categoria": categoria or "General", "publicado": bool(publicar)})
+            md.update({
+                "doc_id": doc_id,
+                "categoria": categoria or "General",
+                "publicado": bool(publicar)
+            })
             it["metadata"] = md
             it["id"] = chunk_id(doc_id, i)
 
@@ -97,7 +111,7 @@ async def ingest_text(
             "categoria": categoria or "General",
             "publicado": bool(publicar),
             "chunks": stat.get("upserted", 0),
-            "fecha": db.SERVER_TIMESTAMP if hasattr(db, "SERVER_TIMESTAMP") else None
+            "fecha": firestore.SERVER_TIMESTAMP
         }, merge=True)
 
         return {"ok": True, "doc_id": doc_id, "chunks": stat.get("upserted", 0)}
@@ -115,12 +129,12 @@ async def ingest_status(doc_id: str):
         return {"ok": True, "doc": snap.to_dict()}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-    
+
 
 @router.delete("/ingest/delete")
 async def ingest_delete(doc_id: str, namespace: Optional[str] = None):
     """
-    Elimina el documento de Firestore y purga sus chunks en Pinecone por metadata.doc_id
+    Elimina el documento de Firestore y purga sus chunks en Pinecone por metadata.doc_id.
     """
     try:
         # 1) Pinecone

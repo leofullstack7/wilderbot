@@ -1,5 +1,15 @@
+# services/pine.py
+
 from typing import List, Dict, Any, Optional
-from services.clients import pine_index, openai_client, EMBEDDING_MODEL
+from services.clients import openai_client, EMBEDDING_MODEL
+from pinecone import Pinecone
+import os
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+INDEX_NAME = os.getenv("PINECONE_INDEX", "wilder-frases")
+
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(INDEX_NAME)  # exportado
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     if not texts:
@@ -22,13 +32,11 @@ def upsert_chunks(items: List[Dict[str, Any]], namespace: Optional[str] = None):
             "values": v,
             "metadata": {**(it.get("metadata") or {}), "texto": it["text"]}
         })
-    # Nota: sin namespace => default; así /responder actual los encontrará
     if namespace:
-        pine_index.upsert(vectors=vectors, namespace=namespace)
+        index.upsert(vectors=vectors, namespace=namespace)
     else:
-        pine_index.upsert(vectors=vectors)
+        index.upsert(vectors=vectors)
     return {"upserted": len(vectors)}
-
 
 def delete_by_doc_id(doc_id: str, namespace: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -37,24 +45,19 @@ def delete_by_doc_id(doc_id: str, namespace: Optional[str] = None) -> Dict[str, 
     if not doc_id:
         return {"deleted": 0, "error": "doc_id vacío"}
 
-    flt = {"doc_id": {"$eq": doc_id}}
+    flt = {"doc_id": doc_id}  # igualdad simple es suficiente
     if namespace:
-        pine_index.delete(filter=flt, namespace=namespace)
+        index.delete(filter=flt, namespace=namespace)
     else:
-        pine_index.delete(filter=flt)
-    # Pinecone no devuelve conteo exacto; devolvemos ack.
+        index.delete(filter=flt)
     return {"ok": True, "doc_id": doc_id}
 
-
 def delete_by_ids(ids: List[str], namespace: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Borra por IDs exactos de vectores (útil si los tienes guardados).
-    """
     ids = [i for i in (ids or []) if i]
     if not ids:
         return {"deleted": 0, "error": "ids vacío"}
     if namespace:
-        pine_index.delete(ids=ids, namespace=namespace)
+        index.delete(ids=ids, namespace=namespace)
     else:
-        pine_index.delete(ids=ids)
+        index.delete(ids=ids)
     return {"ok": True, "count": len(ids)}
