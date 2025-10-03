@@ -1700,9 +1700,10 @@ def update_panel_resumen(categoria: str, tono: str, titulo: str, usuario_id: str
     panel_ref = db.collection("panel_resumen").document("global")
     panel_ref.set({
         "total_conversaciones": Increment(1),
-        "propuestas_por_categoria": {categoria: Increment(1)},
-        "resumen_tono": {tono: Increment(1)}
+        f"propuestas_por_categoria.{categoria}": Increment(1),
+        f"resumen_tono.{tono}": Increment(1),
     }, merge=True)
+
     panel_ref.set({
         "ultimas_propuestas": firestore.ArrayUnion([{
             "titulo": titulo,
