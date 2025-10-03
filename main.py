@@ -923,8 +923,10 @@ def positive_ack_and_request_argument(name: Optional[str], project_location: Opt
     )
 
 CONTACT_PATTERNS = re.compile(
-    r"(compart(e|ir)|env(í|i)a|dime|indícame|facilítame).{0,40}"
-    r"(tu\s+)?(nombre|barrio|celular|tel[eé]fono|n[uú]mero|contacto)", re.IGNORECASE)
+    r"(compart\w+|env(í|i)a\w*|dime|indíca\w*|facilita\w*|regálame|regalame|me\s+das|me\s+dejas).{0,60}"
+    r"(tu\s+)?(nombre|barrio|celular|tel[eé]fono|n[uú]mero|contacto)",
+    re.IGNORECASE
+)
 
 def strip_contact_requests(texto: str) -> str:
     # Elimina frases que pidan datos de contacto si aún no corresponde
@@ -1405,12 +1407,17 @@ async def responder(data: Entrada):
 
             # 3) Ya tenemos propuesta y estamos pidiendo argumento
             if conv_data.get("proposal_collected") and not conv_data.get("argument_collected"):
-                if has_argument_text(data.mensaje) or len(_normalize_text(data.mensaje)) >= 20:
+                # Solo marcar argumento si:
+                #   a) lo pedimos en el turno anterior y el usuario respondió algo (≥5 chars), o
+                #   b) hay señales causales claras (porque/ya que/debido…)
+                last_role = historial_for_decider[-1]["role"] if historial_for_decider else None
+                just_asked_arg = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
+
+                if has_argument_text(data.mensaje) or (just_asked_arg and len(_normalize_text(data.mensaje)) >= 5):
                     conv_ref.update({
                         "argument_collected": True,
                         "ultima_fecha": firestore.SERVER_TIMESTAMP
                     })
-                    # Pide contacto (nombre, barrio, celular)
                     info_actual = (conv_data.get("contact_info") or {})
                     faltan = []
                     if not info_actual.get("nombre"):   faltan.append("nombre")
@@ -1426,14 +1433,13 @@ async def responder(data: Entrada):
                 else:
                     # Reforzar petición de argumento (corta)
                     texto = craft_argument_question(name, conv_data.get("project_location"))
-                    # <<< PUNTO 17 >>>
                     texto = add_location_note_if_needed(texto)
-
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
 
             # 4) Ya tenemos propuesta + argumento y falta contacto
             if conv_data.get("argument_collected") and not (conv_data.get("contact_collected") or phone):
@@ -1497,6 +1503,7 @@ async def responder(data: Entrada):
         should_ask_now = (policy.get("should_request")
                         and intent in ("propuesta", "problema")
                         and bool(conv_data.get("argument_collected"))
+                        and bool(conv_data.get("argument_requested"))   # <-- NUEVO GATE
                         and not already_col
                         and not contact_refused_any
                         and not already_req)
