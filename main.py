@@ -812,14 +812,55 @@ def llm_contact_policy(summary_so_far: str, last_user: str) -> Dict[str, Any]:
 def llm_consulta_classifier(ultimo_usuario: str, historial_breve: List[Dict[str, str]] | None = None) -> Dict[str, Any]:
     """
     Decide si es CONSULTA y asigna un título de CONSULTA_TITULOS.
-    Primero intentamos una heurística determinista; si no alcanza, caemos al LLM.
+    Versión mejorada que prioriza la búsqueda en documentos.
     """
-    # 1) Heurística determinista primero (barata y robusta)
+    # ====================================================================
+    # NUEVO: Detectar keywords que indican búsqueda de información
+    # ====================================================================
+    KEYWORDS_BUSQUEDA = [
+        # Preguntas directas
+        "qué", "que", "cómo", "como", "cuál", "cual", "cuándo", "cuando",
+        "dónde", "donde", "por qué", "por que", "quién", "quien",
+        
+        # Solicitudes de información
+        "dime sobre", "cuéntame sobre", "háblame de", "hablame de",
+        "información sobre", "informacion sobre", "datos sobre",
+        "me gustaría saber", "me gustaria saber", "quisiera saber",
+        "quiero saber", "necesito saber",
+        
+        # Referencias a Wilder/leyes/documentos
+        "wilder", "ley", "proyecto de ley", "norma", "congreso",
+        "propuesta de wilder", "posición de wilder", "posicion de wilder",
+        "qué dice wilder", "que dice wilder",
+        
+        # Preguntas sobre temas específicos
+        "hay alguna", "existe alguna", "se puede", "es posible",
+        "está permitido", "esta permitido",
+    ]
+    
+    texto_norm = _normalize_text(ultimo_usuario)
+    
+    # Si tiene keyword de búsqueda Y no es claramente una propuesta, es consulta
+    tiene_keyword_busqueda = any(kw in texto_norm for kw in 
+                                  [_normalize_text(k) for k in KEYWORDS_BUSQUEDA])
+    
+    es_claramente_propuesta = (
+        is_proposal_intent(ultimo_usuario) or 
+        looks_like_proposal_content(ultimo_usuario)
+    )
+    
+    # REGLA 1: Si tiene keyword de búsqueda y NO es propuesta → CONSULTA
+    if tiene_keyword_busqueda and not es_claramente_propuesta:
+        h_title = heuristic_consulta_title(ultimo_usuario)
+        titulo = h_title if h_title else "General"
+        return {"is_consulta": True, "titulo": titulo, "reason": "keyword_busqueda"}
+    
+    # REGLA 2: Heurística determinista primero (barata y robusta)
     h_title = heuristic_consulta_title(ultimo_usuario)
     if h_title:
         return {"is_consulta": True, "titulo": h_title, "reason": "heuristic"}
 
-    # 2) Si la heurística no decide, pedimos al LLM (respaldo)
+    # REGLA 3: Si la heurística no decide, pedimos al LLM (respaldo)
     historia = ""
     if historial_breve:
         historia = "\n".join([f"{m['role']}: {m['content']}" for m in historial_breve[-4:]])
@@ -856,17 +897,15 @@ def llm_consulta_classifier(ultimo_usuario: str, historial_breve: List[Dict[str,
             titulo = "General"
         return {"is_consulta": True, "titulo": titulo, "reason": data.get("reason", "llm")}
 
-    # 3) Último salvavidas: si el LLM dijo que no, reintenta con heurística “suave”
+    # REGLA 4: Último salvavidas: si el LLM dijo que no, reintenta con heurística "suave"
     soft_title = heuristic_consulta_title(ultimo_usuario)
     if soft_title:
         return {"is_consulta": True, "titulo": soft_title, "reason": "heuristic-soft"}
     
-     # --- Fallback si el LLM falla o dice que no es consulta y la heurística lo ve como consulta ---
+    # Fallback si el LLM falla o dice que no es consulta y la heurística lo ve como consulta
     if not bool(data.get("is_consulta")) and _is_consulta_heuristic(ultimo_usuario):
         titulo_fb = _pick_consulta_title(ultimo_usuario)
         return {"is_consulta": True, "titulo": titulo_fb, "reason": "heuristic_fallback"}
-
-    # Sanitiza título (ya existente)
 
     return {"is_consulta": False, "titulo": "", "reason": data.get("reason", "llm_no")}
 
