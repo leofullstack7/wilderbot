@@ -413,17 +413,56 @@ def is_plain_greeting(text: str) -> bool:
 
 def has_argument_text(t: str) -> bool:
     """
-    Heurística para detectar 'argumento/razón'.
-    Más estricta: NO dispara por 'para' suelto (evita falsos positivos como 'para los niños').
+    Heurística RÁPIDA para detectar argumentos obvios.
+    Si no está seguro, devuelve True para que llm_is_argument valide.
     """
     t = _normalize_text(t)
-    keys = [
-        "porque", "ya que", "debido", "por que", "porqué",
-        "afecta", "impacta", "riesgo", "peligro",
-        "falta", "no hay", "urge", "es necesario", "contamina",
-        "seguridad", "salud", "empleo", "movilidad", "ambiental"
+    
+    # Palabras clave muy claras (detección rápida)
+    obvious_keys = [
+        "porque", "ya que", "debido", "necesitamos", "es importante",
+        "para que", "con el fin", "urgente", "peligro"
     ]
-    return any(k in t for k in keys)
+    
+    if any(k in t for k in obvious_keys):
+        return True
+    
+    # Si es respuesta mediana/larga (probablemente está argumentando)
+    if len(t) >= 30:
+        return True
+    
+    return False
+
+
+def llm_is_argument(text: str, proposal_context: str = "") -> bool:
+    """
+    Usa LLM para detectar si el texto es un argumento/justificación.
+    Más inteligente que keywords.
+    """
+    sys = (
+        "Eres un clasificador que detecta si un mensaje es un ARGUMENTO/JUSTIFICACIÓN.\n"
+        "Un argumento explica:\n"
+        "- POR QUÉ algo es importante\n"
+        "- A QUIÉN beneficia\n"
+        "- QUÉ PROBLEMA resuelve\n"
+        "- CONSECUENCIAS de no hacerlo\n\n"
+        "Responde SOLO 'SI' o 'NO'."
+    )
+    
+    usr = f"Contexto (propuesta): {proposal_context}\n\nMensaje del usuario: {text}\n\n¿Es un argumento/justificación? (SI/NO)"
+    
+    try:
+        out = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
+            temperature=0.0,
+            max_tokens=10
+        ).choices[0].message.content.strip().upper()
+        
+        return "SI" in out or "YES" in out
+    except:
+        # Si falla el LLM, usa la heurística
+        return has_argument_text(text)
 
     
 
@@ -1535,7 +1574,15 @@ async def responder(data: Entrada):
                 last_role = historial_for_decider[-1]["role"] if historial_for_decider else None
                 just_asked_arg = bool(conv_data.get("argument_requested")) and (last_role == "assistant")
 
-                if has_argument_text(data.mensaje) or (just_asked_arg and len(_normalize_text(data.mensaje)) >= 5):
+                    # Detectar argumento de forma inteligente
+                proposal_ctx = conv_data.get("current_proposal") or ""
+                is_argument = (
+                    has_argument_text(data.mensaje) or  # heurística rápida
+                    llm_is_argument(data.mensaje, proposal_ctx) or  # LLM inteligente
+                    (just_asked_arg and len(_normalize_text(data.mensaje)) >= 5)  # respondió a pregunta
+                )
+                
+                if is_argument:
                     conv_ref.update({
                         "argument_collected": True,
                         "ultima_fecha": firestore.SERVER_TIMESTAMP
