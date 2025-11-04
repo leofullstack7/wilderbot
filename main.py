@@ -1395,15 +1395,23 @@ async def responder(data: Entrada):
         # =========================
         # FLUJO DETERMINISTA: PROPUESTAS / SUGERENCIAS
         # =========================
-        is_proposal_flow = (
+        # PRIORIDAD 1: Si ya estamos en flujo de propuestas, NO salir hasta completar
+        already_in_proposal_flow = (
+            bool(conv_data.get("proposal_requested")) or
+            bool(conv_data.get("proposal_collected")) or
+            bool(conv_data.get("argument_requested")) or
+            conv_data.get("contact_intent") == "propuesta"
+        )
+
+        # PRIORIDAD 2: Detectar nueva propuesta
+        new_proposal_detected = (
             not is_plain_greeting(data.mensaje) and (
-                intent == "propuesta"
-                or looks_like_proposal_content(data.mensaje)
-                or conv_data.get("contact_intent") == "propuesta"
-                or bool(conv_data.get("proposal_requested"))
-                or bool(conv_data.get("proposal_collected"))
+                intent == "propuesta" or
+                looks_like_proposal_content(data.mensaje)
             )
         )
+
+        is_proposal_flow = already_in_proposal_flow or new_proposal_detected
 
         if is_proposal_flow:
             # 1) ¿Este turno YA trae la propuesta? -> capturar y pasar a argumento
