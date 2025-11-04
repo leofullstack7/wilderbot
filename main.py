@@ -675,6 +675,40 @@ def extract_user_barrio(text: str) -> Optional[str]:
     return None
 
 
+def llm_extract_contact_info(text: str) -> Dict[str, Optional[str]]:
+    """
+    Usa LLM para extraer nombre, barrio y teléfono cuando el usuario
+    los da todos juntos sin formato claro.
+    """
+    sys = (
+        "Extrae información de contacto del mensaje.\n"
+        "Devuelve SOLO JSON con claves: nombre, barrio, telefono\n"
+        "Si algo no está presente, usa null.\n\n"
+        "Ejemplos:\n"
+        "- 'Juliana Salazar, vivo en Miñitas, 3168207240' → {\"nombre\": \"Juliana Salazar\", \"barrio\": \"Miñitas\", \"telefono\": \"3168207240\"}\n"
+        "- 'Juan Pérez del barrio Centro' → {\"nombre\": \"Juan Pérez\", \"barrio\": \"Centro\", \"telefono\": null}\n"
+        "- 'Mi número es 3001234567' → {\"nombre\": null, \"barrio\": null, \"telefono\": \"3001234567\"}\n"
+    )
+    
+    usr = f"Mensaje: {text}\n\nExtrae la información y devuelve el JSON."
+    
+    try:
+        out = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
+            temperature=0.0,
+            max_tokens=150
+        ).choices[0].message.content.strip()
+        
+        data = json.loads(out)
+        return {
+            "nombre": data.get("nombre"),
+            "barrio": data.get("barrio"),
+            "telefono": data.get("telefono")
+        }
+    except:
+        return {"nombre": None, "barrio": None, "telefono": None}
+
 def _titlecase(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip()).title()
 
@@ -1295,8 +1329,17 @@ async def responder(data: Entrada):
         # === EXTRAER datos sueltos del texto ===
         name = extract_user_name(data.mensaje)
         phone = extract_phone(data.mensaje)
-        user_barrio = extract_user_barrio(data.mensaje)  # residencia
+        user_barrio = extract_user_barrio(data.mensaje)
         proj_loc = extract_project_location(data.mensaje)
+        # Si ya pedimos contacto y el usuario respondió sin formato claro, usa LLM
+        if conv_data.get("contact_requested") and not (name or phone or user_barrio):
+            llm_data = llm_extract_contact_info(data.mensaje)
+            if llm_data.get("nombre"):
+                name = llm_data["nombre"]
+            if llm_data.get("telefono"):
+                phone = llm_data["telefono"]
+            if llm_data.get("barrio"):
+                user_barrio = llm_data["barrio"]
         if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
             conv_ref.update({"project_location": proj_loc})
 
@@ -1384,7 +1427,26 @@ async def responder(data: Entrada):
 
         # Si ya habíamos pedido datos y ahora rechaza, responde política de privacidad y corta
         if contact_refused_any and already_req and not already_col:
-            texto = PRIVACY_REPLY
+            # Primera negativa: explicar por qué necesitamos los datos
+            refusal_count = int(conv_data.get("contact_refusal_count") or 0)
+            
+            if refusal_count == 0:
+                # Primera vez: explica
+                conv_ref.update({"contact_refusal_count": 1})
+                texto = PRIVACY_REPLY + " ¿Me compartes tus datos para poder ayudarte?"
+            else:
+                # Segunda negativa: acepta y despide
+                conv_ref.update({
+                    "contact_refused": True,
+                    "contact_requested": False,
+                    "contact_refusal_count": 2
+                })
+                texto = (
+                    "Entiendo tu decisión y la respeto completamente. "
+                    "Si en algún momento cambias de opinión, estaré aquí para ayudarte. "
+                    "¡Que tengas un excelente día!"
+                )
+            
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto}
@@ -1457,6 +1519,8 @@ async def responder(data: Entrada):
                         "argument_collected": False,      # <--- NUEVO: reinicia argumento
                         "contact_intent": "propuesta",
                         "contact_requested": False,       # <--- NUEVO: evita arrastrar pedido previo
+                        "categoria_general": [],
+                        "titulo_propuesta": [],
                         "ultima_fecha": firestore.SERVER_TIMESTAMP
                     })
                     texto = positive_ack_and_request_argument(
@@ -1676,16 +1740,6 @@ async def responder(data: Entrada):
                 ])
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
-
-        
-        # Si el usuario rechazó dar datos y ya se los habíamos pedido -> envia mensaje de tranquilidad
-        if contact_refused_any and already_req and not already_col:
-            texto = PRIVACY_REPLY
-            append_mensajes(conv_ref, [
-                {"role": "user", "content": data.mensaje},
-                {"role": "assistant", "content": texto}
-            ])
-            return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
 
         # nunca pedir contacto sin propuesta + argumento
