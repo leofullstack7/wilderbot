@@ -1408,12 +1408,26 @@ async def responder(data: Entrada):
             return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
         # === Política argumento + contacto ===
-        policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
-        intent = policy.get("intent", "otro")
+        # IMPORTANTE: Solo clasificar si NO estamos ya en flujo de propuestas
+        already_in_proposal_flow = (
+            bool(conv_data.get("proposal_requested")) or
+            bool(conv_data.get("proposal_collected")) or
+            bool(conv_data.get("argument_requested")) or
+            conv_data.get("contact_intent") == "propuesta"
+        )
 
-        # NUEVO: también considera contenido concreto como propuesta
-        if is_proposal_intent(data.mensaje) or looks_like_proposal_content(data.mensaje):
+        if already_in_proposal_flow:
+            # Ya estamos en flujo, mantener intent como "propuesta"
             intent = "propuesta"
+        else:
+            # Nueva conversación, clasificar
+            policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
+            intent = policy.get("intent", "otro")
+            
+            # NUEVO: también considera contenido concreto como propuesta
+            if is_proposal_intent(data.mensaje) or looks_like_proposal_content(data.mensaje):
+                intent = "propuesta"
+
         
         # --- EARLY: manejar rechazo de datos ANTES del flujo de propuesta/contacto ---
         refused_now = detect_contact_refusal(data.mensaje)
