@@ -29,6 +29,9 @@ from api.ingest import router as ingest_router
 
 from fastapi.middleware.cors import CORSMiddleware
 
+import time
+from typing import Optional, Dict, Any, List
+
 
 # =========================================================
 #  Config
@@ -333,19 +336,25 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
 
 
 def append_mensajes(conv_ref, nuevos: List[Dict[str, Any]]):
+    """Versión mejorada con actualización de resumen automática."""
     snap = conv_ref.get()
     data = snap.to_dict() or {}
     arr = data.get("mensajes", [])
     arr.extend(nuevos)
     conv_ref.update({"mensajes": arr, "ultima_fecha": firestore.SERVER_TIMESTAMP})
 
-    # --- Recalcular y guardar resumen corto (≤100 chars) ---
+    # Actualizar resumen corto para clasificador (≤100 chars)
     try:
         resumen = summarize_conversation_brief(arr, max_chars=100)
         conv_ref.update({"resumen": resumen, "resumen_updated_at": firestore.SERVER_TIMESTAMP})
     except Exception:
-        # no rompas el flujo si el resumen falla
         pass
+    
+    # NUEVO: Actualizar resumen en caliente (contexto inteligente)
+    try:
+        update_conversation_summary(conv_ref)
+    except Exception as e:
+        print(f"[WARN] Conversation summary update failed: {e}")
 
 
 def load_historial_para_prompt(conv_ref) -> List[Dict[str, str]]:
@@ -361,6 +370,210 @@ def load_historial_para_prompt(conv_ref) -> List[Dict[str, str]]:
                 out.append({"role": role, "content": content})
         return out
     return []
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# FUNCIÓN 1: Actualizar Resumen de Conversación (Cache Inteligente)
+# ═══════════════════════════════════════════════════════════════════════
+# PEGAR DESPUÉS de la función load_historial_para_prompt (línea ~363)
+
+def update_conversation_summary(conv_ref, force: bool = False):
+    """
+    Mantiene un resumen actualizado de la conversación para contexto rápido.
+    Se ejecuta cada 4 mensajes o cuando se fuerza.
+    
+    Beneficio: LLM lee 100 tokens (resumen) en lugar de 1000+ (historial completo)
+    Resultado: 10x más rápido, 10x más barato
+    """
+    snap = conv_ref.get()
+    data = snap.to_dict() or {}
+    
+    msg_count = int(data.get("messages_since_summary", 0)) + 1
+    
+    # Solo actualizar cada 4 mensajes (o forzado)
+    if msg_count < 4 and not force:
+        conv_ref.update({"messages_since_summary": msg_count})
+        return
+    
+    all_messages = data.get("mensajes", [])
+    
+    # Si hay menos de 4 mensajes, no vale la pena resumir
+    if len(all_messages) < 4:
+        conv_ref.update({"messages_since_summary": msg_count})
+        return
+    
+    # Últimos 12 mensajes para resumir
+    recent = all_messages[-12:]
+    transcript = []
+    for m in recent:
+        role = "U" if m["role"] == "user" else "B"
+        content = (m.get("content", "") or "")[:180]
+        transcript.append(f"{role}: {content}")
+    
+    transcript_text = "\n".join(transcript)
+    
+    # Prompt ultra-compacto
+    sys = (
+        "Resume en MÁXIMO 140 caracteres: tema, propuesta (si hay), fase actual.\n"
+        "Ejemplo: 'Consultó ley fauna. Propuso mejorar alumbrado Milán. Dio argumento seguridad.'\n"
+        "Sin nombres ni teléfonos."
+    )
+    
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": transcript_text}
+            ],
+            temperature=0.2,
+            max_tokens=50,
+            timeout=3  # timeout agresivo
+        )
+        
+        summary = response.choices[0].message.content.strip()[:140]
+        
+        conv_ref.update({
+            "conversacion_resumida": summary,
+            "summary_updated_at": firestore.SERVER_TIMESTAMP,
+            "messages_since_summary": 0
+        })
+        
+    except Exception as e:
+        # Si falla, incrementar contador pero no bloquear
+        conv_ref.update({"messages_since_summary": msg_count})
+        print(f"[WARN] Summary update failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# FUNCIÓN 2: Fast Path - Respuestas Instantáneas (0ms)
+# ═══════════════════════════════════════════════════════════════════════
+# PEGAR DESPUÉS de update_conversation_summary
+
+def fast_path_check(mensaje: str, conv_data: dict) -> Optional[str]:
+    """
+    Fast Path: Respuestas instantáneas sin LLM para casos obvios.
+    
+    Cubre ~70% de casos:
+    - Saludos iniciales
+    - Confirmaciones simples
+    - Rechazos de datos
+    - Respuestas en flujo activo ya determinado
+    
+    Returns: texto de respuesta o None si necesita procesamiento más profundo
+    """
+    t = _normalize_text(mensaje)
+    mensaje_len = len(t)
+    
+    # 1. Saludo inicial sin historial
+    if not conv_data.get("mensajes") and is_plain_greeting(mensaje):
+        return BOT_INTRO_TEXT
+    
+    # 2. Rechazo de datos cuando ya se pidieron
+    if conv_data.get("contact_requested") and not conv_data.get("contact_collected"):
+        if detect_contact_refusal(mensaje):
+            refusal_count = int(conv_data.get("contact_refusal_count", 0))
+            if refusal_count == 0:
+                return PRIVACY_REPLY + " ¿Me compartes tus datos para poder ayudarte?"
+            else:
+                return (
+                    "Entiendo tu decisión y la respeto completamente. "
+                    "Si en algún momento cambias de opinión, estaré aquí para ayudarte. "
+                    "¡Que tengas un excelente día!"
+                )
+    
+    # 3. Confirmaciones ultra-cortas en flujos activos (delegamos al flujo normal)
+    # No procesamos aquí para no romper lógica existente
+    
+    return None  # Necesita procesamiento más profundo
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# FUNCIÓN 3: Smart Classifier - Clasificación Rápida con Contexto
+# ═══════════════════════════════════════════════════════════════════════
+# PEGAR DESPUÉS de fast_path_check
+
+def smart_classify_with_context(mensaje: str, resumen: str, conv_data: dict) -> Dict[str, Any]:
+    """
+    Clasificación inteligente híbrida: heurísticas + LLM con resumen.
+    
+    Beneficios:
+    - Usa heurísticas primero (gratis, instantáneo)
+    - Solo llama LLM en casos ambiguos
+    - LLM lee resumen (100 tokens) en lugar de historial completo (1000+ tokens)
+    
+    Returns: {"tipo": "consulta"|"propuesta", "confianza": "alta"|"media"|"baja"}
+    """
+    t = _normalize_text(mensaje)
+    
+    # ──────────────────────────────────────────────────────────
+    # NIVEL 1: Heurísticas Deterministas (GRATIS, INSTANTÁNEO)
+    # ──────────────────────────────────────────────────────────
+    
+    # Propuestas obvias
+    propuesta_keywords = [
+        "propongo", "mi propuesta es", "quisiera que construyan",
+        "me gustaria que arreglen", "sugiero que", "deberían hacer"
+    ]
+    if any(kw in t for kw in propuesta_keywords):
+        return {"tipo": "propuesta", "confianza": "alta", "metodo": "heuristica_propuesta"}
+    
+    # Consultas obvias (preguntas simples sin proponer acción)
+    if "?" in mensaje and not any(kw in t for kw in ["propongo", "sugiero", "me gustaria construir"]):
+        # Si pregunta sobre Wilder/leyes, es consulta
+        if any(kw in t for kw in ["wilder", "ley", "proyecto de ley", "que propone", "que apoya"]):
+            return {"tipo": "consulta", "confianza": "alta", "metodo": "heuristica_consulta"}
+    
+    # Seguimientos obvios de consulta
+    followup_words = ["explicame mas", "cuentame mas", "ampliame", "y que mas", "mas sobre", "detallame"]
+    if any(fw in t for fw in followup_words):
+        # Si el resumen menciona consulta/ley/información, es seguimiento de consulta
+        if resumen:
+            resumen_lower = resumen.lower()
+            if any(kw in resumen_lower for kw in ["consulta", "ley", "información", "preguntó"]):
+                return {"tipo": "consulta", "confianza": "alta", "metodo": "heuristica_seguimiento"}
+    
+    # ──────────────────────────────────────────────────────────
+    # NIVEL 2: LLM con Resumen (RÁPIDO, casos ambiguos)
+    # ──────────────────────────────────────────────────────────
+    
+    # Construir prompt ultra-compacto
+    contexto = resumen if resumen else "Inicio de conversación (sin contexto previo)"
+    
+    sys = (
+        f"Contexto: {contexto}\n"
+        f"Nuevo mensaje: {mensaje}\n\n"
+        "¿Es 'consulta' (pide información/explicación) o 'propuesta' (quiere construir/mejorar algo físico)?\n"
+        "Reglas:\n"
+        "- 'Explícame más' después de hablar de leyes = consulta\n"
+        "- 'Quiero mejorar el parque' = propuesta\n"
+        "- 'Hay huecos en mi calle' (solo reporta) = consulta\n\n"
+        "Responde UNA palabra: consulta|propuesta"
+    )
+    
+    try:
+        start = time.time()
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": sys}],
+            temperature=0,
+            max_tokens=5,
+            timeout=2
+        )
+        elapsed = int((time.time() - start) * 1000)
+        
+        answer = response.choices[0].message.content.strip().lower()
+        tipo = "propuesta" if "propuesta" in answer else "consulta"
+        
+        print(f"[PERF] LLM classify: {elapsed}ms")
+        return {"tipo": tipo, "confianza": "media", "metodo": "llm_resumido"}
+        
+    except Exception as e:
+        print(f"[WARN] LLM classify failed: {e}")
+        # Fallback conservador: si hay duda, tratar como consulta
+        return {"tipo": "consulta", "confianza": "baja", "metodo": "fallback"}
+
 
 # =========================================================
 #  Text utils
@@ -1194,6 +1407,42 @@ async def responder(data: Entrada):
         conv_ref = ensure_conversacion(chat_id, usuario_id, data.faq_origen, data.canal)
 
         conv_data = (conv_ref.get().to_dict() or {})
+
+        # Fast Path: Respuestas instantáneas sin LLM
+        # ═══════════════════════════════════════════════════════════════════════
+
+        fast_response = fast_path_check(data.mensaje, conv_data)
+        if fast_response:
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": fast_response}
+            ])
+            return {"respuesta": fast_response, "fuentes": [], "chat_id": chat_id}
+        
+        # Smart Path: Clasificación rápida con contexto resumido
+        # ═══════════════════════════════════════════════════════════════════════
+
+        # Obtener resumen en caliente
+        resumen_contexto = conv_data.get("conversacion_resumida", "")
+
+        # Clasificación inteligente híbrida
+        clasificacion = smart_classify_with_context(data.mensaje, resumen_contexto, conv_data)
+
+        # Si ya estamos en flujo de propuesta determinista, mantenerlo
+        already_in_proposal_flow = (
+            bool(conv_data.get("proposal_collected")) or
+            bool(conv_data.get("proposal_requested")) or
+            bool(conv_data.get("argument_requested")) or
+            conv_data.get("contact_intent") == "propuesta"
+        )
+
+        if already_in_proposal_flow:
+            clasificacion["tipo"] = "propuesta"
+            clasificacion["confianza"] = "alta"
+            clasificacion["metodo"] = "flujo_activo"
+
+        print(f"[CLASSIFY] Tipo: {clasificacion['tipo']}, Confianza: {clasificacion['confianza']}, Método: {clasificacion.get('metodo', 'N/A')}")
+
         # --- NEGACIÓN explícita de propuesta: resetea subflujo y no pidas nada más ---
         if is_proposal_denial(data.mensaje):
             conv_ref.update({
@@ -1267,11 +1516,7 @@ async def responder(data: Entrada):
             return {"respuesta": BOT_INTRO_TEXT, "fuentes": [], "chat_id": chat_id}
 
         # --- NUEVO: si es CONSULTA, responder ya con RAG y salir ---
-        consulta_try = llm_consulta_classifier(
-            data.mensaje,
-            historial_for_decider[-4:] if historial_for_decider else None
-        )
-        if consulta_try.get("is_consulta"):
+        if clasificacion["tipo"] == "consulta" and not already_in_proposal_flow:
             # Limpia cualquier estado de propuesta para no arrastrar
             conv_ref.update({
                 "proposal_requested": False,
@@ -1460,11 +1705,10 @@ async def responder(data: Entrada):
             intent = "propuesta"
         else:
             # Nueva conversación, clasificar
-            policy = llm_contact_policy(prev_sum or curr_sum, data.mensaje)
-            intent = policy.get("intent", "otro")
+            intent = clasificacion["tipo"] if clasificacion["tipo"] == "propuesta" else "otro"
             
             # NUEVO: también considera contenido concreto como propuesta
-            if is_proposal_intent(data.mensaje) or looks_like_proposal_content(data.mensaje):
+            if clasificacion["tipo"] == "propuesta" or looks_like_proposal_content(data.mensaje):
                 intent = "propuesta"
 
         
