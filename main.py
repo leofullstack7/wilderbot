@@ -465,22 +465,61 @@ def llm_is_argument(text: str, proposal_context: str = "") -> bool:
         return has_argument_text(text)
 
     
+def llm_is_proposal(text: str, conversation_context: str = "") -> bool:
+    """
+    Usa LLM para detectar si el mensaje es una PROPUESTA/SUGERENCIA.
+    """
+    sys = (
+        "Eres un clasificador que detecta si un mensaje es una PROPUESTA o SUGERENCIA cívica.\n\n"
+        "Una PROPUESTA es cuando el ciudadano:\n"
+        "- Quiere que se haga algo en su comunidad (construir, mejorar, crear, arreglar, instalar)\n"
+        "- Sugiere una acción específica para resolver un problema\n"
+        "- Propone una idea para beneficiar al barrio/ciudad\n\n"
+        "NO es propuesta cuando:\n"
+        "- Solo hace una PREGUNTA sobre información\n"
+        "- Pide que le EXPLIQUEN algo\n"
+        "- Consulta sobre leyes o datos\n"
+        "- Reporta un problema SIN sugerir qué hacer\n\n"
+        "Responde SOLO 'SI' o 'NO'."
+    )
+    
+    context_msg = f"\nContexto previo: {conversation_context}" if conversation_context else ""
+    usr = f"Mensaje del ciudadano: {text}{context_msg}\n\n¿Es una propuesta/sugerencia? (SI/NO)"
+    
+    try:
+        out = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
+            temperature=0.0,
+            max_tokens=10
+        ).choices[0].message.content.strip().upper()
+        
+        return "SI" in out or "YES" in out
+    except:
+        return is_proposal_intent_heuristic(text)
+
+
+def is_proposal_intent_heuristic(text: str) -> bool:
+    """Heurística rápida para detectar propuestas."""
+    t = _normalize_text(text)
+    if "me gustaria que" in t and re.search(r"\b(me\s+dig[ae]n|me\s+expliquen?|me\s+informen?)\b", t):
+        return False
+    
+    kw = [
+        "propongo", "propuesta", "sugerencia", "mi idea",
+        "quiero proponer", "me gustaria proponer",
+        "me gustaria mejorar", "quiero construir", "quisiera arreglar"
+    ]
+    return any(k in t for k in kw)
 
 # === NUEVO: heurística fuerte para detectar intención de propuesta/sugerencia ===
 def is_proposal_intent(text: str) -> bool:
-    t = _normalize_text(text)
-
-    # Si es "me gustaría que me dijeran/explicaran/informaran", NO es propuesta (suele ser consulta)
-    if "me gustaria que" in t and re.search(r"\b(me\s+dig[ae]n|me\s+expliquen?|me\s+informen?)\b", t):
-        return False
-
-    kw = [
-        "propongo", "propuesta", "sugerencia", "sugerir", "sugiero",
-        "mi idea", "mi propuesta", "quiero proponer", "quisiera proponer",
-        "me gustaria proponer", "planteo", "plantear",
-        "propongo que", "propuse", "propone"
-    ]
-    return any(k in t for k in kw)
+    """Detecta propuestas con LLM inteligente."""
+    # Primero heurística rápida
+    if is_proposal_intent_heuristic(text):
+        return True
+    # Si no, usa LLM
+    return llm_is_proposal(text)
 
 def is_question_like(text: str) -> bool:
     t = _normalize_text(text)
