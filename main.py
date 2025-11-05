@@ -1529,7 +1529,7 @@ async def responder(data: Entrada):
             })
 
             # (Opcional) marcar tema como Consulta/<título>
-            titulo_cons = consulta_try.get("titulo") or "General"
+            titulo_cons = "General"
             conv_ref.set({
                 "categoria_general": ["Consulta"],
                 "titulo_propuesta": [titulo_cons]
