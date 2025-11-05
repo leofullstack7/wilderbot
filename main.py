@@ -1327,6 +1327,71 @@ def rag_search(query: str, top_k: int = 5):
         })
     return hits
 
+def reformulate_query_with_context(
+    current_query: str, 
+    conversation_history: List[Dict[str, str]],
+    max_history: int = 6
+) -> str:
+    """
+    Usa LLM para reformular la query considerando el contexto completo.
+    
+    El LLM lee la conversación y convierte queries dependientes del contexto
+    en queries autónomas que pueden usarse para búsqueda.
+    
+    Ejemplos:
+    
+    CASO 1:
+    Conversación:
+      U: "¿Wilder apoyó ley de fauna?"
+      B: "Sí, la Ley 2402 de 2024 sobre transporte de fauna..."
+      U: "Háblame más sobre ella"
+    
+    → Query reformulada: "Ley 2402 de 2024 transporte de fauna detalles completos"
+    
+    CASO 2:
+    Conversación:
+      U: "¿Qué propone Wilder sobre educación?"
+      B: "Propone la nivelación educativa pospandemia..."
+      U: "¿Eso ya fue aprobado?"
+    
+    → Query reformulada: "nivelación educativa pospandemia estado aprobación"
+    
+    CASO 3:
+    Conversación:
+      U: "Cuéntame sobre sus proyectos de salud"
+      B: "Tiene varios: telemedicina, salud mental..."
+      U: "El primero me interesa"
+    
+    → Query reformulada: "telemedicina proyecto Wilder detalles"
+    """
+    
+    # Si la query ya es específica y larga, no reformular
+    if len(current_query.split()) > 8 and not any(
+        ref in current_query.lower() 
+        for ref in ["ella", "él", "eso", "esa", "ese", "lo", "la", "el", "primero", "segundo"]
+    ):
+        print(f"[QUERY] Query específica, no reformular: '{current_query}'")
+        return current_query
+    
+    # Construir contexto conversacional
+    recent = conversation_history[-max_history:] if conversation_history else []
+    
+    if not recent:
+        # Sin contexto, usar query original
+        return current_query
+    
+    # Construir transcripción
+    transcript = []
+    for msg in recent:
+        role = "Usuario" if msg["role"] == "user" else "Asistente"
+        content = msg.get("content", "")[:300]  # Limitar para eficiencia
+        transcript.append(f"{role}: {content}")
+    
+    transcript_text = "\n".join(transcript)
+    
+    # Prompt para reformulación inteligente
+    system_prompt = f"""Eres un asistente que reformula queries de búsqueda.
+
 # =========================================================
 #  Prompt constructor
 # =========================================================
