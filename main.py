@@ -1391,6 +1391,63 @@ def reformulate_query_with_context(
     
     # Prompt para reformulación inteligente
     system_prompt = f"""Eres un asistente que reformula queries de búsqueda.
+    CONTEXTO DE LA CONVERSACIÓN:
+    {transcript_text}
+
+    NUEVA QUERY DEL USUARIO:
+    {current_query}
+
+    TAREA:
+    Reformula la query del usuario para que sea AUTÓNOMA (independiente del contexto).
+    Si la query tiene referencias vagas (ella, eso, el primero, etc.), reemplázalas con los términos específicos del contexto.
+
+    REGLAS:
+    1. Si la query YA es específica y clara, devuélvela sin cambios
+    2. Si tiene referencias al contexto, expándelas con información específica
+    3. Mantén el idioma español
+    4. Máximo 15 palabras
+    5. Enfócate en términos de búsqueda (nombres propios, leyes, proyectos, conceptos)
+    6. NO incluyas preguntas, solo términos clave
+
+    EJEMPLOS:
+
+    Contexto: "Usuario: ¿Wilder apoyó ley fauna? | Asistente: Sí, Ley 2402..."
+    Query: "Háblame más sobre ella"
+    Reformulada: Ley 2402 transporte fauna detalles
+
+    Contexto: "Usuario: ¿Proyectos de salud? | Asistente: Telemedicina, salud mental..."
+    Query: "El primero me interesa"
+    Reformulada: telemedicina proyecto Wilder
+
+    Contexto: Ninguno
+    Query: "¿Qué propone Wilder sobre educación?"
+    Reformulada: propuestas Wilder educación
+
+    Devuelve SOLO la query reformulada, sin explicaciones."""
+
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "system", "content": system_prompt}],
+            temperature=0.1,
+            max_tokens=40,
+            timeout=2
+        )
+        
+        reformulated = response.choices[0].message.content.strip()
+        
+        # Validación: si la reformulación es muy corta o vacía, usar original
+        if len(reformulated.split()) < 2:
+            reformulated = current_query
+        
+        print(f"[QUERY] Original: '{current_query}'")
+        print(f"[QUERY] Reformulada: '{reformulated}'")
+        
+        return reformulated
+        
+    except Exception as e:
+        print(f"[WARN] Query reformulation failed: {e}")
+        return current_query  # Fallback a query original
 
 # =========================================================
 #  Prompt constructor
@@ -1601,13 +1658,27 @@ async def responder(data: Entrada):
             }, merge=True)
 
             # RAG y respuesta breve, SIN pedir contacto
-            hits = rag_search(data.mensaje, top_k=5)
+            # NUEVO: Reformulación inteligente de query con contexto
+            historial_completo = load_historial_para_prompt(conv_ref)
+            
+            # El LLM reformula la query para que sea autónoma
+            query_reformulada = reformulate_query_with_context(
+                data.mensaje,
+                historial_completo,
+                max_history=6  # Últimos 6 mensajes (3 turnos)
+            )
+            
+            # Buscar con query reformulada
+            hits = rag_search(query_reformulada, top_k=5)
+            
+            # Construir mensajes para el LLM de respuesta
             historial = load_historial_para_prompt(conv_ref)
             msgs = build_consulta_messages(
-                data.mensaje,
+                data.mensaje,  # Query ORIGINAL para que la respuesta suene natural
                 [h["texto"] for h in hits],
-                historial
+                historial  # El LLM de respuesta también ve el historial
             )
+            
             completion = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=msgs,
@@ -1616,7 +1687,7 @@ async def responder(data: Entrada):
             )
             texto = limit_sentences(completion.choices[0].message.content.strip(), 3)
             texto = strip_contact_requests(texto)
-
+            
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": texto}
