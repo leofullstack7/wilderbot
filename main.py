@@ -1994,6 +1994,11 @@ async def responder(data: Entrada):
             )
         )
 
+        es_consulta_pura = (
+            clasificacion["tipo"] == "consulta" 
+            and not already_in_proposal_flow 
+            and not conv_data.get("proposal_collected")
+        )
         is_proposal_flow = already_in_proposal_flow or new_proposal_detected
 
         if is_proposal_flow:
@@ -2208,6 +2213,31 @@ async def responder(data: Entrada):
 
             # 4) Ya tenemos propuesta + argumento y falta contacto
             if conv_data.get("argument_collected") and not (conv_data.get("contact_collected") or phone):
+                # NUEVO: Verificar que realmente sea propuesta antes de pedir contacto
+                # VALIDACIÓN: Solo pedir contacto si hay propuesta real
+                if not conv_data.get("proposal_collected") or not conv_data.get("current_proposal"):
+                    print(f"[WARN] Se iba a pedir contacto sin propuesta real. Abortando flujo.")
+                    # Salir del flujo de propuestas
+                    conv_ref.update({
+                        "proposal_requested": False,
+                        "argument_requested": False,
+                        "argument_collected": False,
+                        "contact_intent": None,
+                        "contact_requested": False,
+                        "ultima_fecha": firestore.SERVER_TIMESTAMP
+                    })
+                    # No return, dejar que siga al flujo normal RAG
+                    pass
+                else:
+                    if not conv_data.get("proposal_collected"):
+                        # No hay propuesta real, salir del flujo
+                        conv_ref.update({
+                            "proposal_requested": False,
+                            "argument_requested": False,
+                            "contact_intent": None,
+                            "ultima_fecha": firestore.SERVER_TIMESTAMP
+                        })
+
                 # No insistir si el ciudadano rechazó dar datos
                 if contact_refused_any:
                     texto = PRIVACY_REPLY
