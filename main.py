@@ -927,38 +927,100 @@ def extract_user_barrio(text: str) -> Optional[str]:
     return None
 
 
-def llm_extract_contact_info(text: str) -> Dict[str, Optional[str]]:
+def llm_extract_contact_info(text: str, info_actual: Dict[str, Optional[str]] = None) -> Dict[str, Optional[str]]:
     """
-    Usa LLM para extraer nombre, barrio y teléfono cuando el usuario
-    los da todos juntos sin formato claro.
+    Extractor inteligente de datos de contacto usando LLM.
+    Maneja CUALQUIER forma de expresión del usuario.
     """
+    info_actual = info_actual or {}
+    
     sys = (
-        "Extrae información de contacto del mensaje.\n"
-        "Devuelve SOLO JSON con claves: nombre, barrio, telefono\n"
-        "Si algo no está presente, usa null.\n\n"
-        "Ejemplos:\n"
-        "- 'Juliana Salazar, vivo en Miñitas, 3168207240' → {\"nombre\": \"Juliana Salazar\", \"barrio\": \"Miñitas\", \"telefono\": \"3168207240\"}\n"
-        "- 'Juan Pérez del barrio Centro' → {\"nombre\": \"Juan Pérez\", \"barrio\": \"Centro\", \"telefono\": null}\n"
-        "- 'Mi número es 3001234567' → {\"nombre\": null, \"barrio\": null, \"telefono\": \"3001234567\"}\n"
+        "Eres un extractor experto de información de contacto.\n"
+        "Tu trabajo es identificar NOMBRE COMPLETO, BARRIO DE RESIDENCIA y TELÉFONO en mensajes informales.\n\n"
+        
+        "REGLAS CRÍTICAS:\n"
+        "1. NOMBRE: Solo nombres propios de personas (2-4 palabras)\n"
+        "   - Acepta: 'Manuel Arango', 'María del Carmen López', 'Maria Carmenza Suarez'\n"
+        "   - Rechaza: 'Hola', 'Claro', 'Ok', 'La Francia' (es barrio)\n"
+        
+        "2. BARRIO: Nombre del lugar donde VIVE la persona\n"
+        "   - Palabras clave: 'vivo en', 'resido en', 'soy de', 'del barrio'\n"
+        "   - Acepta: 'La Francia', 'San José', 'Centro', 'Aranjuez'\n"
+        "   - Rechaza: nombres de personas\n"
+        
+        "3. TELÉFONO: 8-12 dígitos (con o sin prefijos/espacios)\n"
+        "   - Acepta: '3154628963', '+57 315 462 8963', '300-123-4567'\n"
+        "   - Normaliza: quita espacios, guiones, paréntesis, prefijos +57/0057\n\n"
+        
+        "CASOS ESPECIALES:\n"
+        "- Si el mensaje es solo 'no', 'prefiero no', 'no quiero' → devuelve todo null\n"
+        "- Si menciona un dato que YA TENÍAMOS, ignóralo (null)\n"
+        "- Si algo no está claro, usa null (NO inventes)\n\n"
+        
+        "FORMATO DE SALIDA:\n"
+        "Devuelve SOLO JSON válido sin markdown:\n"
+        '{"nombre": "...", "barrio": "...", "telefono": "..."}\n\n'
+        
+        "EJEMPLOS:\n"
+        "Mensaje: 'Claro, Manuel Arango, vivo en La Francia y 3154628963'\n"
+        '→ {"nombre": "Manuel Arango", "barrio": "La Francia", "telefono": "3154628963"}\n\n'
+        
+        "Mensaje: 'Maria Carmenza Suarez'\n"
+        '→ {"nombre": "Maria Carmenza Suarez", "barrio": null, "telefono": null}\n\n'
+        
+        "Mensaje: 'Ok, soy Juan del barrio Centro'\n"
+        '→ {"nombre": "Juan", "barrio": "Centro", "telefono": null}\n\n'
+        
+        "Mensaje: 'Mi número es 300 555 1234'\n"
+        '→ {"nombre": null, "barrio": null, "telefono": "3005551234"}\n\n'
+        
+        "Mensaje: 'No quiero dar mis datos'\n"
+        '→ {"nombre": null, "barrio": null, "telefono": null}\n'
     )
     
-    usr = f"Mensaje: {text}\n\nExtrae la información y devuelve el JSON."
+    context = ""
+    if info_actual:
+        context = f"\n\nDatos que YA TENEMOS (ignóralos si se repiten):\n"
+        if info_actual.get("nombre"):
+            context += f"- Nombre: {info_actual['nombre']}\n"
+        if info_actual.get("barrio"):
+            context += f"- Barrio: {info_actual['barrio']}\n"
+        if info_actual.get("telefono"):
+            context += f"- Teléfono: {info_actual['telefono']}\n"
+    
+    usr = f"Mensaje del usuario:\n{text}{context}\n\nExtrae SOLO los datos NUEVOS y devuelve el JSON."
     
     try:
         out = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
             temperature=0.0,
-            max_tokens=150
+            max_tokens=200,
+            timeout=3
         ).choices[0].message.content.strip()
         
+        # Limpiar markdown si viene con ```json
+        out = out.replace("```json", "").replace("```", "").strip()
+        
         data = json.loads(out)
+        
+        # Normalizar teléfono si viene
+        if data.get("telefono"):
+            tel = re.sub(r'\D', '', data["telefono"])
+            tel = re.sub(r'^(?:00)?57', '', tel)
+            data["telefono"] = tel if 8 <= len(tel) <= 12 else None
+        
         return {
             "nombre": data.get("nombre"),
             "barrio": data.get("barrio"),
             "telefono": data.get("telefono")
         }
-    except:
+    
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] LLM extract JSON parse failed: {out[:200] if 'out' in locals() else 'N/A'}")
+        return {"nombre": None, "barrio": None, "telefono": None}
+    except Exception as e:
+        print(f"[ERROR] LLM extract failed: {e}")
         return {"nombre": None, "barrio": None, "telefono": None}
 
 def _titlecase(s: str) -> str:
@@ -1240,17 +1302,34 @@ def llm_consulta_classifier(ultimo_usuario: str, historial_breve: List[Dict[str,
 # =========================================================
 
 def build_contact_request(missing: List[str]) -> str:
+    """
+    Genera mensaje para pedir datos faltantes con tono más directo.
+    """
     etiquetas = {
         "nombre": "tu nombre",
         "barrio": "tu barrio",
-        "celular": "un número de contacto",
+        "celular": "tu número de teléfono",
         "project_location": "el barrio del proyecto",
     }
+    
     pedir = [etiquetas[m] for m in missing if m in etiquetas]
+    
     if not pedir:
         return "¿Me confirmas por favor los datos pendientes?"
-    frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
-    return f"Para escalar y darle seguimiento, ¿me compartes {frase}? Lo usamos solo para informarte avances."
+    
+    # Generar frase natural
+    if len(pedir) == 1:
+        frase = pedir[0]
+    elif len(pedir) == 2:
+        frase = f"{pedir[0]} y {pedir[1]}"
+    else:
+        frase = ", ".join(pedir[:-1]) + " y " + pedir[-1]
+    
+    # Mensaje más directo según número de datos faltantes
+    if len(pedir) >= 2:
+        return f"Olvidaste darme {frase}. Con la información completa es más probable que tu propuesta sea escalada."
+    else:
+        return f"Me falta {frase}. Con la información completa es más probable que tu propuesta sea escalada."
 
 
 # NUEVO: pedir SOLO el barrio del proyecto con un tono distinto al de contacto
@@ -1747,19 +1826,28 @@ async def responder(data: Entrada):
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
         # === EXTRAER datos sueltos del texto ===
+        # ESTRATEGIA: Regex primero (rápido), LLM como complemento inteligente
         name = extract_user_name(data.mensaje)
         phone = extract_phone(data.mensaje)
         user_barrio = extract_user_barrio(data.mensaje)
         proj_loc = extract_project_location(data.mensaje)
-        # Si ya pedimos contacto y el usuario respondió sin formato claro, usa LLM
-        if conv_data.get("contact_requested") and not (name or phone or user_barrio):
-            llm_data = llm_extract_contact_info(data.mensaje)
-            if llm_data.get("nombre"):
+        
+        # Si falta algún dato Y estamos en contexto de contacto, usa LLM inteligente
+        if conv_data.get("contact_requested") or (not name and not phone and not user_barrio):
+            info_actual = conv_data.get("contact_info") or {}
+            llm_data = llm_extract_contact_info(data.mensaje, info_actual)
+            
+            # Solo sobrescribir si el LLM encontró algo que regex no encontró
+            if not name and llm_data.get("nombre"):
                 name = llm_data["nombre"]
-            if llm_data.get("telefono"):
+            if not phone and llm_data.get("telefono"):
                 phone = llm_data["telefono"]
-            if llm_data.get("barrio"):
+            if not user_barrio and llm_data.get("barrio"):
                 user_barrio = llm_data["barrio"]
+            
+            print(f"[EXTRACT] Regex: name={bool(extract_user_name(data.mensaje))}, phone={bool(extract_phone(data.mensaje))}, barrio={bool(extract_user_barrio(data.mensaje))}")
+            print(f"[EXTRACT] LLM: name={llm_data.get('nombre')}, phone={llm_data.get('telefono')}, barrio={llm_data.get('barrio')}")
+            print(f"[EXTRACT] Final: name={name}, phone={phone}, barrio={user_barrio}")
         if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
             conv_ref.update({"project_location": proj_loc})
 
