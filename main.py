@@ -1566,6 +1566,10 @@ async def responder(data: Entrada):
         # ═══════════════════════════════════════════════════════════════════════
 
         # Obtener resumen en caliente
+# Smart Path: Clasificación rápida con contexto resumido
+        # ══════════════════════════════════════════════════════════════════════════════
+
+        # Obtener resumen en caliente
         resumen_contexto = conv_data.get("conversacion_resumida", "")
 
         # Clasificación inteligente híbrida
@@ -1599,7 +1603,7 @@ async def responder(data: Entrada):
                 "contact_refused": False,
                 "ultima_fecha": firestore.SERVER_TIMESTAMP
             })
-            texto = "Perfecto, sin problema. Cuando la tengas, cuéntamela en 1–2 frases y el barrio del proyecto."
+            texto = "Perfecto, sin problema. Cuando la tengas, cuéntamela en 1—2 frases y el barrio del proyecto."
             append_mensajes(conv_ref, [
                 {"role":"user","content": data.mensaje},
                 {"role":"assistant","content": texto}
