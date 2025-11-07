@@ -933,13 +933,22 @@ def llm_extract_contact_info(text: str) -> Dict[str, Optional[str]]:
     los da todos juntos sin formato claro.
     """
     sys = (
-        "Extrae información de contacto del mensaje.\n"
-        "Devuelve SOLO JSON con claves: nombre, barrio, telefono\n"
+        "Eres un extractor de información de contacto.\n"
+        "Extrae del mensaje: nombre completo, barrio de residencia, y teléfono.\n"
+        "Devuelve SOLO JSON válido con claves: nombre, barrio, telefono\n"
         "Si algo no está presente, usa null.\n\n"
+        "REGLAS IMPORTANTES:\n"
+        "- El BARRIO es donde VIVE la persona (busca 'vivo en', 'resido en', 'soy de')\n"
+        "- El NOMBRE debe ser un nombre propio (2-4 palabras capitalizadas)\n"
+        "- El TELÉFONO son 8-12 dígitos consecutivos\n"
+        "- NO confundas el barrio de residencia con ubicaciones del proyecto\n"
+        "- Si dice 'del barrio X' después de un nombre, ese es su barrio de residencia\n\n"
         "Ejemplos:\n"
         "- 'Juliana Salazar, vivo en Miñitas, 3168207240' → {\"nombre\": \"Juliana Salazar\", \"barrio\": \"Miñitas\", \"telefono\": \"3168207240\"}\n"
         "- 'Juan Pérez del barrio Centro' → {\"nombre\": \"Juan Pérez\", \"barrio\": \"Centro\", \"telefono\": null}\n"
         "- 'Mi número es 3001234567' → {\"nombre\": null, \"barrio\": null, \"telefono\": \"3001234567\"}\n"
+        "- 'María, Aranjuez, 310...' → {\"nombre\": \"María\", \"barrio\": \"Aranjuez\", \"telefono\": \"310...\"}\n"
+        "- 'Carlos de Prado, 315...' → {\"nombre\": \"Carlos\", \"barrio\": \"Prado\", \"telefono\": \"315...\"}\n"
     )
     
     usr = f"Mensaje: {text}\n\nExtrae la información y devuelve el JSON."
@@ -952,13 +961,25 @@ def llm_extract_contact_info(text: str) -> Dict[str, Optional[str]]:
             max_tokens=150
         ).choices[0].message.content.strip()
         
+        # Limpia markdown si viene envuelto
+        out = out.replace("```json", "").replace("```", "").strip()
+        
         data = json.loads(out)
+        
+        # Normaliza teléfono (quita prefijos)
+        tel = data.get("telefono")
+        if tel:
+            tel_clean = re.sub(r'\D', '', str(tel))
+            tel_clean = re.sub(r'^(?:00)?57', '', tel_clean)
+            data["telefono"] = tel_clean if 8 <= len(tel_clean) <= 12 else None
+        
         return {
             "nombre": data.get("nombre"),
             "barrio": data.get("barrio"),
             "telefono": data.get("telefono")
         }
-    except:
+    except Exception as e:
+        print(f"[WARN] LLM extraction failed: {e}")
         return {"nombre": None, "barrio": None, "telefono": None}
 
 def _titlecase(s: str) -> str:
@@ -1747,19 +1768,24 @@ async def responder(data: Entrada):
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
         # === EXTRAER datos sueltos del texto ===
+        # Primero intenta con regex (rápido)
         name = extract_user_name(data.mensaje)
         phone = extract_phone(data.mensaje)
         user_barrio = extract_user_barrio(data.mensaje)
         proj_loc = extract_project_location(data.mensaje)
-        # Si ya pedimos contacto y el usuario respondió sin formato claro, usa LLM
-        if conv_data.get("contact_requested") and not (name or phone or user_barrio):
-            llm_data = llm_extract_contact_info(data.mensaje)
-            if llm_data.get("nombre"):
-                name = llm_data["nombre"]
-            if llm_data.get("telefono"):
-                phone = llm_data["telefono"]
-            if llm_data.get("barrio"):
-                user_barrio = llm_data["barrio"]
+        
+        # Si ya pedimos contacto y NO encontramos nada con regex, usa LLM
+        if conv_data.get("contact_requested") and not conv_data.get("contact_collected"):
+            # Solo si NO capturamos nada con regex
+            if not (name or phone or user_barrio):
+                llm_data = llm_extract_contact_info(data.mensaje)
+                name = llm_data.get("nombre") or name
+                phone = llm_data.get("telefono") or phone
+                user_barrio = llm_data.get("barrio") or user_barrio
+                
+                print(f"[LLM EXTRACT] Nombre: {name}, Barrio: {user_barrio}, Tel: {phone}")
+        
+        # Actualiza project_location si viene
         if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
             conv_ref.update({"project_location": proj_loc})
 
@@ -1782,23 +1808,26 @@ async def responder(data: Entrada):
         
 
         partials = {}
-        if name:   partials["nombre"] = name
-        if phone:  partials["telefono"] = phone
-        if user_barrio: partials["barrio"] = user_barrio
+        if name:   
+            partials["nombre"] = name.strip()
+        if phone:  
+            partials["telefono"] = phone
+        if user_barrio: 
+            partials["barrio"] = user_barrio.strip()
 
         if partials:
             current_info = (conv_data.get("contact_info") or {})
             new_info = dict(current_info)  # copia
 
-            # no sobrescribir un nombre ya existente
-            if name and not current_info.get("nombre"):
-                new_info["nombre"] = name
-            if user_barrio:
-                new_info["barrio"] = user_barrio
-            if phone:
-                new_info["telefono"] = phone
-
+            # Actualiza solo lo que viene nuevo y no está vacío
+            for key, value in partials.items():
+                if value and (not current_info.get(key) or len(str(current_info.get(key, ""))) < len(str(value))):
+                    new_info[key] = value
+            
+            # Guarda en conversación
             conv_ref.update({"contact_info": new_info})
+            
+            # Si llegó teléfono, marca como completado
             if phone:
                 conv_ref.update({"contact_collected": True})
                 upsert_usuario_o_anon(
@@ -1806,8 +1835,8 @@ async def responder(data: Entrada):
                     new_info.get("nombre") or data.nombre or data.usuario,
                     phone,
                     data.canal,
-                    new_info.get("barrio") or user_barrio       # <-- barrio a usuarios
-            )
+                    new_info.get("barrio") or user_barrio
+                )
 
 
                 # --- AUTO-CIERRE si ya teníamos pedido de contacto y ahora se completó tel + ubicación ---
@@ -2262,16 +2291,32 @@ async def responder(data: Entrada):
 
         # --- POST: si falta algo y ya toca pedir contacto -> pide lo que falte (sin repetir lo ya dado) ---
         elif should_ask_now:
-            info_actual = (conv_data.get("contact_info") or {})
+            # Construir info actualizada con los datos del turno actual
+            info_actual_now = (conv_data.get("contact_info") or {})
+            if partials:
+                info_actual_now = {**info_actual_now, **partials}
+            
+            # Usar la versión actualizada para verificar qué falta
+            info_actual = info_actual_now
+            
             missing = []
-            if not (info_actual.get("nombre") or name):        missing.append("nombre")
-            if not (info_actual.get("barrio") or user_barrio): missing.append("barrio")
-            if not (info_actual.get("telefono") or phone):     missing.append("celular")
-            if not (conv_data.get("project_location") or proj_loc): missing.append("project_location")
+            if not (info_actual.get("nombre") or name):        
+                missing.append("nombre")
+                
+            if not (info_actual.get("barrio") or user_barrio): 
+                missing.append("barrio")
+                
+            if not (info_actual.get("telefono") or phone):     
+                missing.append("celular")
+                
+            if not (conv_data.get("project_location") or proj_loc): 
+                missing.append("project_location")
+            
             if missing:
                 texto = (build_project_location_request()
                         if missing == ["project_location"]
                         else build_contact_request(missing))
+        
         texto = add_location_note_if_needed(texto)
 
         # 6) Guardar turnos
