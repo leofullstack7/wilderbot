@@ -33,6 +33,57 @@ import time
 from typing import Optional, Dict, Any, List
 
 
+
+
+# =========================================================
+#  Listas de validación de nombres
+# =========================================================
+
+# Nombres comunes colombianos (muestra - expandir según necesidad)
+NOMBRES_VALIDOS = {
+    # Nombres masculinos comunes
+    "julian", "julián", "carlos", "juan", "andrés", "andres", "david", "daniel", 
+    "luis", "miguel", "jose", "josé", "fernando", "sergio", "oscar", "óscar",
+    "jorge", "alberto", "ricardo", "eduardo", "alejandro", "pablo", "diego",
+    "santiago", "sebastián", "sebastian", "camilo", "felipe", "leonardo",
+    
+    # Nombres femeninos comunes
+    "maria", "maría", "carolina", "andrea", "laura", "claudia", "paola",
+    "diana", "natalia", "monica", "mónica", "patricia", "sandra", "luz",
+    "angela", "ángela", "cristina", "martha", "marta", "gloria", "helena",
+    "juliana", "marcela", "jennifer", "catalina", "daniela", "valentina",
+    
+    # Apellidos comunes colombianos
+    "rodriguez", "rodríguez", "martinez", "martínez", "garcia", "garcía",
+    "lopez", "lópez", "gonzalez", "gonzález", "hernandez", "hernández",
+    "diaz", "díaz", "perez", "pérez", "torres", "ramirez", "ramírez",
+    "flores", "rivera", "gomez", "gómez", "moreno", "jimenez", "jiménez",
+    "alvarez", "álvarez", "ruiz", "sanchez", "sánchez", "castro", "ortiz",
+    "buitrago", "vargas", "mendoza", "rojas", "morales", "delgado"
+}
+
+# Palabras que NUNCA son nombres (anti-patrones)
+NO_SON_NOMBRES = {
+    # Saludos y respuestas comunes
+    "hola", "buenas", "claro", "si", "sí", "no", "ok", "okay", "vale",
+    "gracias", "perfecto", "listo", "entiendo", "entendido", "bien", "bueno",
+    
+    # Conectores y muletillas
+    "pues", "entonces", "mira", "aunque", "pero", "sin embargo", "además",
+    "ademas", "igual", "tal vez", "talvez", "quizas", "quizás",
+    
+    # Pronombres y artículos
+    "yo", "tu", "tú", "el", "él", "ella", "nosotros", "ustedes", "ellos",
+    "mi", "tu", "su", "nuestro", "este", "ese", "aquel",
+    
+    # Verbos comunes en primera persona
+    "vivo", "resido", "soy", "estoy", "tengo", "quiero", "necesito",
+    "quisiera", "propongo", "sugiero", "creo",
+    
+    # Otros
+    "señor", "señora", "don", "doña", "doctor", "doctora"
+}
+
 # =========================================================
 #  Config
 # =========================================================
@@ -834,53 +885,155 @@ def summarize_conversation_brief(mensajes: List[Dict[str, str]], max_chars: int 
     return _clamp_summary(out, max_chars)
 
 
+def summarize_conversation_full(mensajes: List[Dict[str, str]], max_chars: int = 500) -> str:
+    """
+    Resume TODA la conversación de forma detallada (~500 caracteres).
+    
+    Incluye:
+    - Propuesta/consulta principal
+    - Argumentos dados
+    - Ubicación del proyecto
+    - Estado del flujo (datos recopilados)
+    - Respuestas clave del bot
+    
+    Para mostrar en botón "Ver Resumen Completo" del front.
+    """
+    if not mensajes:
+        return "No hay conversación para resumir."
+    
+    # Construir transcripción completa (últimos 60 mensajes)
+    parts = []
+    for m in mensajes[-60:]:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        # Ocultar datos sensibles
+        content = re.sub(r"\+?\d[\d\s\-]{6,}", "[teléfono]", content)
+        content = re.sub(r"\b3\d{9}\b", "[teléfono]", content)  # Celulares colombianos
+        
+        tag = "Ciudadano" if role == "user" else "Wilder" if role == "assistant" else role
+        parts.append(f"{tag}: {content}")
+    
+    transcript = "\n".join(parts)
+    
+    sys = (
+        "Eres un asistente que resume conversaciones cívicas de forma detallada.\n"
+        "Devuelve un resumen en español de MÁXIMO 500 caracteres.\n\n"
+        "Incluye:\n"
+        "1. Tipo de interacción (consulta o propuesta)\n"
+        "2. Tema principal y detalles clave\n"
+        "3. Si es propuesta: ubicación, argumentos, estado del flujo\n"
+        "4. Respuestas o compromisos del representante\n\n"
+        "NO incluyas:\n"
+        "- Nombres de personas\n"
+        "- Teléfonos (ya están ocultados como [teléfono])\n"
+        "- Saludos o mensajes triviales\n\n"
+        "Sé conciso pero informativo. Usa oraciones completas."
+    )
+    
+    usr = f"Transcripción completa:\n{transcript}\n\nEscribe el resumen detallado (≤500 caracteres):"
+    
+    try:
+        out = client.chat.completions.create(
+            model=OPENAI_MODEL_SUMMARY,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
+            temperature=0.2,
+            max_tokens=180,  # ~500 chars en español
+        ).choices[0].message.content
+    except Exception as e:
+        # Fallback: tomar los primeros mensajes del ciudadano
+        user_msgs = [m.get("content", "") for m in mensajes if m.get("role") == "user"]
+        out = " | ".join(user_msgs[:3])[:max_chars]
+    
+    return _clamp_summary(out, max_chars)
+
+
 # =========================================================
 #  Extracciones específicas
 # =========================================================
 
+def _validate_name(candidate: str) -> bool:
+    """
+    Valida si un candidato es realmente un nombre usando listas de validación.
+    
+    Retorna True si:
+    - Tiene al menos una palabra en NOMBRES_VALIDOS, O
+    - Tiene 2+ palabras capitalizadas y ninguna en NO_SON_NOMBRES
+    """
+    if not candidate or len(candidate.strip()) < 2:
+        return False
+    
+    palabras = candidate.split()
+    palabras_norm = [_normalize_text(p) for p in palabras]
+    
+    # BLOQUEO 1: Si alguna palabra está en la lista negra, rechazar inmediatamente
+    if any(p in NO_SON_NOMBRES for p in palabras_norm):
+        return False
+    
+    # VALIDACIÓN 2: Al menos una palabra debe estar en lista de nombres válidos
+    tiene_nombre_valido = any(p in NOMBRES_VALIDOS for p in palabras_norm)
+    
+    # VALIDACIÓN 3: Si tiene 2+ palabras capitalizadas, es probable que sea nombre+apellido
+    tiene_estructura_nombre = (
+        len(palabras) >= 2 and
+        all(p[0].isupper() for p in palabras if len(p) > 0)
+    )
+    
+    return tiene_nombre_valido or tiene_estructura_nombre
+
+
 def extract_user_name(text: str) -> Optional[str]:
-    # 1) Formas explícitas
-    m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40})', text, flags=re.IGNORECASE)
+    """
+    Extrae el nombre del usuario con validación robusta.
+    
+    Versión mejorada que:
+    1. Usa múltiples patrones regex
+    2. Valida cada candidato con listas de nombres válidos
+    3. Rechaza anti-patrones (saludos, conectores, verbos)
+    """
+    
+    # PATRÓN 1: Formas explícitas ("soy X", "me llamo X", "mi nombre es X")
+    m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,3})(?=\s+(?:del|de|en|y|,)|$)', text, flags=re.IGNORECASE)
     if m:
         nombre = m.group(1).strip(" .,")
-        return nombre if _normalize_text(nombre) not in DISCOURSE_START_WORDS else None
+        if _validate_name(nombre):
+            return nombre
 
-    # 2) Nombre suelto al inicio
+    # PATRÓN 2: Nombre al inicio antes de coma/conectores
     m = re.search(
-        r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)',
+        r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+resido\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)',
         text
     )
     if m:
         posible = m.group(1).strip()
-        low = _normalize_text(posible)
-        if low in DISCOURSE_START_WORDS:
-            return None
-        if len(posible.split()) == 1 and len(posible) <= 3:
-            return None
-        return posible
+        if _validate_name(posible) and len(posible) > 3:
+            return posible
 
-    # 3) Conectores tipo “Claro/Gracias/Ok … [Nombre] … vivo/soy/mi número…”
+    # PATRÓN 3: "Claro/Gracias/Ok, [NOMBRE], vivo/resido..."
+    # Este era el patrón problemático que capturaba "Entiendo"
     m = re.search(
-        r'(?:^|[,;]\s*)(?:[A-Za-zÁÉÍÓÚÑáéíóúñ ]{0,20})?(?:claro(?:\s+que\s+s[ií])?|gracias|vale|ok|okay|perfecto|listo|de acuerdo)\s*,?\s*'
+        r'(?:^|[,;]\s*)(?:claro(?:\s+que\s+s[ií])?|gracias|vale|ok|okay|perfecto|listo|de acuerdo)\s*[,.]?\s+'
         r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*,?\s*'
         r'(?:vivo|resido|mi\s+(?:n[uú]mero|tel[eé]fono|celular)|soy)\b',
         text, flags=re.IGNORECASE
     )
     if m:
-        return m.group(1).strip(" .,")
+        candidato = m.group(1).strip(" .,")
+        if _validate_name(candidato):
+            return candidato
 
-    # 4) Fallback: “Nombre Apellido, vivo/resido/mi número/soy…”
+    # PATRÓN 4: Fallback general "Nombre Apellido, vivo/resido/mi número..."
     m = re.search(
         r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*,?\s*(?:vivo|resido|mi\s+(?:n[uú]mero|tel[eé]fono|celular)|soy)\b',
         text, flags=re.IGNORECASE
     )
     if m:
         posible = m.group(1).strip(" .,")
-        return posible if _normalize_text(posible) not in DISCOURSE_START_WORDS else None
+        if _validate_name(posible):
+            return posible
 
     return None
-
-
 
 def extract_phone(text: str) -> Optional[str]:
     # permite capturar con prefijos largos
@@ -2632,6 +2785,92 @@ async def clasificar(body: ClasificarIn):
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# =========================================================
+#  Endpoint: Resumen Completo
+# =========================================================
+
+class ResumenCompletoIn(BaseModel):
+    chat_id: str
+
+@app.post("/resumen_completo")
+async def get_resumen_completo(body: ResumenCompletoIn):
+    """
+    Endpoint para obtener un resumen detallado de la conversación.
+    
+    Retorna:
+    - resumen: Texto del resumen completo (~500 chars)
+    - resumen_breve: Texto del resumen corto (~100 chars)
+    - categoria: Categoría de la propuesta/consulta
+    - titulo: Título de la propuesta/consulta
+    - tono: Tono detectado
+    - barrio_proyecto: Ubicación del proyecto (si aplica)
+    - barrio_residencia: Barrio de residencia del usuario (si aplica)
+    - contacto: Info de contacto (si fue recopilada)
+    """
+    try:
+        chat_id = body.chat_id
+        
+        # Obtener conversación de Firestore
+        conv_ref = db.collection("conversaciones").document(chat_id)
+        snap = conv_ref.get()
+        
+        if not snap.exists:
+            return {"error": "Conversación no encontrada", "ok": False}
+        
+        conv_data = snap.to_dict() or {}
+        mensajes = conv_data.get("mensajes", [])
+        
+        if not mensajes:
+            return {"error": "No hay mensajes en esta conversación", "ok": False}
+        
+        # Generar resúmenes
+        resumen_completo = summarize_conversation_full(mensajes, max_chars=500)
+        resumen_breve = conv_data.get("resumen") or summarize_conversation_brief(mensajes, max_chars=100)
+        
+        # Extraer metadata
+        categoria = conv_data.get("categoria_general", [])
+        if isinstance(categoria, list):
+            categoria = categoria[0] if categoria else "Sin categoría"
+        
+        titulo = conv_data.get("titulo_propuesta", [])
+        if isinstance(titulo, list):
+            titulo = titulo[0] if titulo else "Sin título"
+        
+        tono = conv_data.get("tono_detectado") or "neutral"
+        
+        barrio_proyecto = conv_data.get("project_location")
+        contact_info = conv_data.get("contact_info") or {}
+        barrio_residencia = contact_info.get("barrio")
+        
+        # Info de contacto (sin teléfono completo por privacidad)
+        contacto = {}
+        if contact_info.get("nombre"):
+            contacto["nombre"] = contact_info["nombre"]
+        if barrio_residencia:
+            contacto["barrio"] = barrio_residencia
+        if contact_info.get("telefono"):
+            # Mostrar solo últimos 4 dígitos
+            tel = contact_info["telefono"]
+            contacto["telefono_parcial"] = "***" + tel[-4:] if len(tel) > 4 else "***"
+        
+        return {
+            "ok": True,
+            "resumen_completo": resumen_completo,
+            "resumen_breve": resumen_breve,
+            "categoria": categoria,
+            "titulo": titulo,
+            "tono": tono,
+            "barrio_proyecto": barrio_proyecto,
+            "barrio_residencia": barrio_residencia,
+            "contacto": contacto,
+            "total_mensajes": len(mensajes)
+        }
+        
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 
 # =========================================================
 #  Arranque local
