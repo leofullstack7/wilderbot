@@ -1562,10 +1562,10 @@ async def responder(data: Entrada):
             ])
             return {"respuesta": fast_response, "fuentes": [], "chat_id": chat_id}
         
-# Smart Path: Clasificación rápida con contexto resumido
+        # Smart Path: Clasificación rápida con contexto resumido
         # ═══════════════════════════════════════════════════════════════════════
 
-        # Obtener resumen en caliente
+# Obtener resumen en caliente
         resumen_contexto = conv_data.get("conversacion_resumida", "")
 
         # PRIMERO: Verificar si ya estamos en flujo de propuesta
@@ -1576,75 +1576,73 @@ async def responder(data: Entrada):
             conv_data.get("contact_intent") == "propuesta"
         )
 
-        # SEGUNDO: Solo clasificar si NO hay flujo activo de propuesta
-        if not already_in_proposal_flow:
-            # Clasificación inteligente híbrida
-            clasificacion = smart_classify_with_context(data.mensaje, resumen_contexto, conv_data)
+        # SEGUNDO: SIEMPRE clasificar (independiente del flujo)
+        clasificacion = smart_classify_with_context(data.mensaje, resumen_contexto, conv_data)
+        
+        # TERCERO: Si NO hay flujo activo Y es consulta → responder y salir
+        if not already_in_proposal_flow and clasificacion["tipo"] == "consulta":
+            # Limpia cualquier estado residual de propuesta
+            conv_ref.update({
+                "proposal_requested": False,
+                "proposal_collected": False,
+                "argument_requested": False,
+                "argument_collected": False,
+                "contact_intent": None,
+                "contact_requested": False,
+                "awaiting_topic_confirm": False,
+                "ultima_fecha": firestore.SERVER_TIMESTAMP
+            })
             
-            # === CRÍTICO: Si es CONSULTA, responder INMEDIATAMENTE y salir ===
-            if clasificacion["tipo"] == "consulta":
-                # Limpia cualquier estado residual de propuesta
-                conv_ref.update({
-                    "proposal_requested": False,
-                    "proposal_collected": False,
-                    "argument_requested": False,
-                    "argument_collected": False,
-                    "contact_intent": None,
-                    "contact_requested": False,
-                    "awaiting_topic_confirm": False,
-                    "ultima_fecha": firestore.SERVER_TIMESTAMP
-                })
-                
-                # Marcar como consulta en BD
-                conv_ref.set({
-                    "categoria_general": ["Consulta"],
-                    "titulo_propuesta": ["General"]
-                }, merge=True)
-                
-                # RAG y respuesta directa para consulta
-                historial_completo = load_historial_para_prompt(conv_ref)
-                
-                # Reformular query con contexto
-                query_reformulada = reformulate_query_with_context(
-                    data.mensaje,
-                    historial_completo,
-                    max_history=6
-                )
-                
-                # Buscar con query reformulada
-                hits = rag_search(query_reformulada, top_k=5)
-                
-                # Construir mensajes para respuesta
-                historial = load_historial_para_prompt(conv_ref)
-                msgs = build_consulta_messages(
-                    data.mensaje,
-                    [h["texto"] for h in hits],
-                    historial
-                )
-                
-                # Generar respuesta
-                completion = client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=msgs,
-                    temperature=0.2,
-                    max_tokens=240
-                )
-                texto = limit_sentences(completion.choices[0].message.content.strip(), 3)
-                texto = strip_contact_requests(texto)
-                
-                # Guardar y retornar
-                append_mensajes(conv_ref, [
-                    {"role": "user", "content": data.mensaje},
-                    {"role": "assistant", "content": texto}
-                ])
-                return {"respuesta": texto, "fuentes": hits, "chat_id": chat_id}
-        else:
-            # Ya hay flujo activo de propuesta, mantenerlo
-            clasificacion = {
-                "tipo": "propuesta",
-                "confianza": "alta",
-                "metodo": "flujo_activo"
-            }
+            # Marcar como consulta en BD
+            conv_ref.set({
+                "categoria_general": ["Consulta"],
+                "titulo_propuesta": ["General"]
+            }, merge=True)
+            
+            # RAG y respuesta directa para consulta
+            historial_completo = load_historial_para_prompt(conv_ref)
+            
+            # Reformular query con contexto
+            query_reformulada = reformulate_query_with_context(
+                data.mensaje,
+                historial_completo,
+                max_history=6
+            )
+            
+            # Buscar con query reformulada
+            hits = rag_search(query_reformulada, top_k=5)
+            
+            # Construir mensajes para respuesta
+            historial = load_historial_para_prompt(conv_ref)
+            msgs = build_consulta_messages(
+                data.mensaje,
+                [h["texto"] for h in hits],
+                historial
+            )
+            
+            # Generar respuesta
+            completion = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=msgs,
+                temperature=0.2,
+                max_tokens=240
+            )
+            texto = limit_sentences(completion.choices[0].message.content.strip(), 3)
+            texto = strip_contact_requests(texto)
+            
+            # Guardar y retornar
+            append_mensajes(conv_ref, [
+                {"role": "user", "content": data.mensaje},
+                {"role": "assistant", "content": texto}
+            ])
+            return {"respuesta": texto, "fuentes": hits, "chat_id": chat_id}
+        
+        # CUARTO: Si hay flujo activo, forzar tipo propuesta
+        if already_in_proposal_flow:
+            clasificacion["tipo"] = "propuesta"
+            clasificacion["confianza"] = "alta"
+            clasificacion["metodo"] = "flujo_activo"
+            
 
         # --- NEGACIÓN explícita de propuesta: resetea subflujo y no pidas nada más ---
         if is_proposal_denial(data.mensaje):
