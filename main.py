@@ -1080,38 +1080,97 @@ def extract_user_barrio(text: str) -> Optional[str]:
     return None
 
 
-def llm_extract_contact_info(text: str) -> Dict[str, Optional[str]]:
+def llm_extract_contact_info(text: str, info_actual: Dict[str, Optional[str]] = None) -> Dict[str, Optional[str]]:
     """
-    Usa LLM para extraer nombre, barrio y teléfono cuando el usuario
-    los da todos juntos sin formato claro.
+    Extractor inteligente de datos de contacto usando LLM.
+    Maneja CUALQUIER forma de expresión del usuario.
     """
+    info_actual = info_actual or {}
+    
     sys = (
-        "Extrae información de contacto del mensaje.\n"
-        "Devuelve SOLO JSON con claves: nombre, barrio, telefono\n"
-        "Si algo no está presente, usa null.\n\n"
-        "Ejemplos:\n"
-        "- 'Juliana Salazar, vivo en Miñitas, 3168207240' → {\"nombre\": \"Juliana Salazar\", \"barrio\": \"Miñitas\", \"telefono\": \"3168207240\"}\n"
-        "- 'Juan Pérez del barrio Centro' → {\"nombre\": \"Juan Pérez\", \"barrio\": \"Centro\", \"telefono\": null}\n"
-        "- 'Mi número es 3001234567' → {\"nombre\": null, \"barrio\": null, \"telefono\": \"3001234567\"}\n"
+        "Eres un extractor experto de información de contacto.\n"
+        "Tu trabajo es identificar NOMBRE COMPLETO, BARRIO DE RESIDENCIA y TELÉFONO en mensajes informales.\n\n"
+        
+        "REGLAS CRÍTICAS:\n"
+        "1. NOMBRE: Solo nombres propios de personas (2-4 palabras)\n"
+        "   - Acepta: 'Manuel Arango', 'María del Carmen López'\n"
+        "   - Rechaza: 'Hola', 'Claro', 'Ok', 'La Francia' (es barrio)\n"
+        
+        "2. BARRIO: Nombre del lugar donde VIVE la persona\n"
+        "   - Palabras clave: 'vivo en', 'resido en', 'soy de', 'del barrio'\n"
+        "   - Acepta: 'La Francia', 'San José', 'Centro', 'Aranjuez'\n"
+        "   - Rechaza: nombres de personas\n"
+        
+        "3. TELÉFONO: 8-12 dígitos (con o sin prefijos/espacios)\n"
+        "   - Acepta: '3154628963', '+57 315 462 8963', '300-123-4567'\n"
+        "   - Normaliza: quita espacios, guiones, paréntesis, prefijos +57/0057\n\n"
+        
+        "CASOS ESPECIALES:\n"
+        "- Si el mensaje es solo 'no', 'prefiero no', 'no quiero' → devuelve todo null\n"
+        "- Si menciona un dato que YA TENÍAMOS, ignóralo (null)\n"
+        "- Si algo no está claro, usa null (NO inventes)\n\n"
+        
+        "FORMATO DE SALIDA:\n"
+        "Devuelve SOLO JSON válido sin markdown:\n"
+        '{"nombre": "...", "barrio": "...", "telefono": "..."}\n\n'
+        
+        "EJEMPLOS:\n"
+        "Mensaje: 'Claro, Manuel Arango, vivo en La Francia y 3154628963'\n"
+        '→ {"nombre": "Manuel Arango", "barrio": "La Francia", "telefono": "3154628963"}\n\n'
+        
+        "Mensaje: 'Ok, soy Juan del barrio Centro'\n"
+        '→ {"nombre": "Juan", "barrio": "Centro", "telefono": null}\n\n'
+        
+        "Mensaje: 'Mi número es 300 555 1234'\n"
+        '→ {"nombre": null, "barrio": null, "telefono": "3005551234"}\n\n'
+        
+        "Mensaje: 'No quiero dar mis datos'\n"
+        '→ {"nombre": null, "barrio": null, "telefono": null}\n'
     )
     
-    usr = f"Mensaje: {text}\n\nExtrae la información y devuelve el JSON."
+    context = ""
+    if info_actual:
+        context = f"\n\nDatos que YA TENEMOS (ignóralos si se repiten):\n"
+        if info_actual.get("nombre"):
+            context += f"- Nombre: {info_actual['nombre']}\n"
+        if info_actual.get("barrio"):
+            context += f"- Barrio: {info_actual['barrio']}\n"
+        if info_actual.get("telefono"):
+            context += f"- Teléfono: {info_actual['telefono']}\n"
+    
+    usr = f"Mensaje del usuario:\n{text}{context}\n\nExtrae SOLO los datos NUEVOS y devuelve el JSON."
     
     try:
         out = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
             temperature=0.0,
-            max_tokens=150
+            max_tokens=200,
+            timeout=3
         ).choices[0].message.content.strip()
         
+        # Limpiar markdown si viene con ```json
+        out = out.replace("```json", "").replace("```", "").strip()
+        
         data = json.loads(out)
+        
+        # Normalizar teléfono si viene
+        if data.get("telefono"):
+            tel = re.sub(r'\D', '', data["telefono"])
+            tel = re.sub(r'^(?:00)?57', '', tel)  # Quitar prefijo Colombia
+            data["telefono"] = tel if 8 <= len(tel) <= 12 else None
+        
         return {
             "nombre": data.get("nombre"),
             "barrio": data.get("barrio"),
             "telefono": data.get("telefono")
         }
-    except:
+    
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] LLM extract JSON parse failed: {out[:200]}")
+        return {"nombre": None, "barrio": None, "telefono": None}
+    except Exception as e:
+        print(f"[ERROR] LLM extract failed: {e}")
         return {"nombre": None, "barrio": None, "telefono": None}
 
 def _titlecase(s: str) -> str:
@@ -1404,6 +1463,59 @@ def build_contact_request(missing: List[str]) -> str:
         return "¿Me confirmas por favor los datos pendientes?"
     frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
     return f"Para escalar y darle seguimiento, ¿me compartes {frase}? Lo usamos solo para informarte avances."
+
+
+def build_contact_reminder(missing: List[str], attempt: int) -> str:
+    """
+    Genera recordatorios graduales para datos faltantes.
+    
+    Args:
+        missing: Lista de datos faltantes ['nombre', 'barrio', 'celular']
+        attempt: Número de intento (1, 2, 3...)
+    
+    Returns:
+        Mensaje apropiado según el intento
+    """
+    etiquetas = {
+        "nombre": "tu nombre",
+        "barrio": "tu barrio de residencia",
+        "celular": "tu número de contacto"
+    }
+    
+    pedir = [etiquetas[m] for m in missing if m in etiquetas]
+    
+    if not pedir:
+        return "¿Me confirmas los datos por favor?"
+    
+    if len(pedir) == 1:
+        frase = pedir[0]
+    else:
+        frase = ", ".join(pedir[:-1]) + " y " + pedir[-1]
+    
+    # Intento 1: Solicitud cordial inicial
+    if attempt == 1:
+        return f"Para escalar y darle seguimiento, ¿me compartes {frase}? Lo usamos solo para informarte avances."
+    
+    # Intento 2: Recordatorio amable con ejemplos
+    elif attempt == 2:
+        ejemplos = []
+        if "nombre" in missing:
+            ejemplos.append("tu nombre (ej: Juan Pérez)")
+        if "barrio" in missing:
+            ejemplos.append("el barrio donde vives (ej: La Francia)")
+        if "celular" in missing:
+            ejemplos.append("tu celular (ej: 300 123 4567)")
+        
+        ejemplo_str = ", ".join(ejemplos)
+        return f"Para ayudarte necesito {frase}. Por ejemplo: {ejemplo_str}. ¿Me los compartes?"
+    
+    # Intento 3+: Opción de continuar sin datos
+    else:
+        return (
+            f"Entiendo si prefieres no compartir {frase}. "
+            "Si quieres que escalemos tu propuesta, necesitamos al menos un número de contacto. "
+            "De lo contrario, puedes contarme otra cosa en la que te pueda ayudar."
+        )
 
 
 # NUEVO: pedir SOLO el barrio del proyecto con un tono distinto al de contacto
@@ -1900,19 +2012,33 @@ async def responder(data: Entrada):
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
         # === EXTRAER datos sueltos del texto ===
-        name = extract_user_name(data.mensaje)
-        phone = extract_phone(data.mensaje)
-        user_barrio = extract_user_barrio(data.mensaje)
-        proj_loc = extract_project_location(data.mensaje)
-        # Si ya pedimos contacto y el usuario respondió sin formato claro, usa LLM
-        if conv_data.get("contact_requested") and not (name or phone or user_barrio):
-            llm_data = llm_extract_contact_info(data.mensaje)
-            if llm_data.get("nombre"):
+        # NUEVO: Siempre usar LLM inteligente cuando estamos pidiendo datos
+        name = None
+        phone = None
+        user_barrio = None
+        
+        if conv_data.get("contact_requested"):
+            # Usar LLM inteligente con contexto de datos actuales
+            info_actual = conv_data.get("contact_info") or {}
+            llm_data = llm_extract_contact_info(data.mensaje, info_actual)
+            
+            # Solo tomar datos NUEVOS (que no teníamos antes)
+            if llm_data.get("nombre") and not info_actual.get("nombre"):
                 name = llm_data["nombre"]
-            if llm_data.get("telefono"):
+            if llm_data.get("telefono") and not info_actual.get("telefono"):
                 phone = llm_data["telefono"]
-            if llm_data.get("barrio"):
+            if llm_data.get("barrio") and not info_actual.get("barrio"):
                 user_barrio = llm_data["barrio"]
+            
+            print(f"[EXTRACT] LLM extrajo: nombre={name}, barrio={user_barrio}, tel={phone}")
+        else:
+            # Fuera del flujo de contacto, usamos las funciones regex rápidas
+            name = extract_user_name(data.mensaje)
+            phone = extract_phone(data.mensaje)
+            user_barrio = extract_user_barrio(data.mensaje)
+        
+        # Ubicación del proyecto (siempre intentar extraer)
+        proj_loc = extract_project_location(data.mensaje)
         if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
             conv_ref.update({"project_location": proj_loc})
 
@@ -1961,6 +2087,33 @@ async def responder(data: Entrada):
                     data.canal,
                     new_info.get("barrio") or user_barrio       # <-- barrio a usuarios
             )
+            
+            # NUEVO: Si estamos pidiendo datos y recibimos algunos (pero no todos), responder inteligentemente
+            if conv_data.get("contact_requested"):
+                still_missing = []
+                if not new_info.get("nombre"): still_missing.append("nombre")
+                if not new_info.get("barrio"): still_missing.append("barrio")
+                if not new_info.get("telefono"): still_missing.append("celular")
+                
+                if still_missing and partials:
+                    # Recibimos algo pero falta más
+                    recibido = []
+                    if name: recibido.append("nombre")
+                    if user_barrio: recibido.append("barrio")
+                    if phone: recibido.append("celular")
+                    
+                    # Reiniciar contador de intentos porque dio algo
+                    conv_ref.update({"contact_request_attempts": 0})
+                    
+                    texto_recibido = "Gracias. "
+                    # Solo pedir lo que falta (sin repetir)
+                    texto = build_contact_reminder(still_missing, 1)
+                    
+                    append_mensajes(conv_ref, [
+                        {"role":"user","content": data.mensaje},
+                        {"role":"assistant","content": texto_recibido + texto}
+                    ])
+                    return {"respuesta": texto_recibido + texto, "fuentes": [], "chat_id": chat_id}
 
 
                 # --- AUTO-CIERRE si ya teníamos pedido de contacto y ahora se completó tel + ubicación ---
@@ -2287,9 +2440,32 @@ async def responder(data: Entrada):
                 if not (info_actual.get("nombre") or name):        missing.append("nombre")
                 if not (info_actual.get("barrio") or user_barrio): missing.append("barrio")
                 if not (info_actual.get("telefono") or phone):     missing.append("celular")
+                
                 if missing:
-                    conv_ref.update({"contact_requested": True})
-                    texto = build_contact_request(missing)
+                    # NUEVO: Sistema de recordatorios graduales
+                    attempt_count = int(conv_data.get("contact_request_attempts") or 0) + 1
+                    conv_ref.update({
+                        "contact_requested": True,
+                        "contact_request_attempts": attempt_count
+                    })
+                    
+                    # Usar recordatorio apropiado según el intento
+                    texto = build_contact_reminder(missing, attempt_count)
+                    
+                    # Si ya llevamos 3+ intentos y el usuario no dio nada, aceptar y salir
+                    if attempt_count >= 3:
+                        # Verificar si el usuario dio ALGO en este turno
+                        if not (name or user_barrio or phone):
+                            conv_ref.update({
+                                "contact_refused": True,
+                                "contact_requested": False
+                            })
+                            texto = (
+                                "Entiendo tu decisión. "
+                                "Si más adelante decides compartir tus datos, estaré aquí para ayudarte. "
+                                "¿Hay algo más en lo que pueda asistirte?"
+                            )
+                    
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
