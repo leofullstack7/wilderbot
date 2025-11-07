@@ -33,57 +33,6 @@ import time
 from typing import Optional, Dict, Any, List
 
 
-
-
-# =========================================================
-#  Listas de validación de nombres
-# =========================================================
-
-# Nombres comunes colombianos (muestra - expandir según necesidad)
-NOMBRES_VALIDOS = {
-    # Nombres masculinos comunes
-    "julian", "julián", "carlos", "juan", "andrés", "andres", "david", "daniel", 
-    "luis", "miguel", "jose", "josé", "fernando", "sergio", "oscar", "óscar",
-    "jorge", "alberto", "ricardo", "eduardo", "alejandro", "pablo", "diego",
-    "santiago", "sebastián", "sebastian", "camilo", "felipe", "leonardo",
-    
-    # Nombres femeninos comunes
-    "maria", "maría", "carolina", "andrea", "laura", "claudia", "paola",
-    "diana", "natalia", "monica", "mónica", "patricia", "sandra", "luz",
-    "angela", "ángela", "cristina", "martha", "marta", "gloria", "helena",
-    "juliana", "marcela", "jennifer", "catalina", "daniela", "valentina",
-    
-    # Apellidos comunes colombianos
-    "rodriguez", "rodríguez", "martinez", "martínez", "garcia", "garcía",
-    "lopez", "lópez", "gonzalez", "gonzález", "hernandez", "hernández",
-    "diaz", "díaz", "perez", "pérez", "torres", "ramirez", "ramírez",
-    "flores", "rivera", "gomez", "gómez", "moreno", "jimenez", "jiménez",
-    "alvarez", "álvarez", "ruiz", "sanchez", "sánchez", "castro", "ortiz",
-    "buitrago", "vargas", "mendoza", "rojas", "morales", "delgado"
-}
-
-# Palabras que NUNCA son nombres (anti-patrones)
-NO_SON_NOMBRES = {
-    # Saludos y respuestas comunes
-    "hola", "buenas", "claro", "si", "sí", "no", "ok", "okay", "vale",
-    "gracias", "perfecto", "listo", "entiendo", "entendido", "bien", "bueno",
-    
-    # Conectores y muletillas
-    "pues", "entonces", "mira", "aunque", "pero", "sin embargo", "además",
-    "ademas", "igual", "tal vez", "talvez", "quizas", "quizás",
-    
-    # Pronombres y artículos
-    "yo", "tu", "tú", "el", "él", "ella", "nosotros", "ustedes", "ellos",
-    "mi", "tu", "su", "nuestro", "este", "ese", "aquel",
-    
-    # Verbos comunes en primera persona
-    "vivo", "resido", "soy", "estoy", "tengo", "quiero", "necesito",
-    "quisiera", "propongo", "sugiero", "creo",
-    
-    # Otros
-    "señor", "señora", "don", "doña", "doctor", "doctora"
-}
-
 # =========================================================
 #  Config
 # =========================================================
@@ -885,155 +834,53 @@ def summarize_conversation_brief(mensajes: List[Dict[str, str]], max_chars: int 
     return _clamp_summary(out, max_chars)
 
 
-def summarize_conversation_full(mensajes: List[Dict[str, str]], max_chars: int = 500) -> str:
-    """
-    Resume TODA la conversación de forma detallada (~500 caracteres).
-    
-    Incluye:
-    - Propuesta/consulta principal
-    - Argumentos dados
-    - Ubicación del proyecto
-    - Estado del flujo (datos recopilados)
-    - Respuestas clave del bot
-    
-    Para mostrar en botón "Ver Resumen Completo" del front.
-    """
-    if not mensajes:
-        return "No hay conversación para resumir."
-    
-    # Construir transcripción completa (últimos 60 mensajes)
-    parts = []
-    for m in mensajes[-60:]:
-        role = m.get("role")
-        content = (m.get("content") or "").strip()
-        if not content:
-            continue
-        # Ocultar datos sensibles
-        content = re.sub(r"\+?\d[\d\s\-]{6,}", "[teléfono]", content)
-        content = re.sub(r"\b3\d{9}\b", "[teléfono]", content)  # Celulares colombianos
-        
-        tag = "Ciudadano" if role == "user" else "Wilder" if role == "assistant" else role
-        parts.append(f"{tag}: {content}")
-    
-    transcript = "\n".join(parts)
-    
-    sys = (
-        "Eres un asistente que resume conversaciones cívicas de forma detallada.\n"
-        "Devuelve un resumen en español de MÁXIMO 500 caracteres.\n\n"
-        "Incluye:\n"
-        "1. Tipo de interacción (consulta o propuesta)\n"
-        "2. Tema principal y detalles clave\n"
-        "3. Si es propuesta: ubicación, argumentos, estado del flujo\n"
-        "4. Respuestas o compromisos del representante\n\n"
-        "NO incluyas:\n"
-        "- Nombres de personas\n"
-        "- Teléfonos (ya están ocultados como [teléfono])\n"
-        "- Saludos o mensajes triviales\n\n"
-        "Sé conciso pero informativo. Usa oraciones completas."
-    )
-    
-    usr = f"Transcripción completa:\n{transcript}\n\nEscribe el resumen detallado (≤500 caracteres):"
-    
-    try:
-        out = client.chat.completions.create(
-            model=OPENAI_MODEL_SUMMARY,
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
-            temperature=0.2,
-            max_tokens=180,  # ~500 chars en español
-        ).choices[0].message.content
-    except Exception as e:
-        # Fallback: tomar los primeros mensajes del ciudadano
-        user_msgs = [m.get("content", "") for m in mensajes if m.get("role") == "user"]
-        out = " | ".join(user_msgs[:3])[:max_chars]
-    
-    return _clamp_summary(out, max_chars)
-
-
 # =========================================================
 #  Extracciones específicas
 # =========================================================
 
-def _validate_name(candidate: str) -> bool:
-    """
-    Valida si un candidato es realmente un nombre usando listas de validación.
-    
-    Retorna True si:
-    - Tiene al menos una palabra en NOMBRES_VALIDOS, O
-    - Tiene 2+ palabras capitalizadas y ninguna en NO_SON_NOMBRES
-    """
-    if not candidate or len(candidate.strip()) < 2:
-        return False
-    
-    palabras = candidate.split()
-    palabras_norm = [_normalize_text(p) for p in palabras]
-    
-    # BLOQUEO 1: Si alguna palabra está en la lista negra, rechazar inmediatamente
-    if any(p in NO_SON_NOMBRES for p in palabras_norm):
-        return False
-    
-    # VALIDACIÓN 2: Al menos una palabra debe estar en lista de nombres válidos
-    tiene_nombre_valido = any(p in NOMBRES_VALIDOS for p in palabras_norm)
-    
-    # VALIDACIÓN 3: Si tiene 2+ palabras capitalizadas, es probable que sea nombre+apellido
-    tiene_estructura_nombre = (
-        len(palabras) >= 2 and
-        all(p[0].isupper() for p in palabras if len(p) > 0)
-    )
-    
-    return tiene_nombre_valido or tiene_estructura_nombre
-
-
 def extract_user_name(text: str) -> Optional[str]:
-    """
-    Extrae el nombre del usuario con validación robusta.
-    
-    Versión mejorada que:
-    1. Usa múltiples patrones regex
-    2. Valida cada candidato con listas de nombres válidos
-    3. Rechaza anti-patrones (saludos, conectores, verbos)
-    """
-    
-    # PATRÓN 1: Formas explícitas ("soy X", "me llamo X", "mi nombre es X")
-    m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]+){0,3})(?=\s+(?:del|de|en|y|,)|$)', text, flags=re.IGNORECASE)
+    # 1) Formas explícitas
+    m = re.search(r'\b(?:soy|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÑáéíóúñ ]{2,40})', text, flags=re.IGNORECASE)
     if m:
         nombre = m.group(1).strip(" .,")
-        if _validate_name(nombre):
-            return nombre
+        return nombre if _normalize_text(nombre) not in DISCOURSE_START_WORDS else None
 
-    # PATRÓN 2: Nombre al inicio antes de coma/conectores
+    # 2) Nombre suelto al inicio
     m = re.search(
-        r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+resido\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)',
+        r'^\s*([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*(?=,|\s+vivo\b|\s+soy\b|\s+mi\b|\s+desde\b|\s+del\b|\s+de\b)',
         text
     )
     if m:
         posible = m.group(1).strip()
-        if _validate_name(posible) and len(posible) > 3:
-            return posible
+        low = _normalize_text(posible)
+        if low in DISCOURSE_START_WORDS:
+            return None
+        if len(posible.split()) == 1 and len(posible) <= 3:
+            return None
+        return posible
 
-    # PATRÓN 3: "Claro/Gracias/Ok, [NOMBRE], vivo/resido..."
-    # Este era el patrón problemático que capturaba "Entiendo"
+    # 3) Conectores tipo “Claro/Gracias/Ok … [Nombre] … vivo/soy/mi número…”
     m = re.search(
-        r'(?:^|[,;]\s*)(?:claro(?:\s+que\s+s[ií])?|gracias|vale|ok|okay|perfecto|listo|de acuerdo)\s*[,.]?\s+'
+        r'(?:^|[,;]\s*)(?:[A-Za-zÁÉÍÓÚÑáéíóúñ ]{0,20})?(?:claro(?:\s+que\s+s[ií])?|gracias|vale|ok|okay|perfecto|listo|de acuerdo)\s*,?\s*'
         r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*,?\s*'
         r'(?:vivo|resido|mi\s+(?:n[uú]mero|tel[eé]fono|celular)|soy)\b',
         text, flags=re.IGNORECASE
     )
     if m:
-        candidato = m.group(1).strip(" .,")
-        if _validate_name(candidato):
-            return candidato
+        return m.group(1).strip(" .,")
 
-    # PATRÓN 4: Fallback general "Nombre Apellido, vivo/resido/mi número..."
+    # 4) Fallback: “Nombre Apellido, vivo/resido/mi número/soy…”
     m = re.search(
         r'([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\s*,?\s*(?:vivo|resido|mi\s+(?:n[uú]mero|tel[eé]fono|celular)|soy)\b',
         text, flags=re.IGNORECASE
     )
     if m:
         posible = m.group(1).strip(" .,")
-        if _validate_name(posible):
-            return posible
+        return posible if _normalize_text(posible) not in DISCOURSE_START_WORDS else None
 
     return None
+
+
 
 def extract_phone(text: str) -> Optional[str]:
     # permite capturar con prefijos largos
@@ -1080,97 +927,38 @@ def extract_user_barrio(text: str) -> Optional[str]:
     return None
 
 
-def llm_extract_contact_info(text: str, info_actual: Dict[str, Optional[str]] = None) -> Dict[str, Optional[str]]:
+def llm_extract_contact_info(text: str) -> Dict[str, Optional[str]]:
     """
-    Extractor inteligente de datos de contacto usando LLM.
-    Maneja CUALQUIER forma de expresión del usuario.
+    Usa LLM para extraer nombre, barrio y teléfono cuando el usuario
+    los da todos juntos sin formato claro.
     """
-    info_actual = info_actual or {}
-    
     sys = (
-        "Eres un extractor experto de información de contacto.\n"
-        "Tu trabajo es identificar NOMBRE COMPLETO, BARRIO DE RESIDENCIA y TELÉFONO en mensajes informales.\n\n"
-        
-        "REGLAS CRÍTICAS:\n"
-        "1. NOMBRE: Solo nombres propios de personas (2-4 palabras)\n"
-        "   - Acepta: 'Manuel Arango', 'María del Carmen López'\n"
-        "   - Rechaza: 'Hola', 'Claro', 'Ok', 'La Francia' (es barrio)\n"
-        
-        "2. BARRIO: Nombre del lugar donde VIVE la persona\n"
-        "   - Palabras clave: 'vivo en', 'resido en', 'soy de', 'del barrio'\n"
-        "   - Acepta: 'La Francia', 'San José', 'Centro', 'Aranjuez'\n"
-        "   - Rechaza: nombres de personas\n"
-        
-        "3. TELÉFONO: 8-12 dígitos (con o sin prefijos/espacios)\n"
-        "   - Acepta: '3154628963', '+57 315 462 8963', '300-123-4567'\n"
-        "   - Normaliza: quita espacios, guiones, paréntesis, prefijos +57/0057\n\n"
-        
-        "CASOS ESPECIALES:\n"
-        "- Si el mensaje es solo 'no', 'prefiero no', 'no quiero' → devuelve todo null\n"
-        "- Si menciona un dato que YA TENÍAMOS, ignóralo (null)\n"
-        "- Si algo no está claro, usa null (NO inventes)\n\n"
-        
-        "FORMATO DE SALIDA:\n"
-        "Devuelve SOLO JSON válido sin markdown:\n"
-        '{"nombre": "...", "barrio": "...", "telefono": "..."}\n\n'
-        
-        "EJEMPLOS:\n"
-        "Mensaje: 'Claro, Manuel Arango, vivo en La Francia y 3154628963'\n"
-        '→ {"nombre": "Manuel Arango", "barrio": "La Francia", "telefono": "3154628963"}\n\n'
-        
-        "Mensaje: 'Ok, soy Juan del barrio Centro'\n"
-        '→ {"nombre": "Juan", "barrio": "Centro", "telefono": null}\n\n'
-        
-        "Mensaje: 'Mi número es 300 555 1234'\n"
-        '→ {"nombre": null, "barrio": null, "telefono": "3005551234"}\n\n'
-        
-        "Mensaje: 'No quiero dar mis datos'\n"
-        '→ {"nombre": null, "barrio": null, "telefono": null}\n'
+        "Extrae información de contacto del mensaje.\n"
+        "Devuelve SOLO JSON con claves: nombre, barrio, telefono\n"
+        "Si algo no está presente, usa null.\n\n"
+        "Ejemplos:\n"
+        "- 'Juliana Salazar, vivo en Miñitas, 3168207240' → {\"nombre\": \"Juliana Salazar\", \"barrio\": \"Miñitas\", \"telefono\": \"3168207240\"}\n"
+        "- 'Juan Pérez del barrio Centro' → {\"nombre\": \"Juan Pérez\", \"barrio\": \"Centro\", \"telefono\": null}\n"
+        "- 'Mi número es 3001234567' → {\"nombre\": null, \"barrio\": null, \"telefono\": \"3001234567\"}\n"
     )
     
-    context = ""
-    if info_actual:
-        context = f"\n\nDatos que YA TENEMOS (ignóralos si se repiten):\n"
-        if info_actual.get("nombre"):
-            context += f"- Nombre: {info_actual['nombre']}\n"
-        if info_actual.get("barrio"):
-            context += f"- Barrio: {info_actual['barrio']}\n"
-        if info_actual.get("telefono"):
-            context += f"- Teléfono: {info_actual['telefono']}\n"
-    
-    usr = f"Mensaje del usuario:\n{text}{context}\n\nExtrae SOLO los datos NUEVOS y devuelve el JSON."
+    usr = f"Mensaje: {text}\n\nExtrae la información y devuelve el JSON."
     
     try:
         out = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
             temperature=0.0,
-            max_tokens=200,
-            timeout=3
+            max_tokens=150
         ).choices[0].message.content.strip()
         
-        # Limpiar markdown si viene con ```json
-        out = out.replace("```json", "").replace("```", "").strip()
-        
         data = json.loads(out)
-        
-        # Normalizar teléfono si viene
-        if data.get("telefono"):
-            tel = re.sub(r'\D', '', data["telefono"])
-            tel = re.sub(r'^(?:00)?57', '', tel)  # Quitar prefijo Colombia
-            data["telefono"] = tel if 8 <= len(tel) <= 12 else None
-        
         return {
             "nombre": data.get("nombre"),
             "barrio": data.get("barrio"),
             "telefono": data.get("telefono")
         }
-    
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] LLM extract JSON parse failed: {out[:200]}")
-        return {"nombre": None, "barrio": None, "telefono": None}
-    except Exception as e:
-        print(f"[ERROR] LLM extract failed: {e}")
+    except:
         return {"nombre": None, "barrio": None, "telefono": None}
 
 def _titlecase(s: str) -> str:
@@ -1463,59 +1251,6 @@ def build_contact_request(missing: List[str]) -> str:
         return "¿Me confirmas por favor los datos pendientes?"
     frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
     return f"Para escalar y darle seguimiento, ¿me compartes {frase}? Lo usamos solo para informarte avances."
-
-
-def build_contact_reminder(missing: List[str], attempt: int) -> str:
-    """
-    Genera recordatorios graduales para datos faltantes.
-    
-    Args:
-        missing: Lista de datos faltantes ['nombre', 'barrio', 'celular']
-        attempt: Número de intento (1, 2, 3...)
-    
-    Returns:
-        Mensaje apropiado según el intento
-    """
-    etiquetas = {
-        "nombre": "tu nombre",
-        "barrio": "tu barrio de residencia",
-        "celular": "tu número de contacto"
-    }
-    
-    pedir = [etiquetas[m] for m in missing if m in etiquetas]
-    
-    if not pedir:
-        return "¿Me confirmas los datos por favor?"
-    
-    if len(pedir) == 1:
-        frase = pedir[0]
-    else:
-        frase = ", ".join(pedir[:-1]) + " y " + pedir[-1]
-    
-    # Intento 1: Solicitud cordial inicial
-    if attempt == 1:
-        return f"Para escalar y darle seguimiento, ¿me compartes {frase}? Lo usamos solo para informarte avances."
-    
-    # Intento 2: Recordatorio amable con ejemplos
-    elif attempt == 2:
-        ejemplos = []
-        if "nombre" in missing:
-            ejemplos.append("tu nombre (ej: Juan Pérez)")
-        if "barrio" in missing:
-            ejemplos.append("el barrio donde vives (ej: La Francia)")
-        if "celular" in missing:
-            ejemplos.append("tu celular (ej: 300 123 4567)")
-        
-        ejemplo_str = ", ".join(ejemplos)
-        return f"Para ayudarte necesito {frase}. Por ejemplo: {ejemplo_str}. ¿Me los compartes?"
-    
-    # Intento 3+: Opción de continuar sin datos
-    else:
-        return (
-            f"Entiendo si prefieres no compartir {frase}. "
-            "Si quieres que escalemos tu propuesta, necesitamos al menos un número de contacto. "
-            "De lo contrario, puedes contarme otra cosa en la que te pueda ayudar."
-        )
 
 
 # NUEVO: pedir SOLO el barrio del proyecto con un tono distinto al de contacto
@@ -2012,33 +1747,19 @@ async def responder(data: Entrada):
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
 
         # === EXTRAER datos sueltos del texto ===
-        # NUEVO: Siempre usar LLM inteligente cuando estamos pidiendo datos
-        name = None
-        phone = None
-        user_barrio = None
-        
-        if conv_data.get("contact_requested"):
-            # Usar LLM inteligente con contexto de datos actuales
-            info_actual = conv_data.get("contact_info") or {}
-            llm_data = llm_extract_contact_info(data.mensaje, info_actual)
-            
-            # Solo tomar datos NUEVOS (que no teníamos antes)
-            if llm_data.get("nombre") and not info_actual.get("nombre"):
-                name = llm_data["nombre"]
-            if llm_data.get("telefono") and not info_actual.get("telefono"):
-                phone = llm_data["telefono"]
-            if llm_data.get("barrio") and not info_actual.get("barrio"):
-                user_barrio = llm_data["barrio"]
-            
-            print(f"[EXTRACT] LLM extrajo: nombre={name}, barrio={user_barrio}, tel={phone}")
-        else:
-            # Fuera del flujo de contacto, usamos las funciones regex rápidas
-            name = extract_user_name(data.mensaje)
-            phone = extract_phone(data.mensaje)
-            user_barrio = extract_user_barrio(data.mensaje)
-        
-        # Ubicación del proyecto (siempre intentar extraer)
+        name = extract_user_name(data.mensaje)
+        phone = extract_phone(data.mensaje)
+        user_barrio = extract_user_barrio(data.mensaje)
         proj_loc = extract_project_location(data.mensaje)
+        # Si ya pedimos contacto y el usuario respondió sin formato claro, usa LLM
+        if conv_data.get("contact_requested") and not (name or phone or user_barrio):
+            llm_data = llm_extract_contact_info(data.mensaje)
+            if llm_data.get("nombre"):
+                name = llm_data["nombre"]
+            if llm_data.get("telefono"):
+                phone = llm_data["telefono"]
+            if llm_data.get("barrio"):
+                user_barrio = llm_data["barrio"]
         if proj_loc and (conv_data.get("project_location") or "").strip().lower() != proj_loc.lower():
             conv_ref.update({"project_location": proj_loc})
 
@@ -2087,33 +1808,6 @@ async def responder(data: Entrada):
                     data.canal,
                     new_info.get("barrio") or user_barrio       # <-- barrio a usuarios
             )
-            
-            # NUEVO: Si estamos pidiendo datos y recibimos algunos (pero no todos), responder inteligentemente
-            if conv_data.get("contact_requested"):
-                still_missing = []
-                if not new_info.get("nombre"): still_missing.append("nombre")
-                if not new_info.get("barrio"): still_missing.append("barrio")
-                if not new_info.get("telefono"): still_missing.append("celular")
-                
-                if still_missing and partials:
-                    # Recibimos algo pero falta más
-                    recibido = []
-                    if name: recibido.append("nombre")
-                    if user_barrio: recibido.append("barrio")
-                    if phone: recibido.append("celular")
-                    
-                    # Reiniciar contador de intentos porque dio algo
-                    conv_ref.update({"contact_request_attempts": 0})
-                    
-                    texto_recibido = "Gracias. "
-                    # Solo pedir lo que falta (sin repetir)
-                    texto = build_contact_reminder(still_missing, 1)
-                    
-                    append_mensajes(conv_ref, [
-                        {"role":"user","content": data.mensaje},
-                        {"role":"assistant","content": texto_recibido + texto}
-                    ])
-                    return {"respuesta": texto_recibido + texto, "fuentes": [], "chat_id": chat_id}
 
 
                 # --- AUTO-CIERRE si ya teníamos pedido de contacto y ahora se completó tel + ubicación ---
@@ -2440,32 +2134,9 @@ async def responder(data: Entrada):
                 if not (info_actual.get("nombre") or name):        missing.append("nombre")
                 if not (info_actual.get("barrio") or user_barrio): missing.append("barrio")
                 if not (info_actual.get("telefono") or phone):     missing.append("celular")
-                
                 if missing:
-                    # NUEVO: Sistema de recordatorios graduales
-                    attempt_count = int(conv_data.get("contact_request_attempts") or 0) + 1
-                    conv_ref.update({
-                        "contact_requested": True,
-                        "contact_request_attempts": attempt_count
-                    })
-                    
-                    # Usar recordatorio apropiado según el intento
-                    texto = build_contact_reminder(missing, attempt_count)
-                    
-                    # Si ya llevamos 3+ intentos y el usuario no dio nada, aceptar y salir
-                    if attempt_count >= 3:
-                        # Verificar si el usuario dio ALGO en este turno
-                        if not (name or user_barrio or phone):
-                            conv_ref.update({
-                                "contact_refused": True,
-                                "contact_requested": False
-                            })
-                            texto = (
-                                "Entiendo tu decisión. "
-                                "Si más adelante decides compartir tus datos, estaré aquí para ayudarte. "
-                                "¿Hay algo más en lo que pueda asistirte?"
-                            )
-                    
+                    conv_ref.update({"contact_requested": True})
+                    texto = build_contact_request(missing)
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
@@ -2961,92 +2632,6 @@ async def clasificar(body: ClasificarIn):
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
-
-# =========================================================
-#  Endpoint: Resumen Completo
-# =========================================================
-
-class ResumenCompletoIn(BaseModel):
-    chat_id: str
-
-@app.post("/resumen_completo")
-async def get_resumen_completo(body: ResumenCompletoIn):
-    """
-    Endpoint para obtener un resumen detallado de la conversación.
-    
-    Retorna:
-    - resumen: Texto del resumen completo (~500 chars)
-    - resumen_breve: Texto del resumen corto (~100 chars)
-    - categoria: Categoría de la propuesta/consulta
-    - titulo: Título de la propuesta/consulta
-    - tono: Tono detectado
-    - barrio_proyecto: Ubicación del proyecto (si aplica)
-    - barrio_residencia: Barrio de residencia del usuario (si aplica)
-    - contacto: Info de contacto (si fue recopilada)
-    """
-    try:
-        chat_id = body.chat_id
-        
-        # Obtener conversación de Firestore
-        conv_ref = db.collection("conversaciones").document(chat_id)
-        snap = conv_ref.get()
-        
-        if not snap.exists:
-            return {"error": "Conversación no encontrada", "ok": False}
-        
-        conv_data = snap.to_dict() or {}
-        mensajes = conv_data.get("mensajes", [])
-        
-        if not mensajes:
-            return {"error": "No hay mensajes en esta conversación", "ok": False}
-        
-        # Generar resúmenes
-        resumen_completo = summarize_conversation_full(mensajes, max_chars=500)
-        resumen_breve = conv_data.get("resumen") or summarize_conversation_brief(mensajes, max_chars=100)
-        
-        # Extraer metadata
-        categoria = conv_data.get("categoria_general", [])
-        if isinstance(categoria, list):
-            categoria = categoria[0] if categoria else "Sin categoría"
-        
-        titulo = conv_data.get("titulo_propuesta", [])
-        if isinstance(titulo, list):
-            titulo = titulo[0] if titulo else "Sin título"
-        
-        tono = conv_data.get("tono_detectado") or "neutral"
-        
-        barrio_proyecto = conv_data.get("project_location")
-        contact_info = conv_data.get("contact_info") or {}
-        barrio_residencia = contact_info.get("barrio")
-        
-        # Info de contacto (sin teléfono completo por privacidad)
-        contacto = {}
-        if contact_info.get("nombre"):
-            contacto["nombre"] = contact_info["nombre"]
-        if barrio_residencia:
-            contacto["barrio"] = barrio_residencia
-        if contact_info.get("telefono"):
-            # Mostrar solo últimos 4 dígitos
-            tel = contact_info["telefono"]
-            contacto["telefono_parcial"] = "***" + tel[-4:] if len(tel) > 4 else "***"
-        
-        return {
-            "ok": True,
-            "resumen_completo": resumen_completo,
-            "resumen_breve": resumen_breve,
-            "categoria": categoria,
-            "titulo": titulo,
-            "tono": tono,
-            "barrio_proyecto": barrio_proyecto,
-            "barrio_residencia": barrio_residencia,
-            "contacto": contacto,
-            "total_mensajes": len(mensajes)
-        }
-        
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
 
 # =========================================================
 #  Arranque local
