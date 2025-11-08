@@ -1782,32 +1782,38 @@ async def responder(data: Entrada):
         
 
         partials = {}
-        if name:   partials["nombre"] = name
-        if phone:  partials["telefono"] = phone
-        if user_barrio: partials["barrio"] = user_barrio
+        if name:   
+            partials["nombre"] = name.strip()
+        if phone:  
+            partials["telefono"] = phone
+        if user_barrio: 
+            partials["barrio"] = user_barrio.strip()
 
         if partials:
             current_info = (conv_data.get("contact_info") or {})
             new_info = dict(current_info)  # copia
-
-            # no sobrescribir un nombre ya existente
-            if name and not current_info.get("nombre"):
-                new_info["nombre"] = name
-            if user_barrio:
-                new_info["barrio"] = user_barrio
-            if phone:
-                new_info["telefono"] = phone
-
-            conv_ref.update({"contact_info": new_info})
-            if phone:
-                conv_ref.update({"contact_collected": True})
-                upsert_usuario_o_anon(
-                    chat_id,
-                    new_info.get("nombre") or data.nombre or data.usuario,
-                    phone,
-                    data.canal,
-                    new_info.get("barrio") or user_barrio       # <-- barrio a usuarios
-            )
+            
+            # Actualizar con los datos nuevos capturados
+            for key, value in partials.items():
+                if value:  # Solo actualiza si el valor no está vacío
+                    new_info[key] = value
+            
+            # Guardar en Firestore
+            try:
+                conv_ref.update({"contact_info": new_info})
+                
+                # Si llegó teléfono, marcar como completado
+                if phone:
+                    conv_ref.update({"contact_collected": True})
+                    upsert_usuario_o_anon(
+                        chat_id,
+                        new_info.get("nombre") or data.nombre or data.usuario,
+                        phone,
+                        data.canal,
+                        new_info.get("barrio")  # Barrio ya está en new_info
+                    )
+            except Exception as e:
+                return {"error": f"Error al guardar contacto: {str(e)}"}
 
 
                 # --- AUTO-CIERRE si ya teníamos pedido de contacto y ahora se completó tel + ubicación ---
