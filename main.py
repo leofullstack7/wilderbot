@@ -602,21 +602,68 @@ def is_proposal_intent_heuristic(text: str) -> bool:
     return any(k in t for k in kw)
 
 def looks_like_proposal_content(text: str) -> bool:
+    """
+    Detecta si el texto contiene una propuesta CON CONTENIDO REAL.
+    
+    NO es propuesta si:
+    - Es negación
+    - Es solo intención ("quiero proponer")
+    - No tiene verbos de acción ni sustantivos específicos
+    """
     if is_proposal_denial(text):
         return False
+    
     t = _normalize_text(text)
-    if re.search(r'\b(arregl|mejor|constru|instal|crear|paviment|ilumin)\w*', t):
+    
+    # ───────────────────────────────────────────────────────────
+    # Rechazar intención pura sin contenido
+    # ───────────────────────────────────────────────────────────
+    intencion_pura = re.match(
+        r'^\s*(?:quiero|quisiera|me gustaria)\s+(?:proponer|hacer\s+una\s+propuesta)\s*$',
+        t
+    )
+    if intencion_pura:
+        return False
+    
+    # ───────────────────────────────────────────────────────────
+    # Debe tener VERBO DE ACCIÓN + OBJETO
+    # ───────────────────────────────────────────────────────────
+    tiene_verbo = bool(re.search(
+        r'\b(arregl|mejor|constru|instal|crear|paviment|ilumin|repar|pint|adecu|seÃ±aliz)\w*',
+        t
+    ))
+    
+    tiene_objeto = bool(re.search(
+        r'\b(alumbrado|luminaria|parque|semaforo|cancha|via|calle|anden|acera|juegos|polideportivo|hospital|colegio|puesto|centro)\b',
+        t
+    ))
+    
+    tiene_ubicacion = bool(re.search(
+        r'\b(barrio|sector|comuna|vereda|en\s+[A-Z])\b',
+        text  # Original sin normalizar para detectar mayúsculas
+    ))
+    
+    # ───────────────────────────────────────────────────────────
+    # Criterios de aceptación
+    # ───────────────────────────────────────────────────────────
+    
+    # Caso 1: Verbo + Objeto (suficiente)
+    if tiene_verbo and tiene_objeto:
         return True
-    if re.search(r'\b(parque|semaforo|luminaria|cancha)\b', t):
+    
+    # Caso 2: Verbo + Ubicación + longitud razonable
+    if tiene_verbo and tiene_ubicacion and len(t) >= 15:
         return True
-    return len(t) >= 20
-
-def has_argument_text(t: str) -> bool:
-    t = _normalize_text(t)
-    if any(k in t for k in ["porque", "ya que", "debido", "es importante"]):
+    
+    # Caso 3: Objeto + Ubicación + longitud razonable
+    if tiene_objeto and tiene_ubicacion and len(t) >= 15:
         return True
-    if len(t) >= 30:
+    
+    # Caso 4: Muy largo Y tiene al menos algo relevante
+    if len(t) >= 40 and (tiene_verbo or tiene_objeto):
         return True
+    
+    # Rechazar todo lo demás
     return False
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -957,12 +1004,24 @@ async def responder(data: Entrada):
             
             # ───────────────────────────────────────────────────────────
             # FASE 1: Recopilar la propuesta
-            # ───────────────────────────────────────────────────────────
             if not ctx.proposal_collected:
                 if looks_like_proposal_content(data.mensaje):
-                    # Guardar propuesta y avanzar a pedir argumento
+                    propuesta_extraida = extract_proposal_text(data.mensaje)
+                    
+                    # ⚠️ VALIDACIÓN EXTRA: Verificar que la propuesta extraída no esté vacía
+                    if len(_normalize_text(propuesta_extraida)) < 10:
+                        # La propuesta extraída es muy corta, pedir más detalles
+                        conv_ref.update({"proposal_requested": True})
+                        texto = "Cuéntame un poco más sobre tu propuesta. ¿Qué te gustaría que se hiciera y en qué barrio?"
+                        append_mensajes(conv_ref, [
+                            {"role": "user", "content": data.mensaje},
+                            {"role": "assistant", "content": texto}
+                        ])
+                        return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                    
+                    # Propuesta válida, guardar y pedir argumento
                     conv_ref.update({
-                        "current_proposal": extract_proposal_text(data.mensaje),
+                        "current_proposal": propuesta_extraida,
                         "proposal_collected": True,
                         "proposal_requested": True,
                         "argument_requested": True,
@@ -972,6 +1031,10 @@ async def responder(data: Entrada):
                         ctx.contact_info.get("nombre"),
                         ctx.project_location
                     )
+                    
+                    print(f"[PROPUESTA] ✅ Guardada: '{propuesta_extraida[:50]}...'")
+                    print(f"[PROPUESTA] ➡️  Pidiendo argumento")
+                    
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
