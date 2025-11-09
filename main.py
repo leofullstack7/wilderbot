@@ -813,6 +813,10 @@ def build_contact_request(missing: List[str]) -> str:
     frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
     return f"¿Me compartes {frase}?"
 
+def build_project_location_request() -> str:
+    """Pide el barrio del proyecto específicamente."""
+    return "Para ubicar el caso en el mapa: ¿en qué barrio sería exactamente el proyecto?"
+
 def craft_argument_question(name: Optional[str], project_location: Optional[str] = None) -> str:
     saludo = f"{name}, " if name else ""
     return f"{saludo}¿Por qué es importante?"
@@ -946,15 +950,118 @@ async def responder(data: Entrada):
         clasificacion = layer3_classify_with_context(ctx)
         
         # PROPUESTAS (simplificado)
+            # ═══════════════════════════════════════════════════════════════
+        # FLUJO COMPLETO: PROPUESTAS
+        # ═══════════════════════════════════════════════════════════════
         if clasificacion["tipo"] == "propuesta" or ctx.in_proposal_flow:
+            
+            # ───────────────────────────────────────────────────────────
+            # FASE 1: Recopilar la propuesta
+            # ───────────────────────────────────────────────────────────
             if not ctx.proposal_collected:
                 if looks_like_proposal_content(data.mensaje):
+                    # Guardar propuesta y avanzar a pedir argumento
                     conv_ref.update({
                         "current_proposal": extract_proposal_text(data.mensaje),
                         "proposal_collected": True,
+                        "proposal_requested": True,
                         "argument_requested": True,
+                        "argument_collected": False,
                     })
-                    texto = positive_ack_and_request_argument(None, None)
+                    texto = positive_ack_and_request_argument(
+                        ctx.contact_info.get("nombre"),
+                        ctx.project_location
+                    )
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                else:
+                    # Pedir la propuesta
+                    conv_ref.update({"proposal_requested": True})
+                    texto = "¡Perfecto! ¿Cuál es tu propuesta? Cuéntamela en una o dos frases."
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+            
+            # ───────────────────────────────────────────────────────────
+            # FASE 2: Recopilar argumento
+            # ───────────────────────────────────────────────────────────
+            if ctx.proposal_collected and not ctx.argument_collected:
+                # Verificar si el mensaje actual es un argumento
+                es_argumento = (
+                    has_argument_text(data.mensaje) or 
+                    len(_normalize_text(data.mensaje)) >= 20
+                )
+                
+                if es_argumento:
+                    # Guardar argumento y avanzar a pedir contacto
+                    conv_ref.update({
+                        "argument_collected": True,
+                        "contact_requested": True,
+                        "contact_intent": "propuesta"
+                    })
+                    
+                    # Construir lista de datos faltantes
+                    missing = ctx.get_missing_contact_fields()
+                    if not ctx.project_location:
+                        missing.append("project_location")
+                    
+                    if missing:
+                        if missing == ["project_location"]:
+                            texto = build_project_location_request()
+                        else:
+                            texto = build_contact_request(missing)
+                    else:
+                        # Ya tiene todo
+                        texto = "Perfecto, con estos datos escalamos tu propuesta."
+                    
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                else:
+                    # Pedir argumento de nuevo
+                    texto = craft_argument_question(
+                        ctx.contact_info.get("nombre"),
+                        ctx.project_location
+                    )
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+            
+            # ───────────────────────────────────────────────────────────
+            # FASE 3: Recopilar contacto
+            # ───────────────────────────────────────────────────────────
+            if ctx.argument_collected and ctx.contact_requested:
+                # Verificar qué falta
+                missing = ctx.get_missing_contact_fields()
+                if not ctx.project_location:
+                    missing.append("project_location")
+                
+                if missing:
+                    if missing == ["project_location"]:
+                        texto = build_project_location_request()
+                    else:
+                        texto = build_contact_request(missing)
+                    
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                else:
+                    # Todo completo
+                    nombre_txt = ctx.contact_info.get("nombre", "")
+                    texto = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
+                    texto += "Con estos datos escalamos el caso y te contamos avances."
+                    
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
