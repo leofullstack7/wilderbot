@@ -246,6 +246,145 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             conv_ref.update({"ultima_fecha": firestore.SERVER_TIMESTAMP})
     return conv_ref
 
+# ═══════════════════════════════════════════════════════════════════════
+# RESUMEN COMPLETO ESTRUCTURADO
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_detailed_summary(conv_data: dict, mensajes: List[Dict[str, str]]) -> dict:
+    """
+    Genera un resumen estructurado completo para el botón "Ver más".
+    
+    Devuelve un objeto con:
+    - tema_principal: str
+    - consultas: List[str]  (si hubo consultas)
+    - propuesta: str (si hay)
+    - argumento: str (si hay)
+    - ubicacion: str (si hay)
+    - contacto: dict (datos recopilados)
+    - estado: str (fase actual)
+    - historial_resumido: List[dict] (últimos 5 intercambios)
+    """
+    
+    summary = {
+        "tema_principal": "",
+        "consultas": [],
+        "propuesta": None,
+        "argumento": None,
+        "ubicacion": None,
+        "contacto": {
+            "nombre": None,
+            "barrio": None,
+            "telefono": None
+        },
+        "estado": "iniciado",
+        "historial_resumido": []
+    }
+    
+    # ─────────────────────────────────────────────────────────────
+    # 1. TEMA PRINCIPAL
+    # ─────────────────────────────────────────────────────────────
+    categorias = conv_data.get("categoria_general", [])
+    titulos = conv_data.get("titulo_propuesta", [])
+    
+    if titulos:
+        summary["tema_principal"] = titulos[-1]  # Último título
+    elif categorias:
+        summary["tema_principal"] = categorias[-1]
+    else:
+        summary["tema_principal"] = "Conversación sin clasificar"
+    
+    # ─────────────────────────────────────────────────────────────
+    # 2. CONSULTAS (si la categoría incluye "Consulta")
+    # ─────────────────────────────────────────────────────────────
+    if "Consulta" in categorias:
+        # Extraer títulos de consultas
+        for titulo in titulos:
+            if any(kw in _normalize_text(titulo) for kw in ["ley", "proyecto", "apoyo", "posicion", "posición"]):
+                summary["consultas"].append(titulo)
+    
+    # ─────────────────────────────────────────────────────────────
+    # 3. PROPUESTA
+    # ─────────────────────────────────────────────────────────────
+    propuesta = conv_data.get("current_proposal")
+    if propuesta:
+        # Limpiar y limitar a 120 caracteres
+        summary["propuesta"] = propuesta[:120] + ("..." if len(propuesta) > 120 else "")
+    
+    # ─────────────────────────────────────────────────────────────
+    # 4. ARGUMENTO (buscar en los mensajes del usuario)
+    # ─────────────────────────────────────────────────────────────
+    if conv_data.get("argument_collected"):
+        # Buscar el mensaje con el argumento
+        for i, m in enumerate(mensajes):
+            if m.get("role") == "user":
+                content = m.get("content", "")
+                # Si tiene palabras clave de argumento y es largo
+                if has_argument_text(content) and len(content) > 30:
+                    summary["argumento"] = content[:120] + ("..." if len(content) > 120 else "")
+                    break
+    
+    # ─────────────────────────────────────────────────────────────
+    # 5. UBICACIÓN
+    # ─────────────────────────────────────────────────────────────
+    project_location = conv_data.get("project_location")
+    if project_location:
+        summary["ubicacion"] = project_location
+    
+    # ─────────────────────────────────────────────────────────────
+    # 6. CONTACTO
+    # ─────────────────────────────────────────────────────────────
+    contact_info = conv_data.get("contact_info", {})
+    if contact_info:
+        summary["contacto"] = {
+            "nombre": contact_info.get("nombre"),
+            "barrio": contact_info.get("barrio"),
+            "telefono": contact_info.get("telefono")
+        }
+    
+    # ─────────────────────────────────────────────────────────────
+    # 7. ESTADO (fase actual del flujo)
+    # ─────────────────────────────────────────────────────────────
+    if conv_data.get("contact_collected"):
+        summary["estado"] = "completado"
+    elif conv_data.get("contact_requested"):
+        summary["estado"] = "esperando_contacto"
+    elif conv_data.get("argument_collected"):
+        summary["estado"] = "argumento_recibido"
+    elif conv_data.get("proposal_collected"):
+        summary["estado"] = "propuesta_recibida"
+    elif "Consulta" in categorias:
+        summary["estado"] = "consulta_respondida"
+    else:
+        summary["estado"] = "iniciado"
+    
+    # ─────────────────────────────────────────────────────────────
+    # 8. HISTORIAL RESUMIDO (últimos 5 intercambios)
+    # ─────────────────────────────────────────────────────────────
+    # Tomar últimos 10 mensajes (5 intercambios usuario-bot)
+    recent = mensajes[-10:] if len(mensajes) > 10 else mensajes
+    
+    for m in recent:
+        role = m.get("role")
+        content = m.get("content", "")
+        
+        if role == "user":
+            role_display = "Usuario"
+        elif role == "assistant":
+            role_display = "Asistente"
+        else:
+            continue
+        
+        # Limitar a 100 caracteres
+        content_short = content[:100] + ("..." if len(content) > 100 else "")
+        
+        summary["historial_resumido"].append({
+            "rol": role_display,
+            "mensaje": content_short
+        })
+    
+    return summary
+
+
 def append_mensajes(conv_ref, nuevos: List[Dict[str, Any]]):
     snap = conv_ref.get()
     data = snap.to_dict() or {}
@@ -253,11 +392,23 @@ def append_mensajes(conv_ref, nuevos: List[Dict[str, Any]]):
     arr.extend(nuevos)
     conv_ref.update({"mensajes": arr, "ultima_fecha": firestore.SERVER_TIMESTAMP})
 
+    # ═══════════════════════════════════════════════════════════════
+    # RESUMEN PRELIMINAR (100 chars para vista rápida)
+    # ═══════════════════════════════════════════════════════════════
     try:
         resumen = summarize_conversation_brief(arr, max_chars=100)
         conv_ref.update({"resumen": resumen})
     except:
         pass
+    
+    # ═══════════════════════════════════════════════════════════════
+    # RESUMEN COMPLETO (estructura detallada para "Ver más")
+    # ═══════════════════════════════════════════════════════════════
+    try:
+        resumen_completo = build_detailed_summary(data, arr)
+        conv_ref.update({"resumen_completo": resumen_completo})
+    except Exception as e:
+        print(f"[WARN] Resumen completo falló: {e}")
     
     try:
         update_conversation_summary(conv_ref)
