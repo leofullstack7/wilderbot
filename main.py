@@ -628,13 +628,29 @@ def reformulate_query_with_context(
     return current_query
 
 # ✅ CORRECCIÓN: Validar relevancia RAG
+# ✅ CORRECCIÓN: Validar relevancia RAG (umbral ajustado)
 def validate_rag_relevance(rag_hits: List[Dict]) -> bool:
+    """
+    Valida si hay al menos UN hit con score razonable.
+    Umbral bajado a 0.5 para mayor flexibilidad.
+    """
     if not rag_hits:
+        print("[RAG] ⚠️  No hay hits")
         return False
-    relevant = any(hit.get("score", 0) > 0.7 for hit in rag_hits)
-    if not relevant:
-        print("[RAG] ⚠️  Sin hits relevantes")
-    return relevant
+    
+    # Buscar al menos un hit con score > 0.5
+    best_score = max((hit.get("score", 0) for hit in rag_hits), default=0)
+    
+    if best_score >= 0.5:
+        print(f"[RAG] ✅ Mejor score: {best_score:.3f}")
+        return True
+    else:
+        print(f"[RAG] ⚠️ Score muy bajo: {best_score:.3f}")
+        # Aceptar de todos modos si hay al menos 3 hits
+        if len(rag_hits) >= 3:
+            print("[RAG] ⚠️ Aceptando por cantidad de hits")
+            return True
+        return False
 
 # ═══════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -800,10 +816,26 @@ async def responder(data: Entrada):
             query_for_search = reformulate_query_with_context(data.mensaje, ctx.historial)
         
         hits = rag_search(query_for_search, top_k=5)
+
+        # 🐛 DEBUG: Ver scores de RAG
+        print(f"\n{'='*60}")
+        print(f"[RAG DEBUG] Query: '{query_for_search}'")
+        print(f"[RAG DEBUG] Hits encontrados: {len(hits)}")
+        for i, hit in enumerate(hits[:3], 1):
+            print(f"  Hit {i}: score={hit.get('score', 0):.3f} | texto='{hit.get('texto', '')[:80]}...'")
+        print(f"{'='*60}\n")
         
         # ✅ Validar RAG
+        # ✅ Validar RAG
         if not validate_rag_relevance(hits):
-            texto = "No tengo información específica sobre eso. ¿Puedo ayudarte con algo más?"
+            # Intento de respuesta genérica basada en el tema
+            if any(kw in _normalize_text(data.mensaje) for kw in ["ley", "proyecto", "educacion", "educación"]):
+                texto = (
+                    "No encontré información específica sobre eso en mi base de datos actual. "
+                    "Te recomiendo contactar directamente a la oficina de Wilder para información más detallada."
+                )
+            else:
+                texto = "No tengo información específica sobre eso en este momento. ¿Hay algo más en lo que pueda ayudarte?"
         else:
             texto = layer4_generate_response_with_memory(ctx, clasificacion, hits)
         
