@@ -596,6 +596,29 @@ def is_proposal_denial(text: str) -> bool:
     ]
     return any(re.search(p, t) for p in pats)
 
+def is_question_like(text: str) -> bool:
+    """Detecta si el mensaje es una pregunta (no una propuesta)."""
+    t = _normalize_text(text)
+    
+    # Tiene signos de interrogación
+    if "?" in text:
+        return True
+    
+    # Tiene palabras interrogativas
+    interrogativos = [
+        "que", "qué", "como", "cómo", "cuando", "cuándo",
+        "donde", "dónde", "por que", "por qué", "cual", "cuál",
+        "quien", "quién"
+    ]
+    
+    tiene_interrogativo = any(kw in t for kw in interrogativos)
+    
+    # NO es pregunta si claramente es propuesta
+    if is_proposal_intent_heuristic(text):
+        return False
+    
+    return tiene_interrogativo
+
 def is_proposal_intent_heuristic(text: str) -> bool:
     t = _normalize_text(text)
     kw = ["propongo", "propuesta", "sugerencia", "mi idea", "quiero proponer"]
@@ -1003,29 +1026,53 @@ async def responder(data: Entrada):
         if clasificacion["tipo"] == "propuesta" or ctx.in_proposal_flow:
             
             # ───────────────────────────────────────────────────────────
-            # FASE 1: Recopilar la propuesta
+            # FASE 1: Recopilar la propuesta (CON SISTEMA DE NUDGES)
+            # ═══════════════════════════════════════════════════════════════
             if not ctx.proposal_collected:
+                
+                # ───────────────────────────────────────────────────────────
+                # Caso 1A: Usuario dice que quiere proponer (INTENCIÓN)
+                # ───────────────────────────────────────────────────────────
+                if is_proposal_intent_heuristic(data.mensaje) and not looks_like_proposal_content(data.mensaje):
+                    conv_ref.update({
+                        "proposal_requested": True,
+                        "proposal_collected": False,
+                        "proposal_nudge_count": 0
+                    })
+                    texto = "¡Perfecto! ¿Cuál es tu propuesta? Cuéntamela en una o dos frases y dime en qué barrio."
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                
+                # ───────────────────────────────────────────────────────────
+                # Caso 1B: Usuario da propuesta CON CONTENIDO directamente
+                # ───────────────────────────────────────────────────────────
                 if looks_like_proposal_content(data.mensaje):
                     propuesta_extraida = extract_proposal_text(data.mensaje)
                     
-                    # ⚠️ VALIDACIÓN EXTRA: Verificar que la propuesta extraída no esté vacía
+                    # Validar que no esté vacía
                     if len(_normalize_text(propuesta_extraida)) < 10:
-                        # La propuesta extraída es muy corta, pedir más detalles
-                        conv_ref.update({"proposal_requested": True})
-                        texto = "Cuéntame un poco más sobre tu propuesta. ¿Qué te gustaría que se hiciera y en qué barrio?"
+                        conv_ref.update({
+                            "proposal_requested": True,
+                            "proposal_nudge_count": 1
+                        })
+                        texto = "Cuéntame un poco más: ¿qué te gustaría que se hiciera y en qué barrio?"
                         append_mensajes(conv_ref, [
                             {"role": "user", "content": data.mensaje},
                             {"role": "assistant", "content": texto}
                         ])
                         return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                     
-                    # Propuesta válida, guardar y pedir argumento
+                    # Propuesta válida → guardar y pedir argumento
                     conv_ref.update({
                         "current_proposal": propuesta_extraida,
                         "proposal_collected": True,
                         "proposal_requested": True,
                         "argument_requested": True,
                         "argument_collected": False,
+                        "proposal_nudge_count": 0
                     })
                     texto = positive_ack_and_request_argument(
                         ctx.contact_info.get("nombre"),
@@ -1040,10 +1087,60 @@ async def responder(data: Entrada):
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-                else:
-                    # Pedir la propuesta
-                    conv_ref.update({"proposal_requested": True})
-                    texto = "¡Perfecto! ¿Cuál es tu propuesta? Cuéntamela en una o dos frases."
+                
+                # ───────────────────────────────────────────────────────────
+                # Caso 1C: YA PEDIMOS propuesta pero aún no llegó (NUDGES)
+                # ───────────────────────────────────────────────────────────
+                if conv_data.get("proposal_requested"):
+                    nudges = int(conv_data.get("proposal_nudge_count", 0))
+                    
+                    # Rechazó explícitamente
+                    if is_proposal_denial(data.mensaje):
+                        conv_ref.update({
+                            "proposal_requested": False,
+                            "proposal_collected": False,
+                            "proposal_nudge_count": 0,
+                            "argument_requested": False,
+                            "contact_intent": None
+                        })
+                        texto = "Perfecto, sin problema. Cuando la tengas, cuéntamela en 1-2 frases."
+                        append_mensajes(conv_ref, [
+                            {"role": "user", "content": data.mensaje},
+                            {"role": "assistant", "content": texto}
+                        ])
+                        return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                    
+                    # Hizo una PREGUNTA en lugar de dar propuesta
+                    if is_question_like(data.mensaje):
+                        conv_ref.update({
+                            "proposal_requested": False,
+                            "proposal_nudge_count": 0,
+                            "contact_intent": None
+                        })
+                        texto = "¿Prefieres que responda tu pregunta ahora o seguimos con tu propuesta? Si es propuesta, cuéntamela en 1-2 frases."
+                        append_mensajes(conv_ref, [
+                            {"role": "user", "content": data.mensaje},
+                            {"role": "assistant", "content": texto}
+                        ])
+                        return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                    
+                    # No dio contenido → NUDGE escalonado
+                    nudges += 1
+                    conv_ref.update({"proposal_nudge_count": nudges})
+                    
+                    if nudges == 1:
+                        texto = "Claro. ¿Cuál es tu propuesta? Dímela en 1-2 frases y el barrio del proyecto."
+                    elif nudges == 2:
+                        texto = "Para ayudarte mejor, escribe la propuesta en 1-2 frases (ej: 'Arreglar luminarias del parque de San José')."
+                    else:
+                        # 3+ intentos → salir del modo propuesta
+                        conv_ref.update({
+                            "proposal_requested": False,
+                            "proposal_nudge_count": 0,
+                            "contact_intent": None
+                        })
+                        texto = "Todo bien. Si prefieres, dime tu pregunta o tema y te ayudo de una."
+                    
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
