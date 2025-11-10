@@ -1,7 +1,7 @@
 # ============================
-#  WilderBot API - VERSIÓN MEJORADA
-#  Bot más inteligente y personalizado
-#  Sistema híbrido optimizado (3 capas)
+#  WilderBot API - VERSIÓN MEJORADA (MAIN)
+#  Bot más inteligente, natural y ágil con sistema híbrido (3+1 capas)
+#  NOTA: Se conserva toda la funcionalidad existente; solo se optimiza el uso del LLM y el RAG.
 # ============================
 
 from fastapi import FastAPI
@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 import re
 import math
 import time
+import hashlib
+from collections import OrderedDict
 
 from api.ingest import router as ingest_router
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,6 +50,12 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "wilder-frases")
 GOOGLE_CREDS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "/etc/secrets/firebase.json"
 OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o-mini")
+
+# Ajustes RAG
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+RAG_CANDIDATES = int(os.getenv("RAG_CANDIDATES", "16"))   # candidatos crudos antes de re-rank
+RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.55")) # umbral dinámico base
+RAG_MIN_ACCEPT = float(os.getenv("RAG_MIN_ACCEPT", "0.48"))
 
 BOT_INTRO_TEXT = os.getenv(
     "BOT_INTRO_TEXT",
@@ -138,18 +146,81 @@ def remove_redundant_greetings(texto: str, historial: List[Dict[str, str]]) -> s
             r'^¡?Qué\s+tal!?\s*[,.]?\s*',
             r'^¡?Saludos!?\s*[,.]?\s*',
         ]
-        
         for pattern in greeting_patterns:
             texto = re.sub(pattern, '', texto, flags=re.IGNORECASE)
-        
         texto = re.sub(r'^¡?Hola,?\s+[A-Za-záéíóúñ]+[,.]?\s*', '', texto, flags=re.IGNORECASE)
-    
     texto = texto.strip()
-    
     if not texto or len(texto) < 10:
         return "Claro, déjame ayudarte con eso."
-    
     return texto
+
+def _approx_token_len(s: str) -> int:
+    # Aproximación simple de tokens para recortes rápidos
+    return max(1, math.ceil(len(s) / 4))
+
+def _truncate_by_tokens(s: str, max_tokens: int) -> str:
+    if _approx_token_len(s) <= max_tokens:
+        return s
+    # recorte por frases conservando coherencia
+    parts = re.split(r'(?<=[\.\n])\s+', s)
+    out = []
+    total = 0
+    for p in parts:
+        t = _approx_token_len(p)
+        if total + t > max_tokens:
+            break
+        out.append(p)
+        total += t
+    return " ".join(out) if out else s[:max_tokens*4]
+
+# =========================================================
+#  Embedding Cache (ahorra costos y acelera)
+# =========================================================
+
+class _LRUEmbCache:
+    def __init__(self, capacity: int = 2048):
+        self.capacity = capacity
+        self.store: OrderedDict[str, List[float]] = OrderedDict()
+
+    @staticmethod
+    def _key(text: str, model: str) -> str:
+        h = hashlib.sha256((model + "||" + text).encode("utf-8")).hexdigest()
+        return h
+
+    def get(self, text: str, model: str) -> Optional[List[float]]:
+        k = self._key(text, model)
+        if k in self.store:
+            self.store.move_to_end(k)
+            return self.store[k]
+        return None
+
+    def put(self, text: str, model: str, emb: List[float]):
+        k = self._key(text, model)
+        self.store[k] = emb
+        self.store.move_to_end(k)
+        if len(self.store) > self.capacity:
+            self.store.popitem(last=False)
+
+_EMB_CACHE = _LRUEmbCache()
+
+def get_embedding(text: str, model: str = EMBEDDING_MODEL) -> List[float]:
+    text = (text or "").strip()
+    cached = _EMB_CACHE.get(text, model)
+    if cached is not None:
+        return cached
+    emb = client.embeddings.create(model=model, input=text).data[0].embedding
+    _EMB_CACHE.put(text, model, emb)
+    return emb
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    # robusta a longitudes distintas (no debería pasar)
+    n = min(len(a), len(b))
+    if n == 0:
+        return 0.0
+    s = sum(a[i]*b[i] for i in range(n))
+    na = math.sqrt(sum(a[i]*a[i] for i in range(n))) or 1e-8
+    nb = math.sqrt(sum(b[i]*b[i] for i in range(n))) or 1e-8
+    return s/(na*nb)
 
 # =========================================================
 #  BD Helpers
@@ -525,12 +596,11 @@ def is_plain_greeting(text: str) -> bool:
     t = _normalize_text(text)
     kws = ("hola","holaa","buenas","buenos dias","como estas","que mas","saludos")
     short = len(t) <= 40
-    has_kw = any(k in t for k in kws)
     topicish = any(w in t for w in (
         "arregl","propuesta","proponer","hueco","parque","colegio",
         "salud","seguridad","ayuda","necesito","quiero"
     ))
-    return short and has_kw and not topicish
+    return short and any(k in t for k in kws) and not topicish
 
 def detect_contact_refusal(text: str) -> bool:
     t = _normalize_text(text)
@@ -550,24 +620,13 @@ def is_proposal_denial(text: str) -> bool:
     return any(re.search(p, t) for p in pats)
 
 def is_question_like(text: str) -> bool:
-    """Detecta si el mensaje es una pregunta (no una propuesta)."""
     t = _normalize_text(text)
-    
     if "?" in text:
         return True
-    
-    interrogativos = [
-        "que", "qué", "como", "cómo", "cuando", "cuándo",
-        "donde", "dónde", "por que", "por qué", "cual", "cuál",
-        "quien", "quién"
-    ]
-    
-    tiene_interrogativo = any(kw in t for kw in interrogativos)
-    
+    interrogativos = ["que","qué","como","cómo","cuando","cuándo","donde","dónde","por que","por qué","cual","cuál","quien","quién"]
     if is_proposal_intent_heuristic(text):
         return False
-    
-    return tiene_interrogativo
+    return any(kw in t for kw in interrogativos)
 
 def is_proposal_intent_heuristic(text: str) -> bool:
     t = _normalize_text(text)
@@ -575,66 +634,30 @@ def is_proposal_intent_heuristic(text: str) -> bool:
     return any(k in t for k in kw)
 
 def looks_like_proposal_content(text: str) -> bool:
-    """Detecta si el texto contiene una propuesta CON CONTENIDO REAL."""
-    
     if is_proposal_denial(text):
         return False
-    
     t = _normalize_text(text)
-    
-    # Rechazar intención pura sin contenido
-    intencion_pura = re.match(
-        r'^\s*(?:quiero|quisiera|me gustaria)\s+(?:proponer|hacer\s+una\s+propuesta)\s*$',
-        t
-    )
+    intencion_pura = re.match(r'^\s*(?:quiero|quisiera|me gustaria)\s+(?:proponer|hacer\s+una\s+propuesta)\s*$', t)
     if intencion_pura:
         return False
-    
-    # Debe tener VERBO DE ACCIÓN + OBJETO
-    tiene_verbo = bool(re.search(
-        r'\b(arregl|mejor|constru|instal|crear|paviment|ilumin|repar|pint|adecu|señaliz)\w*',
-        t
-    ))
-    
-    tiene_objeto = bool(re.search(
-        r'\b(alumbrado|luminaria|parque|semaforo|cancha|via|calle|anden|acera|juegos|polideportivo|hospital|colegio|puesto|centro)\b',
-        t
-    ))
-    
-    tiene_ubicacion = bool(re.search(
-        r'\b(barrio|sector|comuna|vereda|en\s+[A-Z])\b',
-        text
-    ))
-    
-    # Criterios de aceptación
+    tiene_verbo = bool(re.search(r'\b(arregl|mejor|constru|instal|crear|paviment|ilumin|repar|pint|adecu|señaliz)\w*', t))
+    tiene_objeto = bool(re.search(r'\b(alumbrado|luminaria|parque|semaforo|cancha|via|calle|anden|acera|juegos|polideportivo|hospital|colegio|puesto|centro)\b', t))
+    tiene_ubicacion = bool(re.search(r'\b(barrio|sector|comuna|vereda|en\s+[A-Z])\b', text))
     if tiene_verbo and tiene_objeto:
         return True
-    
     if tiene_verbo and tiene_ubicacion and len(t) >= 15:
         return True
-    
     if tiene_objeto and tiene_ubicacion and len(t) >= 15:
         return True
-    
     if len(t) >= 40 and (tiene_verbo or tiene_objeto):
         return True
-    
     return False
 
 def has_argument_text(text: str) -> bool:
-    """Detecta si el texto parece ser un argumento."""
     t = _normalize_text(text)
-    
-    # Palabras clave de argumentación
-    arg_keywords = [
-        "porque", "por que", "importante", "necesario", "urgente",
-        "ayudaria", "beneficiaria", "mejoraria", "solucionaria",
-        "afecta", "problema", "situacion", "comunidad"
-    ]
-    
+    arg_keywords = ["porque","por que","importante","necesario","urgente","ayudaria","beneficiaria","mejoraria","solucionaria","afecta","problema","situacion","comunidad"]
     tiene_keyword = any(kw in t for kw in arg_keywords)
     es_largo = len(t) >= 20
-    
     return tiene_keyword or es_largo
 
 # =========================================================
@@ -676,21 +699,19 @@ def extract_proposal_text(text: str) -> str:
 def llm_extract_contact_info(text: str) -> Dict[str, Optional[str]]:
     sys = "Extrae: nombre, barrio, telefono. JSON."
     usr = f"Mensaje: {text}"
-    
     try:
         out = client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=OPENAI_MODEL_SUMMARY,
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
             temperature=0.0,
-            max_tokens=150
+            max_tokens=120
         ).choices[0].message.content.strip()
-        
         return json.loads(out)
     except:
         return {"nombre": None, "barrio": None, "telefono": None}
 
 # =========================================================
-#  CAPAS
+#  CAPAS (1-3 deterministas) — sin cambios críticos
 # =========================================================
 
 def layer1_deterministic_response(ctx: ConversationContext, conv_data: dict) -> Optional[str]:
@@ -719,11 +740,10 @@ def layer2_extract_contact_data(ctx: ConversationContext) -> Dict[str, Optional[
     if name_regex and phone_regex and barrio_regex:
         return {"nombre": name_regex, "telefono": phone_regex, "barrio": barrio_regex}
     
-    if ctx.contact_requested:
-        if not phone_regex:
-            m = re.search(r'\b(\d{10})\b', ctx.mensaje)
-            if m:
-                phone_regex = m.group(1)
+    if ctx.contact_requested and not phone_regex:
+        m = re.search(r'\b(\d{10})\b', ctx.mensaje)
+        if m:
+            phone_regex = m.group(1)
     
     result = {}
     if name_regex: result["nombre"] = name_regex
@@ -734,170 +754,241 @@ def layer2_extract_contact_data(ctx: ConversationContext) -> Dict[str, Optional[
 def layer3_classify_with_context(ctx: ConversationContext) -> Dict[str, Any]:
     if ctx.in_proposal_flow:
         return {"tipo": "propuesta", "confianza": "alta"}
-    
     if is_proposal_intent_heuristic(ctx.mensaje):
         return {"tipo": "propuesta", "confianza": "alta"}
-    
     if "?" in ctx.mensaje:
         return {"tipo": "consulta", "confianza": "alta"}
-    
     return {"tipo": "consulta", "confianza": "media"}
 
 # =========================================================
-#  RAG
+#  RAG — Mejorado (expansión, re-ranking MMR y control de calidad)
 # =========================================================
 
-def rag_search(query: str, top_k: int = 5):
-    emb = client.embeddings.create(model=EMBEDDING_MODEL, input=query).data[0].embedding
-    res = index.query(vector=emb, top_k=top_k, include_metadata=True)
-    hits = []
-    for m in res.matches:
-        hits.append({
-            "id": m.id,
-            "texto": (m.metadata or {}).get("texto", ""),
-            "score": float(m.score)
-        })
-    return hits
-
-def reformulate_query_with_context(
-    current_query: str, 
-    conversation_history: List[Dict[str, str]],
-    max_history: int = 6
-) -> str:
-    """Reformula manteniendo tema específico."""
+def _mmr_rerank(query_emb: List[float], cand_texts: List[str], top_k: int) -> List[int]:
+    # Embeddings de candidatos (cacheados)
+    cand_embs = [get_embedding(ct) for ct in cand_texts]
+    # Relevancia al query
+    rel = [ _cosine(query_emb, e) for e in cand_embs ]
+    selected: List[int] = []
+    lambda_bal = 0.7  # 70% relevancia, 30% diversidad
     
+    remaining = set(range(len(cand_texts)))
+    while len(selected) < min(top_k, len(cand_texts)):
+        if not selected:
+            best = max(remaining, key=lambda i: rel[i])
+            selected.append(best)
+            remaining.remove(best)
+            continue
+        # diversidad: distancia máxima a cualquier seleccionado
+        def mmr_score(i: int) -> float:
+            diversity = min([1 - _cosine(cand_embs[i], cand_embs[j]) for j in selected]) if selected else 1.0
+            return lambda_bal * rel[i] + (1 - lambda_bal) * diversity
+        best = max(remaining, key=mmr_score)
+        selected.append(best)
+        remaining.remove(best)
+    return selected
+
+def _expand_queries_with_llm(user_query: str, history: List[Dict[str,str]]) -> List[str]:
+    """
+    Usa modelo barato para generar 3 variaciones útiles + lista de palabras clave.
+    Solo se utiliza si el primer intento no fue convincente.
+    """
+    hist_tail = "\n".join([f"{m['role']}: {m['content'][:120]}" for m in history[-4:]]) if history else ""
+    prompt = (
+        "Reformula la consulta para búsqueda semántica sobre leyes/proyectos. "
+        "Devuelve SOLO JSON con {variaciones:[...], keywords:[...]} en español; 3 variaciones cortas (<=12 palabras) y 5 keywords."
+    )
+    user = f"Historial breve:\n{hist_tail}\n\nConsulta base: {user_query}"
+    try:
+        out = client.chat.completions.create(
+            model=OPENAI_MODEL_SUMMARY,
+            messages=[{"role":"system","content":prompt},{"role":"user","content":user}],
+            temperature=0.2,
+            max_tokens=160
+        ).choices[0].message.content.strip()
+        out = out.replace("```json","").replace("```","").strip()
+        data = json.loads(out)
+        vari = [v for v in (data.get("variaciones") or []) if isinstance(v,str)]
+        kws  = [k for k in (data.get("keywords") or []) if isinstance(k,str)]
+        # fallback simple si viene vacío
+        if not vari:
+            vari = [user_query]
+        return list({user_query, *vari, " ".join(kws[:5]) if kws else user_query})
+    except:
+        return [user_query]
+
+def rag_search(query: str, top_k: int = RAG_TOP_K) -> List[Dict]:
+    """
+    Búsqueda mejorada:
+      1) Query original -> Pinecone (candidatos)
+      2) MMR re-ranking local con embeddings del texto
+      3) Si flojo, expansión con LLM-mini y reintento
+    """
+    def pinecone_candidates(q: str, candidates: int) -> Tuple[List[Dict], float]:
+        q_emb = get_embedding(q)
+        res = index.query(vector=q_emb, top_k=candidates, include_metadata=True)
+        hits = []
+        best = 0.0
+        for m in res.matches:
+            txt = (m.metadata or {}).get("texto", "") or ""
+            sc = float(m.score or 0.0)
+            hits.append({"id": m.id, "texto": txt, "score": sc})
+            if sc > best: best = sc
+        # Re-ranking MMR
+        cand_texts = [h["texto"] for h in hits if h["texto"]]
+        if cand_texts:
+            order = _mmr_rerank(q_emb, cand_texts, top_k)
+            hits = [hits[i] for i in order if i < len(hits)]
+        return hits[:top_k], best
+
+    # Primer intento
+    hits, best = pinecone_candidates(query, RAG_CANDIDATES)
+    if best >= RAG_MIN_SCORE or len(hits) >= top_k:
+        return hits
+
+    # Expansión (barato) y reintento si hace falta
+    expanded = _expand_queries_with_llm(query, [])
+    best_global = best
+    best_hits = hits
+    for q2 in expanded:
+        h2, b2 = pinecone_candidates(q2, RAG_CANDIDATES)
+        if b2 > best_global or (b2 >= best_global-1e-6 and len(h2) > len(best_hits)):
+            best_global, best_hits = b2, h2
+        if best_global >= (RAG_MIN_SCORE + 0.05):
+            break
+    return best_hits
+
+def reformulate_query_with_context(current_query: str, conversation_history: List[Dict[str, str]], max_history: int = 6) -> str:
+    """Reformula para referencias vagas usando tema del último turno del bot."""
     if len(current_query.split()) > 8:
         return current_query
-    
     recent = conversation_history[-max_history:] if conversation_history else []
-    
     if not recent:
         return current_query
-    
-    # Extraer tema del último bot
     ultimo_bot = ""
     tema_especifico = ""
-    
     for msg in reversed(recent):
         if msg["role"] == "assistant":
             ultimo_bot = msg.get("content", "")
-            
             ley_match = re.search(r'Ley\s+(\d+)', ultimo_bot, re.IGNORECASE)
             if ley_match:
                 tema_especifico = f"Ley {ley_match.group(1)}"
                 break
-    
-    referencias_vagas = ["ella", "eso", "esa", "sobre eso"]
+    referencias_vagas = ["ella","eso","esa","sobre eso","ese tema","ese proyecto","esa ley"]
     if tema_especifico and any(ref in current_query.lower() for ref in referencias_vagas):
-        reformulated = f"{tema_especifico} detalles"
-        print(f"[QUERY] Reformulada: '{reformulated}'")
-        return reformulated
-    
+        return f"{tema_especifico} detalles"
     return current_query
 
-def validate_rag_relevance(rag_hits: List[Dict]) -> bool:
-    """Valida si hay al menos UN hit con score razonable."""
+def _answerability_check(contexto: str, pregunta: str) -> bool:
+    """
+    Verifica con modelo barato si el contexto contiene respuesta directa.
+    Devuelve True/False para evitar 'no sé' cuando sí está en la base.
+    """
+    sys = (
+        "Responde SOLO 'si' o 'no'. "
+        "¿El CONTEXTO contiene información suficiente y específica para responder la PREGUNTA sin inventar?"
+    )
+    usr = f"CONTEXTO:\n{_truncate_by_tokens(contexto, 1000)}\n\nPREGUNTA:\n{pregunta}\n\nResponde:"
+    try:
+        out = client.chat.completions.create(
+            model=OPENAI_MODEL_SUMMARY,
+            messages=[{"role":"system","content":sys},{"role":"user","content":usr}],
+            temperature=0.0,
+            max_tokens=2
+        ).choices[0].message.content.strip().lower()
+        return out.startswith("s")
+    except:
+        return False
+
+def validate_rag_relevance(rag_hits: List[Dict], query_text: str) -> bool:
+    """Valida calidad combinando score y chequeo de respuesta."""
     if not rag_hits:
         print("[RAG] ⚠️  No hay hits")
         return False
-    
-    best_score = max((hit.get("score", 0) for hit in rag_hits), default=0)
-    
-    if best_score >= 0.5:
+    best_score = max((hit.get("score", 0) for hit in rag_hits), default=0.0)
+    contexto = "\n".join([f"- {h.get('texto','')}" for h in rag_hits if h.get("texto")])
+    if best_score >= RAG_MIN_SCORE:
         print(f"[RAG] ✅ Mejor score: {best_score:.3f}")
         return True
-    else:
-        print(f"[RAG] ⚠️ Score muy bajo: {best_score:.3f}")
-        if len(rag_hits) >= 3:
-            print("[RAG] ⚠️ Aceptando por cantidad de hits")
-            return True
-        return False
+    if best_score >= RAG_MIN_ACCEPT and _answerability_check(contexto, query_text):
+        print(f"[RAG] △ Score medio {best_score:.3f} pero contexto suficiente.")
+        return True
+    print(f"[RAG] ❌ Score bajo: {best_score:.3f} sin evidencia suficiente.")
+    return False
 
 # =========================================================
-#  GENERACIÓN INTELIGENTE Y PERSONALIZADA
+#  GENERACIÓN NATURAL (CAPA LLM con anclaje estricto al contexto)
 # =========================================================
 
-def layer4_generate_response_with_memory(
-    ctx: ConversationContext,
-    clasificacion: Dict[str, Any],
-    rag_hits: List[Dict]
-) -> str:
-    """Generación con respeto estricto a RAG pero MÁS NATURAL Y PERSONALIZADA."""
-    
-    contexto_rag = "\n".join([f"- {h['texto']}" for h in rag_hits if h.get("texto")])
-    
-    # ✅ System prompt MEJORADO para mayor personalización
-    system_msg = (
+def _build_system_prompt(ctx: ConversationContext, clasificacion: Dict[str, Any], contexto_rag: str) -> str:
+    sys = (
         "Eres el asistente personal de Wilder Escobar, Representante a la Cámara.\n\n"
-        "PERSONALIDAD Y TONO:\n"
-        "- Habla como una persona real y cercana, no como un robot\n"
-        "- Usa lenguaje natural y conversacional\n"
-        "- Muestra empatía y entusiasmo genuino\n"
-        "- Adapta tu tono según el contexto de la conversación\n"
-        "- Si el usuario parece frustrado, sé más comprensivo\n"
-        "- Si está entusiasmado, comparte su energía\n\n"
-        "REGLAS CRÍTICAS:\n"
-        "1. NO te presentes como Wilder, eres su ASISTENTE\n"
-        "2. NO saludes si ya hay historial de conversación\n"
-        "3. Usa EXCLUSIVAMENTE información del contexto proporcionado\n"
-        "4. Si la información no está en el contexto, di claramente: 'No tengo esa información específica en este momento'\n"
-        "5. Máximo 3 frases por respuesta\n"
-        "6. Personaliza usando el nombre del usuario cuando lo conozcas\n\n"
+        "PERSONALIDAD:\n"
+        "- Habla como una persona real, cercana y respetuosa.\n"
+        "- Sé claro y directo; evita rodeos.\n"
+        "- Máximo 3 frases. Sin listas a menos que sean necesarias.\n\n"
+        "REGLAS:\n"
+        "1) NO te presentes como Wilder; eres su asistente.\n"
+        "2) NO saludes si ya existe historial.\n"
+        "3) Responde SOLO con información del CONTEXTO.\n"
+        "4) Si falta información, dilo sin inventar y ofrece alternativa.\n"
     )
-    
-    # Agregar contexto previo si hay referencia
     if ctx.has_reference and ctx.resumen:
-        system_msg += f"CONTEXTO PREVIO: {ctx.resumen}\n"
-        system_msg += "Mantén coherencia con ese tema.\n\n"
-    
-    # Agregar nombre del usuario si lo tenemos
+        sys += f"\nCONTEXTO PREVIO (resumen): {ctx.resumen}\nMantén coherencia.\n"
     nombre_usuario = ctx.contact_info.get("nombre")
     if nombre_usuario:
-        system_msg += f"NOTA: El usuario se llama {nombre_usuario}. Usa su nombre naturalmente cuando sea apropiado.\n\n"
-    
-    if clasificacion["tipo"] == "consulta":
-        system_msg += (
-            "TIPO DE MENSAJE: CONSULTA\n"
-            "- Responde de forma clara y directa\n"
-            "- Usa SOLO el contexto proporcionado\n"
-            "- NO inventes información\n"
-            "- Si no tienes la respuesta, sé honesto y sugiere alternativas\n"
-        )
-    
+        sys += f"\nNOTA: El usuario se llama {nombre_usuario}. Usa su nombre de forma natural si ayuda.\n"
+    if clasificacion.get("tipo") == "consulta":
+        sys += "\nTIPO: CONSULTA. Responde con precisión y sin adornos innecesarios.\n"
+    # Incluir un recordatorio de no citar fuentes externas
+    sys += "\nNO agregues enlaces externos ni opiniones personales.\n"
+    return sys
+
+def _prepare_context_snippets(hits: List[Dict], max_tokens: int = 900) -> str:
+    # Orden conservando los mejores primeros y cortando por tokens aproximados
+    texts = []
+    used = 0
+    for h in hits:
+        t = (h.get("texto") or "").strip()
+        if not t:
+            continue
+        # Saneamiento mínimo
+        t = re.sub(r'\s+', ' ', t)
+        t = _truncate_by_tokens(t, 220)  # evitar pasajes enormes
+        tk = _approx_token_len(t)
+        if used + tk > max_tokens:
+            break
+        texts.append(f"- {t}")
+        used += tk
+    return "\n".join(texts)
+
+def layer4_generate_response_with_memory(ctx: ConversationContext, clasificacion: Dict[str, Any], rag_hits: List[Dict]) -> str:
+    contexto_rag = _prepare_context_snippets(rag_hits, max_tokens=900)
+    system_msg = _build_system_prompt(ctx, clasificacion, contexto_rag)
     msgs = [{"role": "system", "content": system_msg}]
-    
-    # Incluir historial para continuidad
     if ctx.historial:
         msgs.extend(ctx.historial[-6:])
-    
-    # Mensaje del usuario con contexto RAG
     msgs.append({
         "role": "user",
         "content": (
-            f"CONTEXTO VERIFICADO:\n{contexto_rag}\n\n"
+            f"CONTEXTO (usa SOLO esto):\n{contexto_rag}\n\n"
             f"PREGUNTA DEL CIUDADANO:\n{ctx.mensaje}\n\n"
-            f"Responde usando SOLO el contexto. Sé natural, cercano y útil."
+            "Responde natural, breve y 100% basada en el contexto."
         )
     })
-    
     try:
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=msgs,
-            temperature=0.4,  # ✅ Mayor creatividad para naturalidad (antes 0.1)
-            max_tokens=280,
-            presence_penalty=0.3,  # ✅ Evita repeticiones
-            frequency_penalty=0.3  # ✅ Fomenta variedad
+            temperature=0.35,
+            max_tokens=240,
+            presence_penalty=0.25,
+            frequency_penalty=0.25
         )
-        
         texto = completion.choices[0].message.content.strip()
         texto = limit_sentences(texto, 3)
-        
-        # ✅ Eliminar saludos redundantes
         texto = remove_redundant_greetings(texto, ctx.historial)
-        
         return texto
-        
     except Exception as e:
         print(f"[LLM ERROR] {e}")
         return "Disculpa, tuve un problema técnico. ¿Puedes reformular tu pregunta?"
@@ -938,7 +1029,7 @@ async def responder(data: Entrada):
         
         ctx = ConversationContext(conv_data, data.mensaje)
         
-        # CAPA 1
+        # CAPA 1 (determinista rápida)
         layer1_response = layer1_deterministic_response(ctx, conv_data)
         if layer1_response:
             if is_proposal_denial(data.mensaje):
@@ -948,16 +1039,14 @@ async def responder(data: Entrada):
                     "argument_requested": False,
                     "argument_collected": False,
                 })
-            
             append_mensajes(conv_ref, [
                 {"role": "user", "content": data.mensaje},
                 {"role": "assistant", "content": layer1_response}
             ])
             return {"respuesta": layer1_response, "fuentes": [], "chat_id": chat_id}
         
-        # CAPA 2
+        # CAPA 2 (extracción de contacto ligera)
         extracted_data = layer2_extract_contact_data(ctx)
-        
         if extracted_data:
             current_info = ctx.contact_info.copy()
             if extracted_data.get("nombre"):
@@ -966,27 +1055,22 @@ async def responder(data: Entrada):
                 current_info["telefono"] = extracted_data["telefono"]
             if extracted_data.get("barrio"):
                 current_info["barrio"] = extracted_data["barrio"]
-            
             conv_ref.update({"contact_info": current_info})
-            
             if current_info.get("telefono"):
                 conv_ref.update({"contact_collected": True})
-            
             ctx.contact_info = current_info
         
         proj_loc = extract_project_location(data.mensaje)
         if proj_loc:
             conv_ref.update({"project_location": proj_loc})
         
-        # CAPA 3
+        # CAPA 3 (clasificación liviana)
         clasificacion = layer3_classify_with_context(ctx)
         
-        # PROPUESTAS
+        # FLUJO PROPUESTAS (se mantiene)
         if clasificacion["tipo"] == "propuesta" or ctx.in_proposal_flow:
-            
             # FASE 1: Recopilar propuesta
             if not ctx.proposal_collected:
-                
                 # Caso A: Intención sin contenido
                 if is_proposal_intent_heuristic(data.mensaje) and not looks_like_proposal_content(data.mensaje):
                     conv_ref.update({
@@ -999,11 +1083,9 @@ async def responder(data: Entrada):
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-                
-                # Caso B: Tiene contenido de propuesta
+                # Caso B: Tiene contenido
                 if looks_like_proposal_content(data.mensaje):
                     propuesta_extraida = extract_proposal_text(data.mensaje)
-                    
                     if len(_normalize_text(propuesta_extraida)) < 10:
                         conv_ref.update({
                             "proposal_requested": True,
@@ -1015,7 +1097,6 @@ async def responder(data: Entrada):
                             {"role": "assistant", "content": texto}
                         ])
                         return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-                    
                     # Propuesta válida
                     conv_ref.update({
                         "current_proposal": propuesta_extraida,
@@ -1028,19 +1109,15 @@ async def responder(data: Entrada):
                         ctx.contact_info.get("nombre"),
                         ctx.project_location
                     )
-                    
                     print(f"[PROPUESTA] ✅ Guardada: '{propuesta_extraida[:50]}...'")
-                    
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-                
-                # Caso C: Ya pedimos propuesta pero no llegó (NUDGES)
+                # Caso C: Nudges
                 if conv_data.get("proposal_requested"):
                     nudges = int(conv_data.get("proposal_nudge_count", 0))
-                    
                     if is_proposal_denial(data.mensaje):
                         conv_ref.update({
                             "proposal_requested": False,
@@ -1055,7 +1132,6 @@ async def responder(data: Entrada):
                             {"role": "assistant", "content": texto}
                         ])
                         return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-                    
                     if is_question_like(data.mensaje):
                         conv_ref.update({
                             "proposal_requested": False,
@@ -1068,11 +1144,9 @@ async def responder(data: Entrada):
                             {"role": "assistant", "content": texto}
                         ])
                         return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-                    
-                    # Nudge escalonado
+                    # nudge escalonado
                     nudges += 1
                     conv_ref.update({"proposal_nudge_count": nudges})
-                    
                     if nudges == 1:
                         texto = "Claro. ¿Cuál es tu propuesta? Dímela en 1-2 frases y el barrio del proyecto."
                     elif nudges == 2:
@@ -1084,95 +1158,78 @@ async def responder(data: Entrada):
                             "contact_intent": None
                         })
                         texto = "Todo bien. Si prefieres, dime tu pregunta o tema y te ayudo de una."
-                    
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-            
             # FASE 2: Recopilar argumento
             if ctx.proposal_collected and not ctx.argument_collected:
                 es_argumento = has_argument_text(data.mensaje)
-                
                 if es_argumento:
                     conv_ref.update({
                         "argument_collected": True,
                         "contact_requested": True,
                     })
-                    
                     missing = ctx.get_missing_contact_fields()
                     if not ctx.project_location:
                         missing.append("project_location")
-                    
                     if missing:
-                        if missing == ["project_location"]:
-                            texto = build_project_location_request()
-                        else:
-                            texto = build_contact_request(missing)
+                        texto = build_project_location_request() if missing == ["project_location"] else build_contact_request(missing)
                     else:
                         texto = "Perfecto, con estos datos escalamos tu propuesta."
-                    
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                 else:
-                    texto = craft_argument_question(
-                        ctx.contact_info.get("nombre"),
-                        ctx.project_location
-                    )
+                    texto = craft_argument_question(ctx.contact_info.get("nombre"), ctx.project_location)
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-            
             # FASE 3: Recopilar contacto
             if ctx.argument_collected and ctx.contact_requested:
                 missing = ctx.get_missing_contact_fields()
                 if not ctx.project_location:
                     missing.append("project_location")
-                
                 if missing:
-                    if missing == ["project_location"]:
-                        texto = build_project_location_request()
-                    else:
-                        texto = build_contact_request(missing)
+                    texto = build_project_location_request() if missing == ["project_location"] else build_contact_request(missing)
                 else:
                     nombre_txt = ctx.contact_info.get("nombre", "")
                     texto = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
                     texto += "Con estos datos escalamos el caso y te contamos avances."
-                
                 append_mensajes(conv_ref, [
                     {"role": "user", "content": data.mensaje},
                     {"role": "assistant", "content": texto}
                 ])
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
         
-        # CAPA 4: RAG
+        # CAPA 4: RAG (mejorado)
         query_for_search = data.mensaje
         if ctx.has_reference:
             query_for_search = reformulate_query_with_context(data.mensaje, ctx.historial)
         
-        hits = rag_search(query_for_search, top_k=5)
+        hits = rag_search(query_for_search, top_k=RAG_TOP_K)
 
         print(f"\n{'='*60}")
         print(f"[RAG DEBUG] Query: '{query_for_search}'")
         print(f"[RAG DEBUG] Hits encontrados: {len(hits)}")
         for i, hit in enumerate(hits[:3], 1):
-            print(f"  Hit {i}: score={hit.get('score', 0):.3f} | texto='{hit.get('texto', '')[:80]}...'")
+            print(f"  Hit {i}: score={hit.get('score', 0):.3f} | texto='{(hit.get('texto','')[:120]).replace(chr(10),' ')}...'")
         print(f"{'='*60}\n")
         
-        if not validate_rag_relevance(hits):
-            if any(kw in _normalize_text(data.mensaje) for kw in ["ley", "proyecto", "educacion", "educación"]):
+        if not validate_rag_relevance(hits, data.mensaje):
+            # último intento de expansión para consultas explícitas de leyes/proyectos
+            if any(kw in _normalize_text(data.mensaje) for kw in ["ley","proyecto","educacion","educación"]):
                 texto = (
                     "No encontré información específica sobre eso en mi base de datos actual. "
-                    "Te recomiendo contactar directamente a la oficina de Wilder para información más detallada."
+                    "Si puedes darme el número de la ley o más detalles puntuales, lo reviso de inmediato."
                 )
             else:
-                texto = "No tengo información específica sobre eso en este momento. ¿Hay algo más en lo que pueda ayudarte?"
+                texto = "No tengo información específica sobre eso en este momento. ¿Quieres que afinemos la pregunta?"
         else:
             texto = layer4_generate_response_with_memory(ctx, clasificacion, hits)
         
@@ -1199,24 +1256,20 @@ async def clasificar(body: ClasificarIn):
         chat_id = body.chat_id
         conv_ref = db.collection("conversaciones").document(chat_id)
         snap = conv_ref.get()
-        
         if not snap.exists:
             return {"ok": False, "mensaje": "Conversación no encontrada"}
         
         conv_data = snap.to_dict() or {}
         mensajes = conv_data.get("mensajes", [])
-        
         ultimo_usuario = ""
         for m in reversed(mensajes):
             if m.get("role") == "user":
                 ultimo_usuario = m.get("content", "")
                 break
-        
         if not ultimo_usuario:
             return {"ok": False, "mensaje": "No hay mensajes para clasificar"}
         
         propuesta = conv_data.get("current_proposal") or ""
-        
         if propuesta:
             tipo = "propuesta"
             texto_clasificar = propuesta
@@ -1224,9 +1277,8 @@ async def clasificar(body: ClasificarIn):
             es_consulta = (
                 ("?" in ultimo_usuario) or
                 any(kw in _normalize_text(ultimo_usuario) 
-                    for kw in ["que", "como", "cuando", "donde", "wilder", "ley", "proyecto"])
+                    for kw in ["que","como","cuando","donde","wilder","ley","proyecto"])
             )
-            
             if es_consulta:
                 tipo = "consulta"
                 texto_clasificar = ultimo_usuario
@@ -1255,12 +1307,11 @@ async def clasificar(body: ClasificarIn):
         
         try:
             out = client.chat.completions.create(
-                model=OPENAI_MODEL,
+                model=OPENAI_MODEL_SUMMARY,
                 messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
                 temperature=0.2,
-                max_tokens=100
+                max_tokens=120
             ).choices[0].message.content.strip()
-            
             out = out.replace("```json", "").replace("```", "").strip()
             data = json.loads(out)
         except:
@@ -1275,7 +1326,6 @@ async def clasificar(body: ClasificarIn):
         
         categorias_existentes = conv_data.get("categoria_general") or []
         titulos_existentes = conv_data.get("titulo_propuesta") or []
-        
         if isinstance(categorias_existentes, str):
             categorias_existentes = [categorias_existentes]
         if isinstance(titulos_existentes, str):
