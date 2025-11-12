@@ -785,18 +785,81 @@ def positive_ack_and_request_argument(name: Optional[str], project_location: Opt
     """Reconoce propuesta y pide argumento."""
     return "Excelente idea. ¿Por qué sería importante?"
 
-def positive_feedback_after_argument(name: Optional[str], missing_fields: List[str]) -> str:
+def positive_feedback_after_argument(
+    name: Optional[str], 
+    missing_fields: List[str],
+    propuesta: str,
+    argumento: str
+) -> str:
     """
-    Da opinión positiva sobre el argumento y explica por qué necesita datos.
+    Genera feedback PERSONALIZADO con LLM sobre la propuesta y el argumento.
+    Luego explica por qué necesita datos.
     """
-    # Opinión positiva personalizada
-    if name:
-        feedback = f"Gracias por compartir eso, {name}. Tu propuesta tiene mucho sentido y puede beneficiar a la comunidad. "
-    else:
-        feedback = "Gracias por compartir eso. Tu propuesta tiene mucho sentido y puede beneficiar a la comunidad. "
     
-    # Explicación de por qué necesitamos datos
-    explanation = "Para darle seguimiento y escalar tu propuesta con el equipo de Wilder, necesito algunos datos: "
+    # ══════════════════════════════════════════════════════════════
+    # PASO 1: Generar feedback personalizado con LLM
+    # ══════════════════════════════════════════════════════════════
+    
+    sys = (
+        "Eres un asistente que valida propuestas ciudadanas.\n"
+        "Da una opinión positiva BREVE (máximo 2 frases cortas) sobre la propuesta y su argumento.\n"
+        "Debe sonar natural, empático y motivador.\n"
+        "NO uses frases genéricas como 'tiene mucho sentido'.\n"
+        "NO repitas las mismas palabras.\n"
+        "Enfócate en el IMPACTO ESPECÍFICO que menciona el ciudadano.\n\n"
+        "Ejemplos BUENOS:\n"
+        "- 'Me parece excelente. Mejorar la seguridad con mejor iluminación es clave para que las familias se sientan tranquilas.'\n"
+        "- 'Muy buena idea. Un espacio recreativo para los niños fortalece la comunidad y les da un lugar seguro para jugar.'\n"
+        "- 'Totalmente de acuerdo. Arreglar esas vías mejorará la movilidad de todos y evitará accidentes.'\n\n"
+        "Ejemplos MALOS (no usar):\n"
+        "- 'Tu propuesta tiene mucho sentido y puede beneficiar a la comunidad.'\n"
+        "- 'Es una propuesta muy valiosa para el sector.'\n"
+    )
+    
+    saludo = f"Gracias, {name}. " if name else "Gracias por compartir eso. "
+    
+    usr = (
+        f"Propuesta: {propuesta}\n"
+        f"Argumento/Motivo: {argumento}\n\n"
+        "Da tu opinión positiva BREVE (máximo 2 frases cortas)."
+    )
+    
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": usr}
+            ],
+            temperature=0.7,  # Más creatividad para variedad
+            max_tokens=80,     # Máximo ~2-3 frases
+            timeout=3
+        )
+        
+        feedback_llm = response.choices[0].message.content.strip()
+        
+        # Limpiar comillas si el LLM las pone
+        feedback_llm = feedback_llm.strip('"').strip("'")
+        
+        feedback = saludo + feedback_llm + " "
+        
+    except Exception as e:
+        # Fallback si el LLM falla
+        print(f"[WARN] LLM feedback failed: {e}")
+        if name:
+            feedback = f"Gracias, {name}. Es una propuesta valiosa que puede mejorar la calidad de vida en el sector. "
+        else:
+            feedback = "Gracias por compartir eso. Es una propuesta valiosa que puede mejorar la calidad de vida en el sector. "
+    
+    # ══════════════════════════════════════════════════════════════
+    # PASO 2: Agregar explicación de por qué necesita datos
+    # ══════════════════════════════════════════════════════════════
+    
+    # Si NO hay datos faltantes
+    if not missing_fields:
+        return feedback + "Ya tengo todos tus datos, así que vamos a escalar esto. ¡Gracias!"
+    
+    explanation = "Para darle seguimiento y escalar tu propuesta con el equipo de Wilder, necesito "
     
     # Construir lista de datos faltantes
     etiquetas = {
@@ -811,9 +874,15 @@ def positive_feedback_after_argument(name: Optional[str], missing_fields: List[s
     if not pedir:
         return feedback + "Ya tengo todos tus datos, así que vamos a escalar esto. ¡Gracias!"
     
-    frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
+    # Construir frase natural
+    if len(pedir) == 1:
+        frase = pedir[0]
+    elif len(pedir) == 2:
+        frase = pedir[0] + " y " + pedir[1]
+    else:
+        frase = ", ".join(pedir[:-1]) + " y " + pedir[-1]
     
-    return feedback + explanation + frase + "."
+    return feedback + explanation + frase + ". ¿Me los compartes?"
 
 
 def build_contact_request_with_explanation(name: Optional[str], missing: List[str]) -> str:
