@@ -102,6 +102,21 @@ class ClasificarIn(BaseModel):
 async def health():
     return {"status": "ok"}
 
+@app.get("/")
+async def root():
+    """Ruta raíz - información básica de la API"""
+    return {
+        "service": "WilderBot API",
+        "version": "2.0",
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "responder": "POST /responder",
+            "clasificar": "POST /clasificar",
+            "docs": "/docs"
+        }
+    }
+
 # ═══════════════════════════════════════════════════════════════════════
 # SECCIÓN 1: UTILIDADES DE TEXTO
 # ═══════════════════════════════════════════════════════════════════════
