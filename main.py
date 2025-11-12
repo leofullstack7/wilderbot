@@ -605,10 +605,71 @@ def extract_user_barrio(text: str) -> Optional[str]:
     return None
 
 def extract_project_location(text: str) -> Optional[str]:
-    """Extrae barrio del proyecto (no de residencia)."""
-    m = re.search(r'\ben\s+el\s+barrio\s+([A-Za-záéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+    """
+    Extrae barrio del proyecto con detección FLEXIBLE.
+    Acepta múltiples formatos:
+      - "en el barrio Aranjuez"
+      - "proyecto es en Aranjuez"
+      - "Aranjuez" (cuando ya se pidió el dato)
+    """
+    
+    # Patrón 1: "en el barrio X"
+    m = re.search(
+        r'\ben\s+el\s+barrio\s+([A-Za-záéíóúñ0-9 \-]{2,50})',
+        text, 
+        flags=re.IGNORECASE
+    )
     if m:
         return _clean_barrio_fragment(m.group(1))
+    
+    # Patrón 2: "proyecto (es/sería) en X"
+    m = re.search(
+        r'\bproyecto\s+(?:es|seria|sería)\s+en\s+([A-Za-záéíóúñ0-9 \-]{2,50})',
+        text,
+        flags=re.IGNORECASE
+    )
+    if m:
+        return _clean_barrio_fragment(m.group(1))
+    
+    # Patrón 3: "el proyecto en X"
+    m = re.search(
+        r'\bel\s+proyecto\s+en\s+([A-Za-záéíóúñ0-9 \-]{2,50})',
+        text,
+        flags=re.IGNORECASE
+    )
+    if m:
+        return _clean_barrio_fragment(m.group(1))
+    
+    # Patrón 4: "se haría en X" o "se hará en X"
+    m = re.search(
+        r'\bse\s+(?:haria|haría|hara|hará)\s+en\s+([A-Za-záéíóúñ0-9 \-]{2,50})',
+        text,
+        flags=re.IGNORECASE
+    )
+    if m:
+        return _clean_barrio_fragment(m.group(1))
+    
+    # Patrón 5: Buscar cualquier nombre con mayúscula que NO sea nombre de persona
+    # Solo si el mensaje es corto (< 50 chars) y tiene pocas palabras
+    if len(text) < 50 and len(text.split()) <= 5:
+        palabras_mayuscula = re.findall(
+            r'\b([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,2})\b',
+            text
+        )
+        
+        for posible_barrio in palabras_mayuscula:
+            normalized = _normalize_text(posible_barrio)
+            
+            # Validar que NO sea palabra de discurso ni nombre común
+            if normalized in DISCOURSE_START_WORDS:
+                continue
+            
+            # Validar que NO sea un nombre de persona (sin apellido)
+            # Si tiene 1 sola palabra y está sola, probablemente es barrio
+            palabras = posible_barrio.split()
+            if len(palabras) <= 3:
+                return _titlecase(posible_barrio)
+    
     return None
 
 def extract_proposal_text(text: str) -> str:
@@ -1076,9 +1137,15 @@ def build_messages(
     contexto = "\n".join([f"- {s}" for s in rag_snippets if s.strip()])
 
     system_msg = (
-        "Actúa como Wilder Escobar, Representante a la Cámara en Colombia.\n"
-        "Tono cercano y claro. **Máximo 3–4 frases, sin párrafos largos.**\n"
-        "No saludes de nuevo. No pidas contacto si no toca."
+        "Eres el ASISTENTE de Wilder Escobar, Representante a la Cámara en Colombia.\n"
+        "IMPORTANTE: NO eres Wilder, eres su asistente que lo representa.\n\n"
+        "REGLAS:\n"
+        "- Habla en TERCERA PERSONA sobre Wilder: 'Wilder ha apoyado...', 'El representante propone...'\n"
+        "- NUNCA digas 'yo' o 'he apoyado' o 'mi trabajo'\n"
+        "- Tono cercano, profesional y claro\n"
+        "- Máximo 3-4 frases, sin párrafos largos\n"
+        "- No saludes de nuevo si ya hay historial\n"
+        "- No pidas contacto si no corresponde\n"
     )
 
     if emphasize_argument:
