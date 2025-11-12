@@ -1209,10 +1209,24 @@ async def responder(data: Entrada):
         
         name = extract_user_name(data.mensaje)
         phone = extract_phone(data.mensaje)
-        user_barrio = extract_user_barrio(data.mensaje)
-        proj_loc = extract_project_location(data.mensaje)
-        
-        # Si ya pedimos contacto y no hay formato claro, usar LLM
+
+        # ──────────────────────────────────────────────────────────────
+        # Extraer barrio según la fase del flujo
+        # ──────────────────────────────────────────────────────────────
+
+        # Si ya pidió datos personales, ahora está pidiendo barrio del proyecto
+        if conv_data.get("contact_collected") and conv_data.get("contact_requested"):
+            # Fase 3B: Pedir barrio del PROYECTO
+            proj_loc = extract_project_location(data.mensaje)
+            user_barrio = None  # No buscar barrio de residencia en esta fase
+        else:
+            # Fase 3A: Pedir datos personales (incluye barrio de RESIDENCIA)
+            user_barrio = extract_user_barrio(data.mensaje)
+            proj_loc = None  # No buscar barrio del proyecto todavía
+
+        # ──────────────────────────────────────────────────────────────
+        # LLM como fallback si no se detectó nada
+        # ──────────────────────────────────────────────────────────────
         if conv_data.get("contact_requested") and not (name or phone or user_barrio):
             llm_data = llm_extract_contact_info(data.mensaje)
             if llm_data.get("nombre"):
@@ -1221,32 +1235,42 @@ async def responder(data: Entrada):
                 phone = llm_data["telefono"]
             if llm_data.get("barrio"):
                 user_barrio = llm_data["barrio"]
-        
+
+        # ──────────────────────────────────────────────────────────────
         # Actualizar info de contacto
+        # ──────────────────────────────────────────────────────────────
         if name or phone or user_barrio:
             current_info = conv_data.get("contact_info") or {}
             new_info = dict(current_info)
             
             if name and not current_info.get("nombre"):
                 new_info["nombre"] = name
-            if user_barrio:
+            if user_barrio and not current_info.get("barrio"):
                 new_info["barrio"] = user_barrio
             if phone:
                 new_info["telefono"] = phone
             
             conv_ref.update({"contact_info": new_info})
-            if phone:
+            
+            # Marcar como "recolectado" solo si tiene nombre + barrio + teléfono
+            if new_info.get("nombre") and new_info.get("barrio") and new_info.get("telefono"):
                 conv_ref.update({"contact_collected": True})
+                
+                # Crear usuario en BD
                 upsert_usuario_o_anon(
                     chat_id,
-                    new_info.get("nombre") or data.nombre or data.usuario,
-                    phone,
+                    new_info.get("nombre"),
+                    new_info.get("telefono"),
                     data.canal,
-                    new_info.get("barrio") or user_barrio
+                    new_info.get("barrio")
                 )
-        
+
+        # ──────────────────────────────────────────────────────────────
+        # Actualizar barrio del proyecto (solo en Fase 3B)
+        # ──────────────────────────────────────────────────────────────
         if proj_loc:
             conv_ref.update({"project_location": proj_loc})
+            print(f"[EXTRACT] ✅ Barrio del proyecto: {proj_loc}")
         
         # ═══════════════════════════════════════════════════════════════
         # CAPA 2: Clasificación Inteligente
@@ -1417,22 +1441,19 @@ async def responder(data: Entrada):
                         ])
                         return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                     
+
                     # ══════════════════════════════════════════════════════════════
-                    # Determinar qué datos faltan
+                    # Determinar qué datos faltan (SOLO datos personales)
                     # ══════════════════════════════════════════════════════════════
                     current_info = conv_data.get("contact_info") or {}
                     missing = []
-                    
+
                     if not (current_info.get("nombre") or name): 
                         missing.append("nombre")
                     if not (current_info.get("barrio") or user_barrio): 
                         missing.append("barrio")
                     if not (current_info.get("telefono") or phone): 
                         missing.append("celular")
-                    
-                    # Ubicación del proyecto (crítico para propuestas)
-                    if not (conv_data.get("project_location") or proj_loc):
-                        missing.append("project_location")
                     
                     # ══════════════════════════════════════════════════════════════
                     # Generar feedback personalizado con LLM
@@ -1462,11 +1483,13 @@ async def responder(data: Entrada):
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
             
 
-            # FASE 3: Recopilar contacto
-            if conv_data.get("argument_collected") and conv_data.get("contact_requested"):
+            # ═══════════════════════════════════════════════════════════════
+            # FASE 3A: Recopilar datos personales (nombre + teléfono + barrio residencia)
+            # ═══════════════════════════════════════════════════════════════
+            if conv_data.get("argument_collected") and conv_data.get("contact_requested") and not conv_data.get("contact_collected"):
                 
                 # ══════════════════════════════════════════════════════════════
-                # NUEVO: Detectar si pregunta "¿para qué?"
+                # Detectar si pregunta "¿para qué?"
                 # ══════════════════════════════════════════════════════════════
                 if is_asking_why(data.mensaje):
                     texto = (
@@ -1481,10 +1504,11 @@ async def responder(data: Entrada):
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                 
                 # ══════════════════════════════════════════════════════════════
-                # Continuar con recolección normal
+                # Verificar qué datos personales faltan
                 # ══════════════════════════════════════════════════════════════
                 current_info = conv_data.get("contact_info") or {}
                 missing = []
+                
                 if not (current_info.get("nombre") or name): 
                     missing.append("nombre")
                 if not (current_info.get("barrio") or user_barrio): 
@@ -1492,12 +1516,8 @@ async def responder(data: Entrada):
                 if not (current_info.get("telefono") or phone): 
                     missing.append("celular")
                 
-                # También verificar barrio del proyecto
-                if not (conv_data.get("project_location") or proj_loc):
-                    missing.append("project_location")
-                
                 if missing:
-                    # NUEVO: Usar helper mejorado que explica por qué
+                    # Todavía faltan datos personales → pedir de nuevo
                     nombre_actual = current_info.get("nombre") or name
                     texto = build_contact_request_with_explanation(nombre_actual, missing)
                     
@@ -1506,16 +1526,57 @@ async def responder(data: Entrada):
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
-                else:
-                    nombre_txt = current_info.get("nombre", "")
-                    texto = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
-                    texto += "Con estos datos escalamos el caso y te contamos avances."
+                
+                # ══════════════════════════════════════════════════════════════
+                # Ya tiene todos los datos personales → pasar a FASE 3B
+                # ══════════════════════════════════════════════════════════════
+                # (el flujo continúa abajo en FASE 3B)
+
+            # ═══════════════════════════════════════════════════════════════
+            # FASE 3B: Pedir barrio del proyecto
+            # ═══════════════════════════════════════════════════════════════
+            if conv_data.get("contact_collected") and not conv_data.get("project_location"):
+                
+                # ¿Ya extrajo el barrio del proyecto en este mensaje?
+                if proj_loc:
+                    # ✅ Usuario acaba de dar el barrio del proyecto
+                    conv_ref.update({"project_location": proj_loc})
+                    
+                    nombre_txt = conv_data.get("contact_info", {}).get("nombre", "")
+                    texto = (f"Perfecto, {nombre_txt}. " if nombre_txt else "Perfecto. ")
+                    texto += "Con todos estos datos vamos a escalar tu propuesta. ¡Gracias por tu participación!"
                     
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                
+                else:
+                    # Todavía falta el barrio del proyecto → pedirlo
+                    texto = build_project_location_request()
+                    
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+
+            # ═══════════════════════════════════════════════════════════════
+            # FASE 3C: Todo completo (ya tiene datos personales Y barrio del proyecto)
+            # ═══════════════════════════════════════════════════════════════
+            if conv_data.get("contact_collected") and conv_data.get("project_location"):
+                
+                # Ya tiene TODO → confirmar y terminar
+                nombre_txt = conv_data.get("contact_info", {}).get("nombre", "")
+                texto = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
+                texto += "Ya tenemos toda la información para escalar tu propuesta. Te mantendremos informado del avance."
+                
+                append_mensajes(conv_ref, [
+                    {"role": "user", "content": data.mensaje},
+                    {"role": "assistant", "content": texto}
+                ])
+                return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
         
         # ═══════════════════════════════════════════════════════════════
         # CAPA 4: RAG + Generación
@@ -1645,24 +1706,53 @@ async def clasificar(body: ClasificarIn):
         categoria = data.get("categoria_general", "General")
         titulo = data.get("titulo_propuesta", "Sin título")
         
-        # Guardar (acumulativo)
+        # ══════════════════════════════════════════════════════════════
+        # LÓGICA MEJORADA: Detectar cambio de tipo (Consulta → Propuesta)
+        # ══════════════════════════════════════════════════════════════
         categorias_existentes = conv_data.get("categoria_general") or []
         titulos_existentes = conv_data.get("titulo_propuesta") or []
-        
+
         if isinstance(categorias_existentes, str):
             categorias_existentes = [categorias_existentes]
         if isinstance(titulos_existentes, str):
             titulos_existentes = [titulos_existentes]
-        
-        if categoria not in categorias_existentes:
+
+        # ──────────────────────────────────────────────────────────────
+        # CASO 1: Usuario cambió de Consulta → Propuesta
+        # ──────────────────────────────────────────────────────────────
+        tiene_consulta = "Consulta" in categorias_existentes
+        es_propuesta_nueva = (tipo == "propuesta" and categoria != "Consulta")
+
+        if tiene_consulta and es_propuesta_nueva:
+            # REEMPLAZAR Consulta por la categoría de propuesta
+            categorias_existentes = [c for c in categorias_existentes if c != "Consulta"]
             categorias_existentes.append(categoria)
-        
-        titulo_normalizado = _normalize_text(titulo)
-        titulos_normalizados_existentes = [_normalize_text(t) for t in titulos_existentes]
-        
-        if titulo_normalizado not in titulos_normalizados_existentes:
+            
+            # REEMPLAZAR título de consulta por título de propuesta
+            # Remover títulos que no sean específicos de propuesta
+            titulos_existentes = []
             titulos_existentes.append(titulo)
-        
+            
+            print(f"[CLASIFICAR] ✅ Cambio detectado: Consulta → {categoria}")
+            
+        # ──────────────────────────────────────────────────────────────
+        # CASO 2: Normal (sin cambio de tipo)
+        # ──────────────────────────────────────────────────────────────
+        else:
+            # Agregar categoría si no existe
+            if categoria not in categorias_existentes:
+                categorias_existentes.append(categoria)
+            
+            # Agregar título si no existe (normalizado)
+            titulo_normalizado = _normalize_text(titulo)
+            titulos_normalizados_existentes = [_normalize_text(t) for t in titulos_existentes]
+            
+            if titulo_normalizado not in titulos_normalizados_existentes:
+                titulos_existentes.append(titulo)
+
+        # ──────────────────────────────────────────────────────────────
+        # Guardar en BD
+        # ──────────────────────────────────────────────────────────────
         conv_ref.update({
             "categoria_general": categorias_existentes,
             "titulo_propuesta": titulos_existentes,
