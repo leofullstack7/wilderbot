@@ -501,10 +501,62 @@ def extract_phone(text: str) -> Optional[str]:
     return tel if 8 <= len(tel) <= 12 else None
 
 def extract_user_barrio(text: str) -> Optional[str]:
-    """Extrae barrio de residencia del usuario."""
-    m = re.search(r'\b(?:vivo|resido)\s+en\s+(?:el\s+)?(?:barrio\s+)?([A-Za-záéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+    """
+    Extrae barrio de residencia con detección FLEXIBLE.
+    Acepta:
+      - "vivo en Aranjuez"
+      - "Barrio Milan" (directo)
+      - "Milan" (si está después de pedirlo)
+    """
+    
+    # Patrón 1: "vivo/resido en (el barrio)? X"
+    m = re.search(
+        r'\b(?:vivo|resido)\s+en\s+(?:el\s+)?(?:barrio\s+)?'
+        r'([A-Záéíóúñ][A-Za-záéíóúñ0-9 \-]{1,49}?)'
+        r'(?=(?:\s+(?:y|mi|número|teléfono|celular|desde|de|del|con|para|por)\b|[,.;]|$))',
+        text, flags=re.IGNORECASE
+    )
     if m:
         return _clean_barrio_fragment(m.group(1))
+    
+    # Patrón 2: "Barrio X" (explícito con la palabra "barrio")
+    m = re.search(
+        r'\bbarrio\s+([A-Záéíóúñ][A-Za-záéíóúñ0-9 \-]{2,30})',
+        text, flags=re.IGNORECASE
+    )
+    if m:
+        return _clean_barrio_fragment(m.group(1))
+    
+    # Patrón 3: "soy del barrio X"
+    m = re.search(r'\bsoy\s+del\s+barrio\s+([A-Za-záéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+    if m:
+        return _clean_barrio_fragment(m.group(1))
+    
+    # Patrón 4: "mi barrio es X" o "mi barrio X"
+    m = re.search(r'\bmi\s+barrio\s+(?:es\s+)?([A-Za-záéíóúñ0-9 \-]{2,50})', text, flags=re.IGNORECASE)
+    if m:
+        return _clean_barrio_fragment(m.group(1))
+    
+    # ──────────────────────────────────────────────────────────
+    # NUEVO: Patrón 5 - Nombre de barrio suelto con mayúscula inicial
+    # (Solo si tiene entre 2-4 palabras y empieza con mayúscula)
+    # ──────────────────────────────────────────────────────────
+    
+    # Buscar palabras que empiecen con mayúscula (posibles nombres de barrio)
+    palabras_mayuscula = re.findall(r'\b([A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})\b', text)
+    
+    for posible_barrio in palabras_mayuscula:
+        # Validar que NO sea una palabra común de discurso
+        normalized = _normalize_text(posible_barrio)
+        
+        if normalized in DISCOURSE_START_WORDS:
+            continue
+        
+        # Validar que tenga 2-4 palabras (barrios típicos)
+        num_palabras = len(posible_barrio.split())
+        if 1 <= num_palabras <= 4:
+            return _titlecase(posible_barrio)
+    
     return None
 
 def extract_project_location(text: str) -> Optional[str]:
@@ -613,8 +665,11 @@ def reformulate_query_with_context(
     conversation_history: List[Dict[str, str]],
     max_history: int = 6
 ) -> str:
-    """Reformula query considerando contexto conversacional."""
+    """
+    Reformula query con contexto COMPLETO de múltiples temas mencionados.
+    """
     
+    # Si la query ya es específica y larga, no reformular
     if len(current_query.split()) > 8:
         return current_query
     
@@ -623,25 +678,57 @@ def reformulate_query_with_context(
     if not recent:
         return current_query
     
-    # Extraer tema del último bot
-    tema_especifico = ""
+    # ──────────────────────────────────────────────────────────
+    # NUEVO: Extraer TODAS las leyes/temas mencionados (no solo el último)
+    # ──────────────────────────────────────────────────────────
+    temas_mencionados = []
     
-    for msg in reversed(recent):
+    for msg in recent:
         if msg["role"] == "assistant":
-            ultimo_bot = msg.get("content", "")
+            content = msg.get("content", "")
             
-            ley_match = re.search(r'Ley\s+(\d+)', ultimo_bot, re.IGNORECASE)
-            if ley_match:
-                tema_especifico = f"Ley {ley_match.group(1)}"
-                break
+            # Extraer TODAS las leyes mencionadas
+            leyes = re.findall(r'Ley\s+(\d+)\s+de\s+(\d+)', content, re.IGNORECASE)
+            for num_ley, año in leyes:
+                temas_mencionados.append(f"Ley {num_ley} de {año}")
+            
+            # Extraer temas generales (ej: "nivelación educativa", "cuidado ambiental")
+            # Buscar frases clave después de "sobre", "para", "de"
+            temas_generales = re.findall(
+                r'(?:sobre|para|de)\s+([a-záéíóúñ\s]{10,50}?)(?:\.|,|$)',
+                content.lower()
+            )
+            temas_mencionados.extend([t.strip() for t in temas_generales if len(t.strip()) > 10])
     
-    referencias_vagas = ["ella", "eso", "esa", "sobre eso"]
-    if tema_especifico and any(ref in current_query.lower() for ref in referencias_vagas):
-        reformulated = f"{tema_especifico} detalles"
-        print(f"[QUERY] Reformulada: '{reformulated}'")
-        return reformulated
+    # ──────────────────────────────────────────────────────────
+    # Detectar referencias plurales ("las dos", "ambas", "esas")
+    # ──────────────────────────────────────────────────────────
+    referencias_plurales = ["las dos", "ambas", "esas", "esos", "las tres", "todos"]
+    query_lower = current_query.lower()
+    
+    if any(ref in query_lower for ref in referencias_plurales):
+        if len(temas_mencionados) >= 2:
+            # Tomar las últimas 2-3 leyes mencionadas
+            ultimos_temas = temas_mencionados[-3:] if len(temas_mencionados) >= 3 else temas_mencionados[-2:]
+            reformulated = " y ".join(ultimos_temas) + " detalles"
+            print(f"[QUERY] Reformulada (plural): '{reformulated}'")
+            return reformulated
+    
+    # ──────────────────────────────────────────────────────────
+    # Detectar referencias singulares ("eso", "esa", "la primera")
+    # ──────────────────────────────────────────────────────────
+    referencias_vagas = ["eso", "esa", "ese", "sobre eso", "de eso", "aquello"]
+    
+    if any(ref in query_lower for ref in referencias_vagas):
+        if temas_mencionados:
+            # Tomar el último tema mencionado
+            ultimo_tema = temas_mencionados[-1]
+            reformulated = f"{ultimo_tema} detalles"
+            print(f"[QUERY] Reformulada (singular): '{reformulated}'")
+            return reformulated
     
     return current_query
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # SECCIÓN 8: HELPERS DE CONTACTO
