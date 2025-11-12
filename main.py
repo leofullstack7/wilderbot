@@ -479,6 +479,36 @@ def detect_contact_refusal(text: str) -> bool:
         "no doy mi celular"
     ])
 
+def is_asking_why(text: str) -> bool:
+    """
+    Detecta si el usuario pregunta "¿para qué?" o similares cuando se le piden datos.
+    """
+    t = _normalize_text(text)
+    
+    # Preguntas directas sobre por qué se piden datos
+    preguntas_why = [
+        "para que",
+        "para qué",
+        "por que",
+        "por qué",
+        "por que razon",
+        "por qué razón",
+        "para que es",
+        "para qué es",
+        "por que lo necesitas",
+        "por qué lo necesitas",
+        "para que lo necesitas",
+        "para qué lo necesitas",
+        "por que me lo pides",
+        "para que sirve"
+    ]
+    
+    # Si el mensaje es corto (menos de 20 chars) y tiene pregunta "para qué"
+    if len(t) <= 20 and any(p in t for p in preguntas_why):
+        return True
+    
+    return False
+
 # ═══════════════════════════════════════════════════════════════════════
 # SECCIÓN 5: EXTRACCIÓN DE DATOS
 # ═══════════════════════════════════════════════════════════════════════
@@ -735,11 +765,12 @@ def reformulate_query_with_context(
 # ═══════════════════════════════════════════════════════════════════════
 
 def build_contact_request(missing: List[str]) -> str:
-    """Genera mensaje pidiendo datos faltantes."""
-    etiquetas = {"nombre": "tu nombre", "barrio": "tu barrio", "celular": "celular"}
-    pedir = [etiquetas[m] for m in missing if m in etiquetas]
-    frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
-    return f"¿Me compartes {frase}?"
+    """
+    Genera mensaje pidiendo datos (ahora con explicación).
+    Mantiene compatibilidad con llamadas antiguas.
+    """
+    # Delegar a la función mejorada (sin nombre porque es legacy)
+    return build_contact_request_with_explanation(None, missing)
 
 def build_project_location_request() -> str:
     """Pide ubicación del proyecto."""
@@ -753,6 +784,77 @@ def craft_argument_question(name: Optional[str], project_location: Optional[str]
 def positive_ack_and_request_argument(name: Optional[str], project_location: Optional[str] = None) -> str:
     """Reconoce propuesta y pide argumento."""
     return "Excelente idea. ¿Por qué sería importante?"
+
+def positive_feedback_after_argument(name: Optional[str], missing_fields: List[str]) -> str:
+    """
+    Da opinión positiva sobre el argumento y explica por qué necesita datos.
+    """
+    # Opinión positiva personalizada
+    if name:
+        feedback = f"Gracias por compartir eso, {name}. Tu propuesta tiene mucho sentido y puede beneficiar a la comunidad. "
+    else:
+        feedback = "Gracias por compartir eso. Tu propuesta tiene mucho sentido y puede beneficiar a la comunidad. "
+    
+    # Explicación de por qué necesitamos datos
+    explanation = "Para darle seguimiento y escalar tu propuesta con el equipo de Wilder, necesito algunos datos: "
+    
+    # Construir lista de datos faltantes
+    etiquetas = {
+        "nombre": "tu nombre",
+        "barrio": "el barrio donde vives",
+        "celular": "tu número de celular",
+        "project_location": "el barrio exacto donde se haría el proyecto"
+    }
+    
+    pedir = [etiquetas[m] for m in missing_fields if m in etiquetas]
+    
+    if not pedir:
+        return feedback + "Ya tengo todos tus datos, así que vamos a escalar esto. ¡Gracias!"
+    
+    frase = pedir[0] if len(pedir) == 1 else (", ".join(pedir[:-1]) + " y " + pedir[-1])
+    
+    return feedback + explanation + frase + "."
+
+
+def build_contact_request_with_explanation(name: Optional[str], missing: List[str]) -> str:
+    """
+    Genera mensaje pidiendo datos CON EXPLICACIÓN de por qué se necesitan.
+    """
+    # Saludo personalizado
+    if name:
+        intro = f"{name}, para darle seguimiento y escalar tu propuesta con el equipo de Wilder, "
+    else:
+        intro = "Para darle seguimiento y escalar tu propuesta con el equipo de Wilder, "
+    
+    # Si NO hay datos faltantes
+    if not missing:
+        return "Ya tengo todos los datos necesarios. ¡Gracias!"
+    
+    # Explicación corta
+    explanation = "necesito "
+    
+    # Construir lista de datos faltantes
+    etiquetas = {
+        "nombre": "tu nombre",
+        "barrio": "el barrio donde vives",
+        "celular": "tu número de celular",
+        "project_location": "el barrio exacto del proyecto"
+    }
+    
+    pedir = [etiquetas[m] for m in missing if m in etiquetas]
+    
+    if not pedir:
+        return "Ya tengo todos los datos necesarios. ¡Gracias!"
+    
+    # Construir frase natural
+    if len(pedir) == 1:
+        frase = pedir[0]
+    elif len(pedir) == 2:
+        frase = pedir[0] + " y " + pedir[1]
+    else:
+        frase = ", ".join(pedir[:-1]) + " y " + pedir[-1]
+    
+    return intro + explanation + frase + ". ¿Me los compartes?"
 
 def strip_contact_requests(texto: str) -> str:
     """Elimina pedidos de contacto del texto."""
@@ -1025,16 +1127,35 @@ async def responder(data: Entrada):
                         "contact_intent": "propuesta"
                     })
                     
+                    # ══════════════════════════════════════════════════════════════
+                    # Determinar qué datos faltan
+                    # ══════════════════════════════════════════════════════════════
                     current_info = conv_data.get("contact_info") or {}
                     missing = []
-                    if not current_info.get("nombre"): missing.append("nombre")
-                    if not current_info.get("barrio"): missing.append("barrio")
-                    if not current_info.get("telefono"): missing.append("celular")
                     
-                    if missing:
-                        texto = build_contact_request(missing)
-                    else:
-                        texto = "Perfecto, con estos datos escalamos tu propuesta."
+                    if not (current_info.get("nombre") or name): 
+                        missing.append("nombre")
+                    if not (current_info.get("barrio") or user_barrio): 
+                        missing.append("barrio")
+                    if not (current_info.get("telefono") or phone): 
+                        missing.append("celular")
+                    
+                    # Ubicación del proyecto (crítico para propuestas)
+                    if not (conv_data.get("project_location") or proj_loc):
+                        missing.append("project_location")
+                    
+                    # ══════════════════════════════════════════════════════════════
+                    # CORRECCIÓN: Generar respuesta completa (feedback + petición)
+                    # ══════════════════════════════════════════════════════════════
+                    nombre_actual = current_info.get("nombre") or name
+                    
+                    # Siempre usar la función que da feedback positivo + explica + pide datos
+                    texto = positive_feedback_after_argument(nombre_actual, missing)
+                    
+                    # ══════════════════════════════════════════════════════════════
+                    # NO necesitas el if/else porque positive_feedback_after_argument
+                    # ya maneja ambos casos (con datos faltantes o sin ellos)
+                    # ══════════════════════════════════════════════════════════════
                     
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
@@ -1049,16 +1170,46 @@ async def responder(data: Entrada):
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
             
+
             # FASE 3: Recopilar contacto
             if conv_data.get("argument_collected") and conv_data.get("contact_requested"):
+                
+                # ══════════════════════════════════════════════════════════════
+                # NUEVO: Detectar si pregunta "¿para qué?"
+                # ══════════════════════════════════════════════════════════════
+                if is_asking_why(data.mensaje):
+                    texto = (
+                        "Es para darle seguimiento a tu propuesta y poder escalarlo con el equipo de Wilder. "
+                        "Así podemos informarte sobre el avance y gestionar tu caso de manera personalizada. "
+                        "¿Me compartes tu nombre, el barrio donde vives y tu número de celular?"
+                    )
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                
+                # ══════════════════════════════════════════════════════════════
+                # Continuar con recolección normal
+                # ══════════════════════════════════════════════════════════════
                 current_info = conv_data.get("contact_info") or {}
                 missing = []
-                if not (current_info.get("nombre") or name): missing.append("nombre")
-                if not (current_info.get("barrio") or user_barrio): missing.append("barrio")
-                if not (current_info.get("telefono") or phone): missing.append("celular")
+                if not (current_info.get("nombre") or name): 
+                    missing.append("nombre")
+                if not (current_info.get("barrio") or user_barrio): 
+                    missing.append("barrio")
+                if not (current_info.get("telefono") or phone): 
+                    missing.append("celular")
+                
+                # También verificar barrio del proyecto
+                if not (conv_data.get("project_location") or proj_loc):
+                    missing.append("project_location")
                 
                 if missing:
-                    texto = build_contact_request(missing)
+                    # NUEVO: Usar helper mejorado que explica por qué
+                    nombre_actual = current_info.get("nombre") or name
+                    texto = build_contact_request_with_explanation(nombre_actual, missing)
+                    
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
                         {"role": "assistant", "content": texto}
@@ -1067,7 +1218,7 @@ async def responder(data: Entrada):
                 else:
                     nombre_txt = current_info.get("nombre", "")
                     texto = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
-                    texto += "Con estos datos escalamos el caso."
+                    texto += "Con estos datos escalamos el caso y te contamos avances."
                     
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
