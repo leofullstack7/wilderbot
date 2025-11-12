@@ -713,9 +713,34 @@ def smart_classify_with_context(mensaje: str, resumen: str, conv_data: dict) -> 
     if any(kw in t for kw in propuesta_keywords):
         return {"tipo": "propuesta", "confianza": "alta", "metodo": "heuristica_propuesta"}
     
-    # Consultas obvias
-    if "?" in mensaje and not any(kw in t for kw in ["propongo", "sugiero", "me gustaria construir"]):
-        if any(kw in t for kw in ["wilder", "ley", "proyecto de ley", "que propone", "que apoya"]):
+    # ══════════════════════════════════════════════════════════════
+    # CONSULTAS OBVIAS (prioridad alta)
+    # ══════════════════════════════════════════════════════════════
+
+    # Tiene signo de interrogación?
+    if "?" in mensaje:
+        # Es consulta si NO tiene palabras de propuesta
+        palabras_propuesta = ["propongo", "sugiero", "me gustaria construir", "quisiera que", "deberian"]
+        es_propuesta = any(kw in t for kw in palabras_propuesta)
+        
+        if not es_propuesta:
+            print("[CLASSIFY] ✅ Es consulta (tiene '?' y no palabras de propuesta)")
+            return {"tipo": "consulta", "confianza": "alta", "metodo": "heuristica_consulta"}
+
+    # Pregunta sobre Wilder o leyes (sin signo de interrogación)
+    palabras_consulta = [
+        "wilder", "ley", "leyes", "proyecto de ley", "proyectos de ley",
+        "que propone", "que apoya", "cual es su posicion", "apoya alguna",
+        "ha presentado", "que piensa", "que opina"
+    ]
+
+    if any(kw in t for kw in palabras_consulta):
+        # Solo si NO tiene verbos de acción física
+        verbos_accion = ["arregl", "constru", "instal", "paviment", "ilumin", "repar", "pint"]
+        tiene_verbo_accion = any(v in t for v in verbos_accion)
+        
+        if not tiene_verbo_accion:
+            print("[CLASSIFY] ✅ Es consulta (pregunta sobre Wilder/leyes sin verbos de acción)")
             return {"tipo": "consulta", "confianza": "alta", "metodo": "heuristica_consulta"}
     
     # NIVEL 2: LLM con resumen (casos ambiguos)
@@ -1283,19 +1308,33 @@ async def responder(data: Entrada):
         resumen_contexto = conv_data.get("conversacion_resumida", "")
         clasificacion = smart_classify_with_context(data.mensaje, resumen_contexto, conv_data)
         
-        # Si ya estamos en flujo de propuesta, mantenerlo
+        # ══════════════════════════════════════════════════════════════
+        # VALIDAR: ¿El usuario cambió de propuesta a consulta?
+        # ══════════════════════════════════════════════════════════════
         already_in_proposal_flow = bool(
             conv_data.get("proposal_collected") or
             conv_data.get("proposal_requested") or
             conv_data.get("argument_requested") or
             conv_data.get("contact_intent") == "propuesta"
         )
-        
-        if already_in_proposal_flow:
+
+        # Si estaba en flujo de propuesta PERO la nueva clasificación es consulta con alta confianza
+        if already_in_proposal_flow and clasificacion["tipo"] == "consulta" and clasificacion["confianza"] == "alta":
+            # Usuario cambió de opinión → resetear flujo de propuesta
+            conv_ref.update({
+                "proposal_requested": False,
+                "proposal_collected": False,
+                "argument_requested": False,
+                "argument_collected": False,
+                "contact_requested": False,
+                "contact_intent": None
+            })
+            already_in_proposal_flow = False
+
+        elif already_in_proposal_flow:
+            # Mantener flujo de propuesta
             clasificacion["tipo"] = "propuesta"
             clasificacion["confianza"] = "alta"
-        
-        print(f"[CLASSIFY] {clasificacion}")
         
         # ═══════════════════════════════════════════════════════════════
         # CAPA 3: Flujo de Propuestas (Determinista)
@@ -1317,6 +1356,12 @@ async def responder(data: Entrada):
             return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
         
         is_proposal_flow = already_in_proposal_flow or clasificacion["tipo"] == "propuesta"
+        # Si NO está en flujo de propuesta Y el mensaje tiene "?"
+        # entonces NO es propuesta aunque clasificacion diga que sí
+        if not already_in_proposal_flow and "?" in data.mensaje and clasificacion["tipo"] == "propuesta":
+            print("[CLASSIFY] ⚠️ Mensaje tiene '?' pero clasificó como propuesta. Corrigiendo a consulta.")
+            is_proposal_flow = False
+            clasificacion["tipo"] = "consulta"
         
         if is_proposal_flow:
             # FASE 1: Recopilar propuesta
