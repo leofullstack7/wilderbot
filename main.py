@@ -1052,13 +1052,12 @@ def positive_feedback_after_argument(
         return feedback + "Ya tengo todos tus datos, así que vamos a escalar esto. ¡Gracias!"
     
     explanation = "Para darle seguimiento y escalar tu propuesta con el equipo de Wilder, necesito "
-    
+
     # Construir lista de datos faltantes
     etiquetas = {
         "nombre": "tu nombre",
-        "barrio": "el barrio donde vives",
-        "celular": "tu número de celular",
-        "project_location": "el barrio exacto donde se haría el proyecto"
+        "barrio": "el barrio donde vives",  # ✅ Este debe estar SIEMPRE
+        "celular": "tu número de celular"
     }
     
     pedir = [etiquetas[m] for m in missing_fields if m in etiquetas]
@@ -1243,26 +1242,31 @@ async def responder(data: Entrada):
             current_info = conv_data.get("contact_info") or {}
             new_info = dict(current_info)
             
-            if name and not current_info.get("nombre"):
+            if name:
                 new_info["nombre"] = name
-            if user_barrio and not current_info.get("barrio"):
+            if user_barrio:
                 new_info["barrio"] = user_barrio
             if phone:
                 new_info["telefono"] = phone
             
             conv_ref.update({"contact_info": new_info})
             
-            # Marcar como "recolectado" solo si tiene nombre + barrio + teléfono
-            if new_info.get("nombre") and new_info.get("barrio") and new_info.get("telefono"):
+            # ✅ Marcar como "recolectado" solo si tiene LOS 3 DATOS
+            tiene_nombre = bool(new_info.get("nombre"))
+            tiene_barrio = bool(new_info.get("barrio"))
+            tiene_telefono = bool(new_info.get("telefono"))
+            
+            if tiene_nombre and tiene_barrio and tiene_telefono:
+                print(f"[CAPA1] ✅ Datos completos: {new_info}")
                 conv_ref.update({"contact_collected": True})
                 
                 # Crear usuario en BD
                 upsert_usuario_o_anon(
                     chat_id,
-                    new_info.get("nombre"),
-                    new_info.get("telefono"),
+                    new_info["nombre"],
+                    new_info["telefono"],
                     data.canal,
-                    new_info.get("barrio")
+                    new_info["barrio"]
                 )
 
         # ──────────────────────────────────────────────────────────────
