@@ -1328,6 +1328,29 @@ async def responder(data: Entrada):
                     })
                     
                     # ══════════════════════════════════════════════════════════════
+                    # VALIDACIÓN CRÍTICA: Verificar que existe propuesta
+                    # ══════════════════════════════════════════════════════════════
+                    propuesta_texto = conv_data.get("current_proposal", "")
+                    
+                    if not propuesta_texto or len(propuesta_texto.strip()) < 10:
+                        # ERROR: No hay propuesta pero llegamos hasta aquí
+                        # Resetear el flujo y pedir propuesta de nuevo
+                        conv_ref.update({
+                            "proposal_collected": False,
+                            "argument_collected": False,
+                            "argument_requested": False,
+                            "contact_requested": False,
+                            "proposal_requested": True,
+                            "proposal_nudge_count": 0
+                        })
+                        texto = "Parece que no tengo clara tu propuesta. ¿Podrías contármela en 1-2 frases?"
+                        append_mensajes(conv_ref, [
+                            {"role": "user", "content": data.mensaje},
+                            {"role": "assistant", "content": texto}
+                        ])
+                        return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                    
+                    # ══════════════════════════════════════════════════════════════
                     # Determinar qué datos faltan
                     # ══════════════════════════════════════════════════════════════
                     current_info = conv_data.get("contact_info") or {}
@@ -1345,17 +1368,18 @@ async def responder(data: Entrada):
                         missing.append("project_location")
                     
                     # ══════════════════════════════════════════════════════════════
-                    # CORRECCIÓN: Generar respuesta completa (feedback + petición)
+                    # Generar feedback personalizado con LLM
                     # ══════════════════════════════════════════════════════════════
                     nombre_actual = current_info.get("nombre") or name
+                    argumento_texto = data.mensaje  # El mensaje actual ES el argumento
                     
-                    # Siempre usar la función que da feedback positivo + explica + pide datos
-                    texto = positive_feedback_after_argument(nombre_actual, missing)
-                    
-                    # ══════════════════════════════════════════════════════════════
-                    # NO necesitas el if/else porque positive_feedback_after_argument
-                    # ya maneja ambos casos (con datos faltantes o sin ellos)
-                    # ══════════════════════════════════════════════════════════════
+                    # Usar LLM para generar feedback personalizado
+                    texto = positive_feedback_after_argument(
+                        nombre_actual, 
+                        missing,
+                        propuesta_texto,
+                        argumento_texto
+                    )
                     
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
