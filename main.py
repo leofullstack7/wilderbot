@@ -873,66 +873,102 @@ def positive_feedback_after_argument(
 ) -> str:
     """
     Genera feedback PERSONALIZADO con LLM sobre la propuesta y el argumento.
-    Luego explica por qué necesita datos.
+    Versión robusta con múltiples niveles de fallback.
     """
     
     # ══════════════════════════════════════════════════════════════
-    # PASO 1: Generar feedback personalizado con LLM
+    # PASO 1: Validar inputs
     # ══════════════════════════════════════════════════════════════
-    
-    sys = (
-        "Eres un asistente que valida propuestas ciudadanas.\n"
-        "Da una opinión positiva BREVE (máximo 2 frases cortas) sobre la propuesta y su argumento.\n"
-        "Debe sonar natural, empático y motivador.\n"
-        "NO uses frases genéricas como 'tiene mucho sentido'.\n"
-        "NO repitas las mismas palabras.\n"
-        "Enfócate en el IMPACTO ESPECÍFICO que menciona el ciudadano.\n\n"
-        "Ejemplos BUENOS:\n"
-        "- 'Me parece excelente. Mejorar la seguridad con mejor iluminación es clave para que las familias se sientan tranquilas.'\n"
-        "- 'Muy buena idea. Un espacio recreativo para los niños fortalece la comunidad y les da un lugar seguro para jugar.'\n"
-        "- 'Totalmente de acuerdo. Arreglar esas vías mejorará la movilidad de todos y evitará accidentes.'\n\n"
-        "Ejemplos MALOS (no usar):\n"
-        "- 'Tu propuesta tiene mucho sentido y puede beneficiar a la comunidad.'\n"
-        "- 'Es una propuesta muy valiosa para el sector.'\n"
-    )
-    
-    saludo = f"Gracias, {name}. " if name else "Gracias por compartir eso. "
-    
-    usr = (
-        f"Propuesta: {propuesta}\n"
-        f"Argumento/Motivo: {argumento}\n\n"
-        "Da tu opinión positiva BREVE (máximo 2 frases cortas)."
-    )
-    
-    try:
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": usr}
-            ],
-            temperature=0.7,  # Más creatividad para variedad
-            max_tokens=80,     # Máximo ~2-3 frases
-            timeout=3
+    if not propuesta or not argumento:
+        print("[WARN] Propuesta o argumento vacíos, usando fallback genérico")
+        if name:
+            feedback = f"Gracias, {name}. Es una propuesta valiosa para la comunidad. "
+        else:
+            feedback = "Gracias por compartir tu propuesta. Es muy valiosa para la comunidad. "
+    else:
+        # ══════════════════════════════════════════════════════════════
+        # PASO 2: Intentar generar feedback personalizado con LLM
+        # ══════════════════════════════════════════════════════════════
+        
+        sys = (
+            "Eres un asistente que valida propuestas ciudadanas.\n"
+            "Da una opinión positiva BREVE (máximo 2 frases cortas) sobre la propuesta.\n"
+            "Debe sonar natural, empático y motivador.\n"
+            "NO uses frases genéricas como 'tiene mucho sentido'.\n"
+            "Enfócate en el IMPACTO que menciona el ciudadano.\n\n"
+            "Ejemplos:\n"
+            "- 'Me parece excelente. Mejorar la seguridad con iluminación es clave para las familias.'\n"
+            "- 'Muy buena idea. Un espacio recreativo fortalece la comunidad.'\n"
+            "- 'Totalmente de acuerdo. Mejorar las vías evitará accidentes.'\n"
         )
         
-        feedback_llm = response.choices[0].message.content.strip()
+        # Limitar tamaño para evitar errores
+        propuesta_corta = propuesta[:200]
+        argumento_corto = argumento[:200]
         
-        # Limpiar comillas si el LLM las pone
-        feedback_llm = feedback_llm.strip('"').strip("'")
+        usr = (
+            f"Propuesta: {propuesta_corta}\n"
+            f"Motivo: {argumento_corto}\n\n"
+            "Da tu opinión positiva BREVE (máximo 2 frases)."
+        )
         
-        feedback = saludo + feedback_llm + " "
-        
-    except Exception as e:
-        # Fallback si el LLM falla
-        print(f"[WARN] LLM feedback failed: {e}")
-        if name:
-            feedback = f"Gracias, {name}. Es una propuesta valiosa que puede mejorar la calidad de vida en el sector. "
-        else:
-            feedback = "Gracias por compartir eso. Es una propuesta valiosa que puede mejorar la calidad de vida en el sector. "
+        try:
+            print("[LLM] Generando feedback personalizado...")
+            
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": usr}
+                ],
+                temperature=0.7,
+                max_tokens=80,
+                timeout=8  # Aumentado a 8 segundos
+            )
+            
+            feedback_llm = response.choices[0].message.content.strip()
+            feedback_llm = feedback_llm.strip('"').strip("'").strip()
+            
+            # Validar que el LLM dio una respuesta útil
+            if len(feedback_llm) < 10:
+                raise ValueError("Respuesta LLM muy corta")
+            
+            saludo = f"Gracias, {name}. " if name else "Gracias por compartir eso. "
+            feedback = saludo + feedback_llm + " "
+            
+            print(f"[LLM] ✅ Feedback generado: {feedback[:100]}...")
+            
+        except Exception as e:
+            print(f"[WARN] LLM feedback failed: {e}")
+            
+            # ══════════════════════════════════════════════════════════════
+            # FALLBACK 1: Feedback basado en palabras clave
+            # ══════════════════════════════════════════════════════════════
+            argumento_lower = argumento.lower()
+            propuesta_lower = propuesta.lower()
+            
+            if "niño" in argumento_lower or "niña" in argumento_lower or "jugar" in argumento_lower:
+                feedback_especifico = "Es una excelente idea. Un espacio para los niños fortalece la comunidad y les brinda seguridad."
+            elif "seguridad" in argumento_lower or "inseguridad" in argumento_lower or "miedo" in argumento_lower:
+                feedback_especifico = "Me parece muy importante. Mejorar la seguridad es fundamental para la tranquilidad de las familias."
+            elif "via" in propuesta_lower or "calle" in propuesta_lower or "anden" in propuesta_lower:
+                feedback_especifico = "Totalmente de acuerdo. Mejorar la infraestructura vial beneficia a toda la comunidad."
+            elif "alumbrado" in propuesta_lower or "luminaria" in propuesta_lower or "luz" in propuesta_lower:
+                feedback_especifico = "Excelente propuesta. Un buen alumbrado público mejora la seguridad y calidad de vida."
+            elif "parque" in propuesta_lower or "cancha" in propuesta_lower:
+                feedback_especifico = "Me parece muy valioso. Los espacios recreativos son esenciales para la comunidad."
+            else:
+                feedback_especifico = "Es una propuesta muy valiosa que puede mejorar la calidad de vida en el sector."
+            
+            if name:
+                feedback = f"Gracias, {name}. {feedback_especifico} "
+            else:
+                feedback = f"Gracias por compartir eso. {feedback_especifico} "
+            
+            print(f"[FALLBACK] ✅ Usando feedback basado en keywords")
     
     # ══════════════════════════════════════════════════════════════
-    # PASO 2: Agregar explicación de por qué necesita datos
+    # PASO 3: Agregar explicación de por qué necesita datos
     # ══════════════════════════════════════════════════════════════
     
     # Si NO hay datos faltantes
