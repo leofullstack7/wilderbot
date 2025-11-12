@@ -697,6 +697,7 @@ def reformulate_query_with_context(
 ) -> str:
     """
     Reformula query con contexto COMPLETO de múltiples temas mencionados.
+    Versión mejorada con mejor detección de leyes y referencias plurales.
     """
     
     # Si la query ya es específica y larga, no reformular
@@ -709,54 +710,133 @@ def reformulate_query_with_context(
         return current_query
     
     # ──────────────────────────────────────────────────────────
-    # NUEVO: Extraer TODAS las leyes/temas mencionados (no solo el último)
+    # PASO 1: Extraer TODAS las leyes mencionadas
     # ──────────────────────────────────────────────────────────
+    leyes_mencionadas = []
     temas_mencionados = []
     
     for msg in recent:
         if msg["role"] == "assistant":
             content = msg.get("content", "")
             
-            # Extraer TODAS las leyes mencionadas
-            leyes = re.findall(r'Ley\s+(\d+)\s+de\s+(\d+)', content, re.IGNORECASE)
-            for num_ley, año in leyes:
-                temas_mencionados.append(f"Ley {num_ley} de {año}")
+            # Patrón 1: "Ley XXXX de YYYY" (ej: Ley 2402 de 2024)
+            leyes_patron1 = re.findall(r'Ley\s+(\d+)\s+de\s+(\d{4})', content, re.IGNORECASE)
+            for num_ley, año in leyes_patron1:
+                ley_completa = f"Ley {num_ley} de {año}"
+                if ley_completa not in leyes_mencionadas:
+                    leyes_mencionadas.append(ley_completa)
             
-            # Extraer temas generales (ej: "nivelación educativa", "cuidado ambiental")
-            # Buscar frases clave después de "sobre", "para", "de"
-            temas_generales = re.findall(
-                r'(?:sobre|para|de)\s+([a-záéíóúñ\s]{10,50}?)(?:\.|,|$)',
+            # Patrón 2: "la Ley XXXX" (sin año)
+            leyes_patron2 = re.findall(r'la\s+Ley\s+(\d+)', content, re.IGNORECASE)
+            for num_ley in leyes_patron2:
+                ley_simple = f"Ley {num_ley}"
+                # Solo agregar si no hay una versión completa ya
+                if not any(f"Ley {num_ley}" in l for l in leyes_mencionadas):
+                    leyes_mencionadas.append(ley_simple)
+            
+            # Patrón 3: Extraer temas después de "sobre", "relacionadas con", "de"
+            temas_patron = re.findall(
+                r'(?:sobre|relacionadas?\s+con|de|para)\s+(?:el\s+|la\s+)?([a-záéíóúñ\s]{8,60}?)(?:\.|,|y\s+la|$)',
                 content.lower()
             )
-            temas_mencionados.extend([t.strip() for t in temas_generales if len(t.strip()) > 10])
+            
+            for tema in temas_patron:
+                tema_limpio = tema.strip()
+                if len(tema_limpio) >= 8 and tema_limpio not in temas_mencionados:
+                    temas_mencionados.append(tema_limpio)
+    
+    print(f"[DEBUG] Leyes encontradas: {leyes_mencionadas}")
+    print(f"[DEBUG] Temas encontrados: {temas_mencionados}")
     
     # ──────────────────────────────────────────────────────────
-    # Detectar referencias plurales ("las dos", "ambas", "esas")
+    # PASO 2: Detectar tipo de referencia en la query actual
     # ──────────────────────────────────────────────────────────
-    referencias_plurales = ["las dos", "ambas", "esas", "esos", "las tres", "todos"]
     query_lower = current_query.lower()
     
-    if any(ref in query_lower for ref in referencias_plurales):
-        if len(temas_mencionados) >= 2:
-            # Tomar las últimas 2-3 leyes mencionadas
-            ultimos_temas = temas_mencionados[-3:] if len(temas_mencionados) >= 3 else temas_mencionados[-2:]
-            reformulated = " y ".join(ultimos_temas) + " detalles"
-            print(f"[QUERY] Reformulada (plural): '{reformulated}'")
+    # Referencias PLURALES en español
+    referencias_plurales = [
+        "las dos", "ambas", "esas", "esos", "las tres", "todos", 
+        "ellas", "sobre ellas", "de ellas", "las leyes",
+        "esas leyes", "ambas leyes", "las mencionadas"
+    ]
+    
+    # Referencias SINGULARES
+    referencias_singulares = [
+        "eso", "esa", "ese", "sobre eso", "de eso", "aquello",
+        "la primera", "el primero", "esa ley", "ese proyecto"
+    ]
+    
+    # ──────────────────────────────────────────────────────────
+    # CASO 1: Referencias PLURALES → Tomar TODAS las leyes/temas
+    # ──────────────────────────────────────────────────────────
+    es_plural = any(ref in query_lower for ref in referencias_plurales)
+    
+    if es_plural:
+        if len(leyes_mencionadas) >= 2:
+            # Tomar TODAS las leyes mencionadas (no solo las últimas)
+            todas_leyes = " y ".join(leyes_mencionadas)
+            reformulated = f"{todas_leyes} detalles completos"
+            print(f"[QUERY] Reformulada (plural - TODAS): '{reformulated}'")
+            return reformulated
+        
+        elif len(leyes_mencionadas) == 1 and len(temas_mencionados) >= 1:
+            # Una ley + temas
+            reformulated = f"{leyes_mencionadas[0]} {temas_mencionados[0]} detalles"
+            print(f"[QUERY] Reformulada (plural - ley+tema): '{reformulated}'")
+            return reformulated
+        
+        elif len(temas_mencionados) >= 2:
+            # Solo temas
+            todos_temas = " y ".join(temas_mencionados[:2])
+            reformulated = f"{todos_temas} información completa"
+            print(f"[QUERY] Reformulada (plural - temas): '{reformulated}'")
             return reformulated
     
     # ──────────────────────────────────────────────────────────
-    # Detectar referencias singulares ("eso", "esa", "la primera")
+    # CASO 2: Referencias SINGULARES → Tomar el ÚLTIMO
     # ──────────────────────────────────────────────────────────
-    referencias_vagas = ["eso", "esa", "ese", "sobre eso", "de eso", "aquello"]
+    es_singular = any(ref in query_lower for ref in referencias_singulares)
     
-    if any(ref in query_lower for ref in referencias_vagas):
-        if temas_mencionados:
-            # Tomar el último tema mencionado
-            ultimo_tema = temas_mencionados[-1]
+    if es_singular:
+        if leyes_mencionadas:
+            # Detectar si pide "la primera" o "el primero"
+            if "primera" in query_lower or "primero" in query_lower:
+                ultimo_tema = leyes_mencionadas[0]  # La primera mencionada
+            else:
+                ultimo_tema = leyes_mencionadas[-1]  # La última mencionada
+            
             reformulated = f"{ultimo_tema} detalles"
             print(f"[QUERY] Reformulada (singular): '{reformulated}'")
             return reformulated
+        
+        elif temas_mencionados:
+            ultimo_tema = temas_mencionados[-1]
+            reformulated = f"{ultimo_tema} información"
+            print(f"[QUERY] Reformulada (singular - tema): '{reformulated}'")
+            return reformulated
     
+    # ──────────────────────────────────────────────────────────
+    # CASO 3: Palabras como "más", "ampliación", "detalles"
+    # ──────────────────────────────────────────────────────────
+    palabras_expansion = ["más", "mas", "ampliar", "detalles", "información", "informacion"]
+    
+    if any(p in query_lower for p in palabras_expansion):
+        if leyes_mencionadas:
+            if len(leyes_mencionadas) >= 2:
+                # Si mencionó varias, asumir que quiere todas
+                todas = " y ".join(leyes_mencionadas)
+                reformulated = f"{todas} información completa"
+                print(f"[QUERY] Reformulada (expansión - todas): '{reformulated}'")
+                return reformulated
+            else:
+                # Solo una ley
+                reformulated = f"{leyes_mencionadas[-1]} detalles"
+                print(f"[QUERY] Reformulada (expansión - una): '{reformulated}'")
+                return reformulated
+    
+    # ──────────────────────────────────────────────────────────
+    # CASO 4: No hay referencias claras → Query original
+    # ──────────────────────────────────────────────────────────
     return current_query
 
 
