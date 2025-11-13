@@ -1708,6 +1708,7 @@ async def responder(data: Entrada):
                 es_argumento = has_argument_text(data.mensaje) or len(_normalize_text(data.mensaje)) >= 20
                 
                 if es_argumento:
+                    tono = detect_tone_from_argument(data.mensaje)
                     conv_ref.update({
                         "argument_collected": True,
                         "contact_requested": True,
