@@ -1781,7 +1781,7 @@ async def responder(data: Entrada):
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
             
 
-# ═══════════════════════════════════════════════════════════════
+            # ═══════════════════════════════════════════════════════════════
             # FASE 3A: Recopilar datos personales (nombre + teléfono + barrio residencia)
             # ═══════════════════════════════════════════════════════════════
             if conv_data.get("argument_collected") and conv_data.get("contact_requested") and not conv_data.get("contact_collected"):
@@ -1824,6 +1824,24 @@ async def responder(data: Entrada):
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                
+                # ══════════════════════════════════════════════════════════════
+                # ✅ YA TIENE TODOS LOS DATOS PERSONALES → PEDIR UBICACIÓN DEL PROYECTO INMEDIATAMENTE
+                # ══════════════════════════════════════════════════════════════
+                
+                # Actualizar BD: marcar datos como recolectados
+                conv_ref.update({"contact_collected": True})
+                
+                print("[FASE 3A→3B] ✅ Datos personales completos. Pasando a pedir ubicación del proyecto.")
+                
+                # PEDIR UBICACIÓN DEL PROYECTO (FASE 3B inline)
+                texto = build_project_location_request()
+                
+                append_mensajes(conv_ref, [
+                    {"role": "user", "content": data.mensaje},
+                    {"role": "assistant", "content": texto}
+                ])
+                return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                 
                 # ══════════════════════════════════════════════════════════════
                 # ✅ Ya tiene todos los datos personales → IR A FASE 3B
