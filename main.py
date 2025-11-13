@@ -525,6 +525,28 @@ def is_asking_why(text: str) -> bool:
     
     return False
 
+def detect_tone_from_argument(text: str) -> str:
+    """
+    Detecta el tono del argumento del usuario.
+    Opciones: propositivo, urgente, preocupado, neutral
+    """
+    t = _normalize_text(text)
+    
+    # Tono URGENTE
+    if any(kw in t for kw in ["urgente", "rapido", "ya", "inmediato", "critico", "grave"]):
+        return "urgente"
+    
+    # Tono PREOCUPADO
+    if any(kw in t for kw in ["miedo", "inseguridad", "peligro", "accidente", "riesgo", "preocupa"]):
+        return "preocupado"
+    
+    # Tono PROPOSITIVO (default para propuestas)
+    if any(kw in t for kw in ["mejor", "beneficio", "oportun", "positiv", "important"]):
+        return "propositivo"
+    
+    # Neutral (fallback)
+    return "neutral"
+
 # ═══════════════════════════════════════════════════════════════════════
 # SECCIÓN 5: EXTRACCIÓN DE DATOS
 # ═══════════════════════════════════════════════════════════════════════
@@ -704,17 +726,25 @@ def llm_extract_personal_contact(text: str) -> Dict[str, Optional[str]]:
     """
     sys = (
         "Extrae los DATOS PERSONALES del usuario del siguiente mensaje.\n"
+        "El bot le pidió: 'tu nombre, el barrio donde vives y tu número de celular'\n\n"
         "Devuelve un JSON con:\n"
         "{\n"
         '  "nombre": "nombre completo del usuario (ej: Juan Pérez)",\n'
-        '  "barrio": "barrio donde VIVE el usuario (ej: Laureles)",\n'
+        '  "barrio": "barrio donde VIVE/RESIDE el usuario (ej: Laureles)",\n'
         '  "telefono": "número de celular sin espacios (ej: 3001234567)"\n'
         "}\n\n"
-        "REGLAS:\n"
+        "REGLAS CRÍTICAS:\n"
+        "- El barrio es donde VIVE el usuario (su RESIDENCIA)\n"
+        "- Si dice 'Cesar, 312658945, Centro' → Centro es su barrio de RESIDENCIA\n"
+        "- Si dice 'Juan, Laureles, 3001234567' → Laureles es su barrio de RESIDENCIA\n"
         "- Si no encuentras algún dato, pon null\n"
-        "- El barrio debe ser donde VIVE, no donde es el proyecto\n"
         "- El teléfono debe ser solo números (quitar espacios y guiones)\n"
         "- El nombre debe estar en formato Title Case\n"
+        "\n"
+        "EJEMPLOS:\n"
+        '- "Cesar, 312658945, Centro" → {"nombre": "Cesar", "barrio": "Centro", "telefono": "312658945"}\n'
+        '- "María López, vivo en Laureles, 3001234567" → {"nombre": "María López", "barrio": "Laureles", "telefono": "3001234567"}\n'
+        '- "Pedro, 3156789012, mi barrio es Aranjuez" → {"nombre": "Pedro", "barrio": "Aranjuez", "telefono": "3156789012"}\n'
     )
     
     usr = f"Mensaje del usuario:\n{text}"
@@ -744,11 +774,11 @@ def llm_extract_personal_contact(text: str) -> Dict[str, Optional[str]]:
             tel = re.sub(r'^(?:00)?57', '', tel)
             data["telefono"] = tel if 8 <= len(tel) <= 12 else None
         
-        print(f"[LLM EXTRACT] Resultado: {data}")
+
         return data
         
     except Exception as e:
-        print(f"[LLM EXTRACT] Error: {e}")
+
         return {"nombre": None, "barrio": None, "telefono": None}
 
 
@@ -1029,8 +1059,6 @@ def reformulate_query_with_context(
                 if len(tema_limpio) >= 8 and tema_limpio not in temas_mencionados:
                     temas_mencionados.append(tema_limpio)
     
-    print(f"[DEBUG] Leyes encontradas: {leyes_mencionadas}")
-    print(f"[DEBUG] Temas encontrados: {temas_mencionados}")
     
     # ──────────────────────────────────────────────────────────
     # PASO 2: Detectar tipo de referencia en la query actual
@@ -1453,22 +1481,19 @@ async def responder(data: Entrada):
 
         # FASE 3A: ¿Está pidiendo datos personales?
         elif conv_data.get("contact_requested") and not conv_data.get("contact_collected"):
-            print("[EXTRACT] Fase 3A: Extrayendo datos personales con LLM...")
             
             # Usar LLM para extraer nombre, barrio de residencia y teléfono
             llm_result = llm_extract_personal_contact(data.mensaje)
             
             if llm_result.get("nombre"):
                 name = llm_result["nombre"]
-                print(f"[EXTRACT] ✅ Nombre: {name}")
             
             if llm_result.get("barrio"):
                 user_barrio = llm_result["barrio"]
-                print(f"[EXTRACT] ✅ Barrio residencia: {user_barrio}")
             
             if llm_result.get("telefono"):
                 phone = llm_result["telefono"]
-                print(f"[EXTRACT] ✅ Teléfono: {phone}")
+
 
         # ══════════════════════════════════════════════════════════════
         # Actualizar info de contacto en BD
@@ -1686,7 +1711,8 @@ async def responder(data: Entrada):
                     conv_ref.update({
                         "argument_collected": True,
                         "contact_requested": True,
-                        "contact_intent": "propuesta"
+                        "contact_intent": "propuesta",
+                        "tono_detectado": tono  # ✅ NUEVO
                     })
                     
                     # ══════════════════════════════════════════════════════════════
@@ -2058,7 +2084,6 @@ async def clasificar(body: ClasificarIn):
             titulos_existentes = []
             titulos_existentes.append(titulo)
             
-            print(f"[CLASIFICAR] ✅ Cambio detectado: Consulta → {categoria}")
             
         # ──────────────────────────────────────────────────────────────
         # CASO 2: Normal (sin cambio de tipo)
