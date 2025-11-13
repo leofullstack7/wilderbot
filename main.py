@@ -632,11 +632,28 @@ def has_argument_text(t: str) -> bool:
 def detect_contact_refusal(text: str) -> bool:
     """Detecta si el usuario rechaza dar datos personales."""
     t = _normalize_text(text)
-    return any(p in t for p in [
+    
+    # Rechazos explícitos
+    rechazos_explicitos = [
         "no me gusta dar mis datos",
         "no quiero compartir mis datos",
-        "no doy mi celular"
-    ])
+        "no doy mi celular",
+        "no quiero dar",
+        "no me gusta dar",
+        "no dare",
+        "no daré",
+        "prefiero no dar",
+        "no me gusta dar esa informacion",
+        "no me gusta dar esa información"
+    ]
+    
+    # Rechazos simples (solo si el mensaje es corto)
+    if len(t) <= 15:
+        rechazos_simples = ["no quiero", "no puedo", "no", "prefiero no"]
+        if any(r == t for r in rechazos_simples):
+            return True
+    
+    return any(p in t for p in rechazos_explicitos)
 
 def is_asking_why(text: str) -> bool:
     """
@@ -1313,6 +1330,14 @@ def build_project_location_request() -> str:
         "Para ubicar el caso en el mapa: ¿en qué barrio sería el proyecto? "
     )
 
+def explain_why_project_location() -> str:
+    """Explica por qué necesitamos la ubicación del proyecto."""
+    return (
+        "Es para ubicar tu propuesta en el mapa y asignarla al área correspondiente. "
+        "Así el equipo de Wilder puede priorizar y gestionar mejor cada caso según la zona. "
+        "¿En qué barrio sería el proyecto?"
+    )
+
 def craft_argument_question(name: Optional[str], project_location: Optional[str] = None) -> str:
     """Pregunta por argumentos."""
     saludo = f"{name}, " if name else ""
@@ -1945,6 +1970,49 @@ async def responder(data: Entrada):
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                 
                 # ══════════════════════════════════════════════════════════════
+                # NUEVO: Detectar si rechaza dar datos
+                # ══════════════════════════════════════════════════════════════
+                if detect_contact_refusal(data.mensaje):
+                    refusal_count = int(conv_data.get("contact_refusal_count", 0))
+                    
+                    # Primera vez que rechaza → explicar
+                    if refusal_count == 0:
+                        conv_ref.update({"contact_refusal_count": 1})
+                        texto = (
+                            "Entiendo tu preocupación. "
+                            "Tus datos son importantes para poder darte seguimiento personalizado "
+                            "y mantenerte informado sobre el avance de tu propuesta. "
+                            "Toda tu información está protegida y solo la usa el equipo de Wilder. "
+                            "¿Me los compartes?"
+                        )
+                        append_mensajes(conv_ref, [
+                            {"role": "user", "content": data.mensaje},
+                            {"role": "assistant", "content": texto}
+                        ])
+                        return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                    
+                    # Segunda vez → respetar decisión y continuar con ubicación
+                    else:
+                        conv_ref.update({
+                            "contact_refused": True,
+                            "contact_collected": False,
+                            "contact_requested": False
+                        })
+                        
+                        # Continuar pidiendo ubicación del proyecto
+                        texto = (
+                            "Entiendo y respeto tu decisión. "
+                            "Para continuar con tu propuesta, necesito saber en qué barrio sería el proyecto. "
+                            "¿Me compartes esa información?"
+                        )
+                        
+                        append_mensajes(conv_ref, [
+                            {"role": "user", "content": data.mensaje},
+                            {"role": "assistant", "content": texto}
+                        ])
+                        return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                
+                # ══════════════════════════════════════════════════════════════
                 # Verificar qué datos personales faltan
                 # ══════════════════════════════════════════════════════════════
                 current_info = conv_data.get("contact_info") or {}
@@ -1969,15 +2037,9 @@ async def responder(data: Entrada):
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                 
                 # ══════════════════════════════════════════════════════════════
-                # ✅ YA TIENE TODOS LOS DATOS PERSONALES → PEDIR UBICACIÓN DEL PROYECTO INMEDIATAMENTE
+                # ✅ YA TIENE TODOS LOS DATOS PERSONALES → PEDIR UBICACIÓN DEL PROYECTO
                 # ══════════════════════════════════════════════════════════════
-                
-                # Actualizar BD: marcar datos como recolectados
                 conv_ref.update({"contact_collected": True})
-                
-                print("[FASE 3A→3B] ✅ Datos personales completos. Pasando a pedir ubicación del proyecto.")
-                
-                # PEDIR UBICACIÓN DEL PROYECTO (FASE 3B inline)
                 texto = build_project_location_request()
                 
                 append_mensajes(conv_ref, [
@@ -2000,16 +2062,23 @@ async def responder(data: Entrada):
             # ═══════════════════════════════════════════════════════════════
             # FASE 3B: Pedir ubicación del proyecto
             # ═══════════════════════════════════════════════════════════════
-            if conv_data.get("contact_collected") and not conv_data.get("project_location"):
+            if (conv_data.get("contact_collected") or conv_data.get("contact_refused")) and not conv_data.get("project_location"):
+                
+                # Detectar si pregunta "¿para qué necesitas el barrio?"
+                if is_asking_why(data.mensaje):
+                    texto = explain_why_project_location()
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                 
                 # ¿Ya extrajo la ubicación del proyecto en este mensaje?
                 if proj_loc:
                     # ✅ Usuario acaba de dar la ubicación
                     conv_ref.update({"project_location": proj_loc})
                     
-                    # ══════════════════════════════════════════════════════════════
-                    # Si dijo "Ciudad" → ir a FASE 3C (pedir nombre de la ciudad)
-                    # ══════════════════════════════════════════════════════════════
+                    # Si dijo "Ciudad" → pedir nombre de la ciudad
                     if proj_loc == "Ciudad":
                         texto = "¿Cuál ciudad específicamente?"
                         
@@ -2019,13 +2088,20 @@ async def responder(data: Entrada):
                         ])
                         return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                     
-                    # ══════════════════════════════════════════════════════════════
                     # Si dio barrio específico → terminar
-                    # ══════════════════════════════════════════════════════════════
                     else:
                         nombre_txt = conv_data.get("contact_info", {}).get("nombre", "")
-                        texto = (f"Perfecto, {nombre_txt}. " if nombre_txt else "Perfecto. ")
-                        texto += "Con todos estos datos vamos a escalar tu propuesta. ¡Gracias por tu participación!"
+                        
+                        if conv_data.get("contact_refused"):
+                            # Usuario rechazó dar datos → despedida sin promesa de seguimiento
+                            texto = (
+                                "Perfecto. Hemos registrado tu propuesta para el barrio {0}. "
+                                "¡Gracias por tu participación!"
+                            ).format(proj_loc)
+                        else:
+                            # Usuario dio datos → despedida con promesa de seguimiento
+                            texto = (f"Perfecto, {nombre_txt}. " if nombre_txt else "Perfecto. ")
+                            texto += "Con todos estos datos vamos a escalar tu propuesta. ¡Gracias por tu participación!"
                         
                         append_mensajes(conv_ref, [
                             {"role": "user", "content": data.mensaje},
