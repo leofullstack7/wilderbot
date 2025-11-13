@@ -270,11 +270,154 @@ def append_mensajes(conv_ref, nuevos: List[Dict[str, Any]]):
     except:
         pass
     
+    # Resumen completo (solo si hay suficientes mensajes)
+    if len(arr) >= 4:
+        try:
+            resumen_completo = build_detailed_summary(data, arr)
+            conv_ref.update({"resumen_completo": resumen_completo})
+        except:
+            pass
+    
     # Resumen en caliente
     try:
         update_conversation_summary(conv_ref)
     except:
         pass
+
+# ╔═══════════════════════════════════════════════════════════════════════
+# ║ RESUMEN COMPLETO ESTRUCTURADO
+# ╚═══════════════════════════════════════════════════════════════════════
+
+def build_detailed_summary(conv_data: dict, mensajes: List[Dict[str, str]]) -> dict:
+    """
+    Genera un resumen estructurado completo para el botón "Ver más".
+    
+    Devuelve un objeto con:
+    - tema_principal: str
+    - consultas: List[str]  (si hubo consultas)
+    - propuesta: str (si hay)
+    - argumento: str (si hay)
+    - ubicacion: str (si hay)
+    - contacto: dict (datos recopilados)
+    - estado: str (fase actual)
+    - historial_resumido: List[dict] (Últimos 5 intercambios)
+    """
+    
+    summary = {
+        "tema_principal": "",
+        "consultas": [],
+        "propuesta": None,
+        "argumento": None,
+        "ubicacion": None,
+        "contacto": {
+            "nombre": None,
+            "barrio": None,
+            "telefono": None
+        },
+        "estado": "iniciado",
+        "historial_resumido": []
+    }
+    
+    # ────────────────────────────────────────────────────────────────
+    # 1. TEMA PRINCIPAL
+    # ────────────────────────────────────────────────────────────────
+    categorias = conv_data.get("categoria_general", [])
+    titulos = conv_data.get("titulo_propuesta", [])
+    
+    if titulos:
+        summary["tema_principal"] = titulos[-1] if isinstance(titulos, list) else titulos
+    elif categorias:
+        summary["tema_principal"] = categorias[-1] if isinstance(categorias, list) else categorias
+    else:
+        summary["tema_principal"] = "Conversación sin clasificar"
+    
+    # ────────────────────────────────────────────────────────────────
+    # 2. CONSULTAS (si la categoría incluye "Consulta")
+    # ────────────────────────────────────────────────────────────────
+    if isinstance(categorias, list) and "Consulta" in categorias:
+        for titulo in (titulos if isinstance(titulos, list) else [titulos]):
+            if titulo and any(kw in _normalize_text(titulo) for kw in ["ley", "proyecto", "apoyo", "posicion", "posición"]):
+                summary["consultas"].append(titulo)
+    
+    # ────────────────────────────────────────────────────────────────
+    # 3. PROPUESTA
+    # ────────────────────────────────────────────────────────────────
+    propuesta = conv_data.get("current_proposal")
+    if propuesta:
+        summary["propuesta"] = propuesta[:120] + ("..." if len(propuesta) > 120 else "")
+    
+    # ────────────────────────────────────────────────────────────────
+    # 4. ARGUMENTO (buscar en los mensajes del usuario)
+    # ────────────────────────────────────────────────────────────────
+    if conv_data.get("argument_collected"):
+        for m in mensajes:
+            if m.get("role") == "user":
+                content = m.get("content", "")
+                if has_argument_text(content) and len(content) > 30:
+                    summary["argumento"] = content[:120] + ("..." if len(content) > 120 else "")
+                    break
+    
+    # ────────────────────────────────────────────────────────────────
+    # 5. UBICACIÓN
+    # ────────────────────────────────────────────────────────────────
+    project_location = conv_data.get("project_location")
+    if project_location:
+        if project_location == "Ciudad" and conv_data.get("project_city"):
+            summary["ubicacion"] = f"{project_location}: {conv_data['project_city']}"
+        else:
+            summary["ubicacion"] = project_location
+    
+    # ────────────────────────────────────────────────────────────────
+    # 6. CONTACTO
+    # ────────────────────────────────────────────────────────────────
+    contact_info = conv_data.get("contact_info", {})
+    if contact_info:
+        summary["contacto"] = {
+            "nombre": contact_info.get("nombre"),
+            "barrio": contact_info.get("barrio"),
+            "telefono": contact_info.get("telefono")
+        }
+    
+    # ────────────────────────────────────────────────────────────────
+    # 7. ESTADO (fase actual del flujo)
+    # ────────────────────────────────────────────────────────────────
+    if conv_data.get("contact_collected"):
+        summary["estado"] = "completado"
+    elif conv_data.get("contact_requested"):
+        summary["estado"] = "esperando_contacto"
+    elif conv_data.get("argument_collected"):
+        summary["estado"] = "argumento_recibido"
+    elif conv_data.get("proposal_collected"):
+        summary["estado"] = "propuesta_recibida"
+    elif isinstance(categorias, list) and "Consulta" in categorias:
+        summary["estado"] = "consulta_respondida"
+    else:
+        summary["estado"] = "iniciado"
+    
+    # ────────────────────────────────────────────────────────────────
+    # 8. HISTORIAL RESUMIDO (Últimos 5 intercambios = 10 mensajes)
+    # ────────────────────────────────────────────────────────────────
+    recent = mensajes[-10:] if len(mensajes) > 10 else mensajes
+    
+    for m in recent:
+        role = m.get("role")
+        content = m.get("content", "")
+        
+        if role == "user":
+            role_display = "Usuario"
+        elif role == "assistant":
+            role_display = "Asistente"
+        else:
+            continue
+        
+        content_short = content[:100] + ("..." if len(content) > 100 else "")
+        
+        summary["historial_resumido"].append({
+            "rol": role_display,
+            "mensaje": content_short
+        })
+    
+    return summary
 
 def load_historial_para_prompt(conv_ref) -> List[Dict[str, str]]:
     """Carga últimos 8 mensajes para contexto."""

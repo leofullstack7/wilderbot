@@ -18,6 +18,9 @@ export default function ConversacionDetalle({ id, onClose }) {
     const [asignado, setAsignado] = useState("");
     const [potencial, setPotencial] = useState(false);
 
+    // ✅ NUEVO: Estado para controlar el modal de resumen completo
+    const [showResumenCompleto, setShowResumenCompleto] = useState(false);
+
     useEffect(() => {
         (async () => {
             setLoading(true);
@@ -61,17 +64,36 @@ export default function ConversacionDetalle({ id, onClose }) {
                     <div className="text-red-600">No encontrada</div>
                 ) : (
                     <div className="space-y-4">
-                        {/* Resumen */}
-                            <section className="rounded-xl border bg-white p-4">
-                                <h3 className="text-sm text-gray-500">Resumen</h3>
-                                <div className="mt-1 text-gray-800">
-                                    {(doc?.resumen && String(doc.resumen).trim())
-                                        || (doc?.last_topic_summary ? String(doc.last_topic_summary).slice(0, 100) : "—")}
+                        {/* ═══════════════════════════════════════════════════════════ */}
+                        {/* RESUMEN MEJORADO CON BOTÓN "VER MÁS" */}
+                        {/* ═══════════════════════════════════════════════════════════ */}
+                        <section className="rounded-xl border bg-gradient-to-br from-emerald-50 to-sky-50 p-4">
+                            <div className="flex items-start justify-between gap-2">
+                                <div className="flex-1">
+                                    <h3 className="text-sm font-semibold text-emerald-800 mb-1">
+                                        Resumen
+                                    </h3>
+                                    <div className="text-sm text-gray-700 leading-relaxed">
+                                        {(doc?.resumen && String(doc.resumen).trim())
+                                            || (doc?.last_topic_summary ? String(doc.last_topic_summary).slice(0, 100) : "Sin resumen disponible")}
+                                    </div>
                                 </div>
-                                <div className="mt-2 text-xs text-gray-500">
-                                    Última actualización: {formatDate(doc.resumen_updated_at || doc.ultima_fecha)}
-                                </div>
-                            </section>
+
+                                {/* ✅ Botón "Ver más" solo si existe resumen_completo */}
+                                {doc?.resumen_completo && (
+                                    <button
+                                        onClick={() => setShowResumenCompleto(true)}
+                                        className="flex-shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium text-white bg-gradient-to-r from-emerald-600 to-sky-600 hover:opacity-90 shadow-sm transition"
+                                    >
+                                        Ver más
+                                    </button>
+                                )}
+                            </div>
+
+                            <div className="mt-2 text-xs text-gray-500">
+                                Última actualización: {formatDate(doc.resumen_updated_at || doc.ultima_fecha)}
+                            </div>
+                        </section>
 
                         {/* Info principal */}
                         <section className="grid md:grid-cols-2 gap-3">
@@ -139,6 +161,16 @@ export default function ConversacionDetalle({ id, onClose }) {
                     </div>
                 )}
             </div>
+
+            {/* ═══════════════════════════════════════════════════════════ */}
+            {/* MODAL DE RESUMEN COMPLETO */}
+            {/* ═══════════════════════════════════════════════════════════ */}
+            {showResumenCompleto && doc?.resumen_completo && (
+                <ResumenCompletoModal
+                    resumen={doc.resumen_completo}
+                    onClose={() => setShowResumenCompleto(false)}
+                />
+            )}
         </div>
     );
 }
@@ -148,6 +180,157 @@ function Card({ label, children, className = "" }) {
         <div className={`rounded-xl border bg-white p-4 ${className}`}>
             <div className="text-xs text-gray-500">{label}</div>
             <div className="mt-1 text-gray-800">{children}</div>
+        </div>
+    );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   COMPONENTE: MODAL DE RESUMEN COMPLETO
+   ═══════════════════════════════════════════════════════════════════════ */
+function ResumenCompletoModal({ resumen, onClose }) {
+    return (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+            {/* Overlay */}
+            <div
+                className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+                onClick={onClose}
+            />
+
+            {/* Modal */}
+            <div className="relative bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-hidden flex flex-col">
+                {/* Header */}
+                <div className="flex items-center justify-between px-6 py-4 border-b bg-gradient-to-r from-emerald-50 to-sky-50">
+                    <h3 className="text-lg font-semibold text-emerald-900">
+                        📋 Resumen Completo
+                    </h3>
+                    <button
+                        onClick={onClose}
+                        className="text-gray-500 hover:text-gray-700 transition"
+                        title="Cerrar"
+                    >
+                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+
+                {/* Content */}
+                <div className="flex-1 overflow-y-auto px-6 py-4">
+                    <div className="space-y-4 text-sm">
+                        {/* Tema Principal */}
+                        {resumen.tema_principal && (
+                            <Section title="Tema Principal" icon="🎯">
+                                <p className="text-gray-800 font-medium">{resumen.tema_principal}</p>
+                            </Section>
+                        )}
+
+                        {/* Consultas */}
+                        {resumen.consultas && resumen.consultas.length > 0 && (
+                            <Section title="Consultas" icon="❓">
+                                <ul className="list-disc list-inside space-y-1 text-gray-700">
+                                    {resumen.consultas.map((consulta, i) => (
+                                        <li key={i}>{consulta}</li>
+                                    ))}
+                                </ul>
+                            </Section>
+                        )}
+
+                        {/* Propuesta */}
+                        {resumen.propuesta && (
+                            <Section title="Propuesta" icon="💡">
+                                <p className="text-gray-800 leading-relaxed">{resumen.propuesta}</p>
+                            </Section>
+                        )}
+
+                        {/* Argumento */}
+                        {resumen.argumento && (
+                            <Section title="Argumento" icon="📝">
+                                <p className="text-gray-700 leading-relaxed italic">{resumen.argumento}</p>
+                            </Section>
+                        )}
+
+                        {/* Ubicación */}
+                        {resumen.ubicacion && (
+                            <Section title="Ubicación del Proyecto" icon="📍">
+                                <p className="text-gray-800 font-medium">{resumen.ubicacion}</p>
+                            </Section>
+                        )}
+
+                        {/* Contacto */}
+                        {resumen.contacto && (resumen.contacto.nombre || resumen.contacto.telefono || resumen.contacto.barrio) && (
+                            <Section title="Información de Contacto" icon="👤">
+                                <div className="space-y-1 text-gray-700">
+                                    {resumen.contacto.nombre && (
+                                        <div><span className="font-medium">Nombre:</span> {resumen.contacto.nombre}</div>
+                                    )}
+                                    {resumen.contacto.barrio && (
+                                        <div><span className="font-medium">Barrio (residencia):</span> {resumen.contacto.barrio}</div>
+                                    )}
+                                    {resumen.contacto.telefono && (
+                                        <div><span className="font-medium">Teléfono:</span> {resumen.contacto.telefono}</div>
+                                    )}
+                                </div>
+                            </Section>
+                        )}
+
+                        {/* Estado */}
+                        {resumen.estado && (
+                            <Section title="Estado Actual" icon="📊">
+                                <span className="inline-block px-3 py-1 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800 capitalize">
+                                    {resumen.estado}
+                                </span>
+                            </Section>
+                        )}
+
+                        {/* Historial Resumido */}
+                        {resumen.historial_resumido && resumen.historial_resumido.length > 0 && (
+                            <Section title="Últimos Intercambios" icon="💬">
+                                <div className="space-y-2">
+                                    {resumen.historial_resumido.map((msg, i) => (
+                                        <div
+                                            key={i}
+                                            className={`p-3 rounded-lg ${msg.rol === "Usuario"
+                                                    ? "bg-sky-50 border-l-4 border-sky-500"
+                                                    : "bg-emerald-50 border-l-4 border-emerald-500"
+                                                }`}
+                                        >
+                                            <div className="text-xs font-semibold text-gray-600 mb-1">
+                                                {msg.rol}
+                                            </div>
+                                            <div className="text-gray-700 text-sm leading-relaxed">
+                                                {msg.mensaje}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </Section>
+                        )}
+                    </div>
+                </div>
+
+                {/* Footer */}
+                <div className="flex items-center justify-end gap-3 px-6 py-4 border-t bg-gray-50">
+                    <button
+                        onClick={onClose}
+                        className="px-4 py-2 rounded-lg text-white bg-gradient-to-r from-emerald-600 to-sky-600 hover:opacity-90 transition shadow"
+                    >
+                        Cerrar
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+/* Subcomponente para las secciones del modal */
+function Section({ title, icon, children }) {
+    return (
+        <div className="border-l-4 border-emerald-500 pl-4">
+            <h4 className="text-sm font-semibold text-emerald-900 mb-2 flex items-center gap-2">
+                <span>{icon}</span>
+                <span>{title}</span>
+            </h4>
+            <div>{children}</div>
         </div>
     );
 }
