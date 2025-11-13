@@ -245,6 +245,7 @@ def ensure_conversacion(chat_id: str, usuario_id: str, faq_origen: Optional[str]
             "contact_refusal_count": 0,
             "contact_info": {"nombre": None, "barrio": None, "telefono": None},
             "project_location": None,
+            "project_city": None,
             "location_note_sent": False,
         })
     else:
@@ -694,7 +695,189 @@ def llm_extract_contact_info(text: str) -> Dict[str, Optional[str]]:
         return json.loads(out)
     except:
         return {"nombre": None, "barrio": None, "telefono": None}
+    
 
+def llm_extract_personal_contact(text: str) -> Dict[str, Optional[str]]:
+    """
+    Usa LLM para extraer DATOS PERSONALES: nombre, barrio de residencia, teléfono.
+    Versión mejorada con prompt específico.
+    """
+    sys = (
+        "Extrae los DATOS PERSONALES del usuario del siguiente mensaje.\n"
+        "Devuelve un JSON con:\n"
+        "{\n"
+        '  "nombre": "nombre completo del usuario (ej: Juan Pérez)",\n'
+        '  "barrio": "barrio donde VIVE el usuario (ej: Laureles)",\n'
+        '  "telefono": "número de celular sin espacios (ej: 3001234567)"\n'
+        "}\n\n"
+        "REGLAS:\n"
+        "- Si no encuentras algún dato, pon null\n"
+        "- El barrio debe ser donde VIVE, no donde es el proyecto\n"
+        "- El teléfono debe ser solo números (quitar espacios y guiones)\n"
+        "- El nombre debe estar en formato Title Case\n"
+    )
+    
+    usr = f"Mensaje del usuario:\n{text}"
+    
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": usr}
+            ],
+            temperature=0.0,
+            max_tokens=150,
+            timeout=5
+        )
+        
+        result = response.choices[0].message.content.strip()
+        
+        # Limpiar posibles backticks
+        result = result.replace("```json", "").replace("```", "").strip()
+        
+        data = json.loads(result)
+        
+        # Validar y limpiar teléfono
+        if data.get("telefono"):
+            tel = re.sub(r'\D', '', data["telefono"])
+            tel = re.sub(r'^(?:00)?57', '', tel)
+            data["telefono"] = tel if 8 <= len(tel) <= 12 else None
+        
+        print(f"[LLM EXTRACT] Resultado: {data}")
+        return data
+        
+    except Exception as e:
+        print(f"[LLM EXTRACT] Error: {e}")
+        return {"nombre": None, "barrio": None, "telefono": None}
+
+
+def llm_extract_project_location(text: str) -> Dict[str, Optional[str]]:
+    """
+    Usa LLM para extraer la UBICACIÓN del proyecto.
+    Puede ser un barrio específico o "Ciudad" si es para toda la ciudad.
+    """
+    sys = (
+        "Extrae la UBICACIÓN del proyecto del siguiente mensaje.\n"
+        "El usuario ya dio sus datos personales. Ahora está diciendo DÓNDE sería el proyecto.\n"
+        "Devuelve un JSON con:\n"
+        "{\n"
+        '  "barrio_proyecto": "ubicación del proyecto"\n'
+        "}\n\n"
+        "REGLAS CRÍTICAS:\n"
+        "1. Si dice que es para TODA LA CIUDAD, la ciudad completa, toda Medellín, toda Manizales, etc:\n"
+        '   → Devuelve: {"barrio_proyecto": "Ciudad"}\n'
+        "\n"
+        "2. Si menciona un BARRIO ESPECÍFICO:\n"
+        '   → Devuelve el nombre del barrio en Title Case (ej: {"barrio_proyecto": "Aranjuez"})\n'
+        "\n"
+        "3. Si menciona una COMUNA:\n"
+        '   → Devuelve "Comuna X" (ej: {"barrio_proyecto": "Comuna 1"})\n'
+        "\n"
+        "4. Si NO menciona ubicación o es ambiguo:\n"
+        '   → Devuelve: {"barrio_proyecto": null}\n'
+        "\n"
+        "EJEMPLOS:\n"
+        '- "En toda la ciudad" → {"barrio_proyecto": "Ciudad"}\n'
+        '- "Para toda Medellín" → {"barrio_proyecto": "Ciudad"}\n'
+        '- "A nivel ciudad" → {"barrio_proyecto": "Ciudad"}\n'
+        '- "En el barrio Laureles" → {"barrio_proyecto": "Laureles"}\n'
+        '- "Aranjuez" → {"barrio_proyecto": "Aranjuez"}\n'
+        '- "En la comuna 1" → {"barrio_proyecto": "Comuna 1"}\n'
+    )
+    
+    usr = f"Mensaje del usuario:\n{text}"
+    
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": usr}
+            ],
+            temperature=0.0,
+            max_tokens=100,
+            timeout=5
+        )
+        
+        result = response.choices[0].message.content.strip()
+        result = result.replace("```json", "").replace("```", "").strip()
+        
+        data = json.loads(result)
+        
+        # Validar y normalizar
+        ubicacion = data.get("barrio_proyecto")
+        
+        if ubicacion:
+            # Si dice "ciudad", normalizarlo a "Ciudad"
+            if ubicacion.lower() in ["ciudad", "toda la ciudad", "la ciudad"]:
+                data["barrio_proyecto"] = "Ciudad"
+            else:
+                # Capitalizar correctamente
+                data["barrio_proyecto"] = _titlecase(ubicacion)
+        
+        print(f"[LLM EXTRACT] Ubicación proyecto: {data}")
+        return data
+        
+    except Exception as e:
+        print(f"[LLM EXTRACT] Error: {e}")
+        return {"barrio_proyecto": None}
+
+
+def llm_extract_city_name(text: str) -> Dict[str, Optional[str]]:
+    """
+    Usa LLM para extraer el NOMBRE DE LA CIUDAD.
+    Se usa cuando el usuario ya dijo "toda la ciudad" y ahora especifica cuál.
+    """
+    sys = (
+        "Extrae el NOMBRE DE LA CIUDAD del siguiente mensaje.\n"
+        "El usuario ya dijo que el proyecto es para 'toda la ciudad'. "
+        "Ahora está especificando cuál ciudad.\n"
+        "Devuelve un JSON con:\n"
+        "{\n"
+        '  "ciudad": "nombre de la ciudad en Title Case (ej: Medellín, Manizales, Bogotá)"\n'
+        "}\n\n"
+        "REGLAS:\n"
+        "- Solo extrae el nombre de la ciudad\n"
+        "- Debe estar en formato Title Case\n"
+        "- Si no encuentras el nombre, pon null\n"
+        "\n"
+        "EJEMPLOS:\n"
+        '- "Medellín" → {"ciudad": "Medellín"}\n'
+        '- "En Manizales" → {"ciudad": "Manizales"}\n'
+        '- "Es para Bogotá" → {"ciudad": "Bogotá"}\n'
+        '- "Cali" → {"ciudad": "Cali"}\n'
+    )
+    
+    usr = f"Mensaje del usuario:\n{text}"
+    
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": usr}
+            ],
+            temperature=0.0,
+            max_tokens=50,
+            timeout=5
+        )
+        
+        result = response.choices[0].message.content.strip()
+        result = result.replace("```json", "").replace("```", "").strip()
+        
+        data = json.loads(result)
+        
+        # Validar y capitalizar
+        if data.get("ciudad"):
+            data["ciudad"] = _titlecase(data["ciudad"])
+        
+        print(f"[LLM EXTRACT] Ciudad: {data}")
+        return data
+        
+    except Exception as e:
+        print(f"[LLM EXTRACT] Error: {e}")
+        return {"ciudad": None}
 # ═══════════════════════════════════════════════════════════════════════
 # SECCIÓN 6: CLASIFICACIÓN INTELIGENTE
 # ═══════════════════════════════════════════════════════════════════════
@@ -955,7 +1138,9 @@ def build_contact_request(missing: List[str]) -> str:
 
 def build_project_location_request() -> str:
     """Pide ubicación del proyecto."""
-    return "Para ubicar el caso en el mapa: ¿en qué barrio sería exactamente el proyecto?"
+    return (
+        "Para ubicar el caso en el mapa: ¿en qué barrio sería el proyecto? "
+    )
 
 def craft_argument_question(name: Optional[str], project_location: Optional[str] = None) -> str:
     """Pregunta por argumentos."""
@@ -1228,45 +1413,71 @@ async def responder(data: Entrada):
                 return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
         
         # ═══════════════════════════════════════════════════════════════
-        # CAPA 1: Extracción de Datos
+        # CAPA 1: Extracción de Datos CON LLM
         # ═══════════════════════════════════════════════════════════════
-        
-        name = extract_user_name(data.mensaje)
-        phone = extract_phone(data.mensaje)
 
-        # ──────────────────────────────────────────────────────────────
-        # Extraer barrio según la fase del flujo
-        # ──────────────────────────────────────────────────────────────
+        name = None
+        phone = None
+        user_barrio = None
+        proj_loc = None
+        project_city = None
 
-        # Si ya pidió datos personales, ahora está pidiendo barrio del proyecto
-        if conv_data.get("contact_collected") and conv_data.get("contact_requested"):
-            # Fase 3B: Pedir barrio del PROYECTO
-            proj_loc = extract_project_location(data.mensaje)
-            user_barrio = None  # No buscar barrio de residencia en esta fase
-        else:
-            # Fase 3A: Pedir datos personales (incluye barrio de RESIDENCIA)
-            user_barrio = extract_user_barrio(data.mensaje)
-            proj_loc = None  # No buscar barrio del proyecto todavía
+        # ══════════════════════════════════════════════════════════════
+        # ESTRATEGIA: Usar LLM SIEMPRE que se estén pidiendo datos
+        # ══════════════════════════════════════════════════════════════
 
-        # ──────────────────────────────────────────────────────────────
-        # LLM como fallback si no se detectó nada
-        # ──────────────────────────────────────────────────────────────
-        if conv_data.get("contact_requested") and not (name or phone or user_barrio):
-            llm_data = llm_extract_contact_info(data.mensaje)
-            if llm_data.get("nombre"):
-                name = llm_data["nombre"]
-            if llm_data.get("telefono"):
-                phone = llm_data["telefono"]
-            if llm_data.get("barrio"):
-                user_barrio = llm_data["barrio"]
+        # FASE 3C: ¿Está pidiendo el nombre de la ciudad?
+        if (conv_data.get("contact_collected") and 
+            conv_data.get("project_location") == "Ciudad" and 
+            not conv_data.get("project_city")):
+            
+            print("[EXTRACT] Fase 3C: Extrayendo nombre de la ciudad con LLM...")
+            
+            # Extraer nombre de la ciudad
+            city_result = llm_extract_city_name(data.mensaje)
+            project_city = city_result.get("ciudad")
+            
+            if project_city:
+                print(f"[EXTRACT] ✅ Ciudad: {project_city}")
 
-        # ──────────────────────────────────────────────────────────────
-        # Actualizar info de contacto
-        # ──────────────────────────────────────────────────────────────
+        # FASE 3B: ¿Está pidiendo ubicación del proyecto?
+        elif conv_data.get("contact_collected") and not conv_data.get("project_location"):
+            print("[EXTRACT] Fase 3B: Extrayendo ubicación del proyecto con LLM...")
+            
+            # Usar LLM para extraer ubicación del proyecto
+            llm_result = llm_extract_project_location(data.mensaje)
+            
+            if llm_result.get("barrio_proyecto"):
+                proj_loc = llm_result["barrio_proyecto"]
+                print(f"[EXTRACT] ✅ Ubicación proyecto: {proj_loc}")
+
+        # FASE 3A: ¿Está pidiendo datos personales?
+        elif conv_data.get("contact_requested") and not conv_data.get("contact_collected"):
+            print("[EXTRACT] Fase 3A: Extrayendo datos personales con LLM...")
+            
+            # Usar LLM para extraer nombre, barrio de residencia y teléfono
+            llm_result = llm_extract_personal_contact(data.mensaje)
+            
+            if llm_result.get("nombre"):
+                name = llm_result["nombre"]
+                print(f"[EXTRACT] ✅ Nombre: {name}")
+            
+            if llm_result.get("barrio"):
+                user_barrio = llm_result["barrio"]
+                print(f"[EXTRACT] ✅ Barrio residencia: {user_barrio}")
+            
+            if llm_result.get("telefono"):
+                phone = llm_result["telefono"]
+                print(f"[EXTRACT] ✅ Teléfono: {phone}")
+
+        # ══════════════════════════════════════════════════════════════
+        # Actualizar info de contacto en BD
+        # ══════════════════════════════════════════════════════════════
         if name or phone or user_barrio:
             current_info = conv_data.get("contact_info") or {}
             new_info = dict(current_info)
             
+            # Actualizar solo los campos que se extrajeron
             if name:
                 new_info["nombre"] = name
             if user_barrio:
@@ -1281,8 +1492,10 @@ async def responder(data: Entrada):
             tiene_barrio = bool(new_info.get("barrio"))
             tiene_telefono = bool(new_info.get("telefono"))
             
+            print(f"[EXTRACT] Estado: nombre={tiene_nombre}, barrio={tiene_barrio}, tel={tiene_telefono}")
+            
             if tiene_nombre and tiene_barrio and tiene_telefono:
-                print(f"[CAPA1] ✅ Datos completos: {new_info}")
+                print(f"[EXTRACT] ✅ TODOS LOS DATOS COMPLETOS")
                 conv_ref.update({"contact_collected": True})
                 
                 # Crear usuario en BD
@@ -1293,13 +1506,22 @@ async def responder(data: Entrada):
                     data.canal,
                     new_info["barrio"]
                 )
+            else:
+                print(f"[EXTRACT] ⚠️ Faltan datos todavía")
 
-        # ──────────────────────────────────────────────────────────────
-        # Actualizar barrio del proyecto (solo en Fase 3B)
-        # ──────────────────────────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════
+        # Actualizar ubicación del proyecto (Fase 3B)
+        # ══════════════════════════════════════════════════════════════
         if proj_loc:
             conv_ref.update({"project_location": proj_loc})
-            print(f"[EXTRACT] ✅ Barrio del proyecto: {proj_loc}")
+            print(f"[EXTRACT] ✅ Ubicación del proyecto guardada: {proj_loc}")
+
+        # ══════════════════════════════════════════════════════════════
+        # Actualizar nombre de la ciudad (Fase 3C)
+        # ══════════════════════════════════════════════════════════════
+        if project_city:
+            conv_ref.update({"project_city": project_city})
+            print(f"[EXTRACT] ✅ Ciudad del proyecto guardada: {project_city}")
         
         # ═══════════════════════════════════════════════════════════════
         # CAPA 2: Clasificación Inteligente
@@ -1582,18 +1804,66 @@ async def responder(data: Entrada):
                 # (el flujo continúa abajo en FASE 3B)
 
             # ═══════════════════════════════════════════════════════════════
-            # FASE 3B: Pedir barrio del proyecto
+            # FASE 3B: Pedir ubicación del proyecto
             # ═══════════════════════════════════════════════════════════════
             if conv_data.get("contact_collected") and not conv_data.get("project_location"):
                 
-                # ¿Ya extrajo el barrio del proyecto en este mensaje?
+                # ¿Ya extrajo la ubicación del proyecto en este mensaje?
                 if proj_loc:
-                    # ✅ Usuario acaba de dar el barrio del proyecto
+                    # ✅ Usuario acaba de dar la ubicación
                     conv_ref.update({"project_location": proj_loc})
+                    
+                    # ══════════════════════════════════════════════════════════════
+                    # Si dijo "Ciudad" → ir a FASE 3C (pedir nombre de la ciudad)
+                    # ══════════════════════════════════════════════════════════════
+                    if proj_loc == "Ciudad":
+                        texto = "¿Cuál ciudad específicamente?"
+                        
+                        append_mensajes(conv_ref, [
+                            {"role": "user", "content": data.mensaje},
+                            {"role": "assistant", "content": texto}
+                        ])
+                        return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                    
+                    # ══════════════════════════════════════════════════════════════
+                    # Si dio barrio específico → terminar
+                    # ══════════════════════════════════════════════════════════════
+                    else:
+                        nombre_txt = conv_data.get("contact_info", {}).get("nombre", "")
+                        texto = (f"Perfecto, {nombre_txt}. " if nombre_txt else "Perfecto. ")
+                        texto += "Con todos estos datos vamos a escalar tu propuesta. ¡Gracias por tu participación!"
+                        
+                        append_mensajes(conv_ref, [
+                            {"role": "user", "content": data.mensaje},
+                            {"role": "assistant", "content": texto}
+                        ])
+                        return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                
+                else:
+                    # Todavía falta la ubicación → pedirla
+                    texto = build_project_location_request()
+                    
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                
+            # ═══════════════════════════════════════════════════════════════
+            # FASE 3C: Pedir nombre de la ciudad
+            # ═══════════════════════════════════════════════════════════════
+            if (conv_data.get("contact_collected") and 
+                conv_data.get("project_location") == "Ciudad" and 
+                not conv_data.get("project_city")):
+                
+                # ¿Ya extrajo el nombre de la ciudad?
+                if project_city:
+                    # ✅ Usuario acaba de dar el nombre de la ciudad
+                    conv_ref.update({"project_city": project_city})
                     
                     nombre_txt = conv_data.get("contact_info", {}).get("nombre", "")
                     texto = (f"Perfecto, {nombre_txt}. " if nombre_txt else "Perfecto. ")
-                    texto += "Con todos estos datos vamos a escalar tu propuesta. ¡Gracias por tu participación!"
+                    texto += f"Vamos a escalar tu propuesta para {project_city}. ¡Gracias por tu participación!"
                     
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
@@ -1602,8 +1872,8 @@ async def responder(data: Entrada):
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
                 
                 else:
-                    # Todavía falta el barrio del proyecto → pedirlo
-                    texto = build_project_location_request()
+                    # Todavía no dio el nombre → volver a pedir
+                    texto = "¿Cuál ciudad específicamente? (Ej: Medellín, Manizales, Bogotá)"
                     
                     append_mensajes(conv_ref, [
                         {"role": "user", "content": data.mensaje},
@@ -1612,20 +1882,26 @@ async def responder(data: Entrada):
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
 
             # ═══════════════════════════════════════════════════════════════
-            # FASE 3C: Todo completo (ya tiene datos personales Y barrio del proyecto)
+            # FASE 3D: Todo completo
             # ═══════════════════════════════════════════════════════════════
+            # Tiene datos personales + ubicación del proyecto + (ciudad si aplica)
             if conv_data.get("contact_collected") and conv_data.get("project_location"):
                 
-                # Ya tiene TODO → confirmar y terminar
-                nombre_txt = conv_data.get("contact_info", {}).get("nombre", "")
-                texto = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
-                texto += "Ya tenemos toda la información para escalar tu propuesta. Te mantendremos informado del avance."
-                
-                append_mensajes(conv_ref, [
-                    {"role": "user", "content": data.mensaje},
-                    {"role": "assistant", "content": texto}
-                ])
-                return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                # ¿Falta la ciudad?
+                if conv_data.get("project_location") == "Ciudad" and not conv_data.get("project_city"):
+                    # No hacer nada, dejar que FASE 3C maneje esto
+                    pass
+                else:
+                    # Ya tiene TODO → confirmar y terminar
+                    nombre_txt = conv_data.get("contact_info", {}).get("nombre", "")
+                    texto = (f"Gracias, {nombre_txt}. " if nombre_txt else "Gracias. ")
+                    texto += "Ya tenemos toda la información para escalar tu propuesta. Te mantendremos informado del avance."
+                    
+                    append_mensajes(conv_ref, [
+                        {"role": "user", "content": data.mensaje},
+                        {"role": "assistant", "content": texto}
+                    ])
+                    return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
         
         # ═══════════════════════════════════════════════════════════════
         # CAPA 4: RAG + Generación
