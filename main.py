@@ -1781,7 +1781,7 @@ async def responder(data: Entrada):
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
             
 
-            # ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
             # FASE 3A: Recopilar datos personales (nombre + teléfono + barrio residencia)
             # ═══════════════════════════════════════════════════════════════
             if conv_data.get("argument_collected") and conv_data.get("contact_requested") and not conv_data.get("contact_collected"):
@@ -1824,6 +1824,12 @@ async def responder(data: Entrada):
                         {"role": "assistant", "content": texto}
                     ])
                     return {"respuesta": texto, "fuentes": [], "chat_id": chat_id}
+                
+                # ══════════════════════════════════════════════════════════════
+                # ✅ Ya tiene todos los datos personales → IR A FASE 3B
+                # ══════════════════════════════════════════════════════════════
+                # Marcar como completo y pedir ubicación del proyecto
+                # NO hacer return aquí - continuar al siguiente if (FASE 3B)
                 
                 # ══════════════════════════════════════════════════════════════
                 # Ya tiene todos los datos personales → pasar a FASE 3B
